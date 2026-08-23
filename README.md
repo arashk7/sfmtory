@@ -1,7 +1,7 @@
 # sfmtory
 
 [![CI](https://github.com/arashk7/sfmtory/actions/workflows/ci.yml/badge.svg)](https://github.com/arashk7/sfmtory/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](#license)
 [![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org)
 
 A from-scratch, CLI-first Structure-from-Motion / camera-calibration pipeline written in
