@@ -467,13 +467,6 @@ fn cmd_map(args: MapArgs) -> Result<()> {
     let started = Instant::now();
     let project = Project::open(&args.project)?;
 
-    if args.pipeline != PipelineArg::Incremental {
-        bail!(
-            "pipeline {:?} is not implemented yet (see PLAN.md); available now: incremental",
-            args.pipeline
-        );
-    }
-
     let db = Database::open(&project.database_path())?;
     let images = db.list_images()?;
     if images.len() < 2 {
@@ -524,10 +517,19 @@ fn cmd_map(args: MapArgs) -> Result<()> {
         cameras,
         pairs,
     };
-    let recon = sfm_reconstruction::run_incremental(
-        &input,
-        &sfm_reconstruction::IncrementalParams::default(),
-    );
+    let pipeline_name = match args.pipeline {
+        PipelineArg::Incremental => "incremental",
+        PipelineArg::Global => "global",
+    };
+    let recon = match args.pipeline {
+        PipelineArg::Incremental => sfm_reconstruction::run_incremental(
+            &input,
+            &sfm_reconstruction::IncrementalParams::default(),
+        ),
+        PipelineArg::Global => {
+            sfm_reconstruction::run_global(&input, &sfm_reconstruction::GlobalParams::default())
+        }
+    };
 
     if recon.images.is_empty() {
         bail!("reconstruction failed to register any images; check `sfm match` results (too few/weak verified pairs?)");
@@ -539,7 +541,7 @@ fn cmd_map(args: MapArgs) -> Result<()> {
     let payload = serde_json::json!({
         "stage": "map",
         "status": "ok",
-        "pipeline": "incremental",
+        "pipeline": pipeline_name,
         "num_images_input": images.len(),
         "num_images_registered": recon.images.len(),
         "num_points3d": recon.points3d.len(),

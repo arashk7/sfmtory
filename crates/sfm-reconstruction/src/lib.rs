@@ -1,11 +1,13 @@
-//! Incremental (COLMAP-style) sparse SfM: seed-pair initialization ->
-//! triangulate -> repeatedly register the next-best unregistered image via
-//! PnP -> triangulate its new points -> periodic bundle adjustment.
+//! Two SfM engines sharing one input/output data model (`ReconstructionInput`
+//! -> `Reconstruction`): this file's own **incremental** (COLMAP-style)
+//! pipeline (`run_incremental`) and the **global** (GLOMAP-style
+//! rotation/translation-averaging) pipeline in [`global`] (`run_global`).
 //!
-//! This is the "robust fallback" pipeline from PLAN.md; the `global`
-//! (GLOMAP-style rotation/translation-averaging) pipeline is still TODO and
-//! will become the speed-optimized default once implemented. Simplifications
-//! deliberately kept small and documented rather than hidden:
+//! Incremental is the "robust fallback" pipeline from PLAN.md: seed-pair
+//! initialization -> triangulate -> repeatedly register the next-best
+//! unregistered image via PnP -> triangulate its new points -> periodic
+//! bundle adjustment. Simplifications deliberately kept small and documented
+//! rather than hidden:
 //! - Seed-pair choice is "most inlier matches", not COLMAP's fuller
 //!   well-conditioned-ness score (inlier count + triangulation angle spread).
 //! - No iterative re-triangulation/track-merging pass after registration -
@@ -14,6 +16,13 @@
 //! - Point color is a fixed placeholder, not sampled from the source images.
 //! All three are reasonable follow-ups once the end-to-end pipeline is
 //! validated against COLMAP (PLAN.md §7), not needed for it to be correct.
+//!
+//! `run_bundle_adjustment`/`assemble_reconstruction` (below) are shared by
+//! both pipelines - see `global`'s module docs for the gauge-fixing
+//! precondition `run_global` relies on to reuse them safely.
+
+mod global;
+pub use global::{run_global, GlobalParams};
 
 use std::collections::HashMap;
 
@@ -282,7 +291,8 @@ pub fn run_incremental(input: &ReconstructionInput, params: &IncrementalParams) 
     run_bundle_adjustment(
         input,
         &mut cameras,
-        params,
+        params.ba_robust_loss,
+        params.max_reprojection_error_px,
         seed_i,
         &registered,
         &mut poses,
@@ -303,7 +313,8 @@ pub fn run_incremental(input: &ReconstructionInput, params: &IncrementalParams) 
     run_bundle_adjustment(
         input,
         &mut cameras,
-        params,
+        params.ba_robust_loss,
+        params.max_reprojection_error_px,
         seed_i,
         &registered,
         &mut poses,
@@ -501,7 +512,8 @@ fn grow_from_seed(
                     run_bundle_adjustment(
                         input,
                         &mut cameras,
-                        params,
+                        params.ba_robust_loss,
+                        params.max_reprojection_error_px,
                         seed_i,
                         &registered,
                         &mut poses,
@@ -571,7 +583,8 @@ fn grow_from_seed(
             run_bundle_adjustment(
                 input,
                 &mut cameras,
-                params,
+                params.ba_robust_loss,
+                params.max_reprojection_error_px,
                 seed_i,
                 &registered,
                 &mut poses,
@@ -1003,7 +1016,8 @@ fn triangulate_pair_matches(
 fn run_bundle_adjustment(
     input: &ReconstructionInput,
     cameras: &mut HashMap<u32, CameraModel>,
-    params: &IncrementalParams,
+    ba_robust_loss: sfm_ba::RobustLoss,
+    max_reprojection_error_px: f64,
     seed_i: usize,
     registered: &[bool],
     poses: &mut [Option<Pose>],
@@ -1090,7 +1104,7 @@ fn run_bundle_adjustment(
         sfm_ba::BaParams::default().max_iterations
     };
     let ba_params = sfm_ba::BaParams {
-        robust_loss: params.ba_robust_loss,
+        robust_loss: ba_robust_loss,
         max_iterations,
         ..Default::default()
     };
@@ -1158,7 +1172,7 @@ fn run_bundle_adjustment(
             filter_and_reoptimize(
                 build_input(fixed_cameras, &observations),
                 &ba_params,
-                params.max_reprojection_error_px,
+                max_reprojection_error_px,
             )
         } else {
             sfm_ba::bundle_adjust(build_input(fixed_cameras, &observations), &ba_params)
