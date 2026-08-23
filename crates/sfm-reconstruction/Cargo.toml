@@ -1,0 +1,14 @@
+[package]
+name = "sfm-reconstruction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sfm-core = { path = "../sfm-core" }
+sfm-geometry = { path = "../sfm-geometry" }
+sfm-ba = { path = "../sfm-ba" }
+nalgebra.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]

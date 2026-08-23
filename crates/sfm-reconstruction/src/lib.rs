@@ -1,0 +1,1460 @@
+//! Incremental (COLMAP-style) sparse SfM: seed-pair initialization ->
+//! triangulate -> repeatedly register the next-best unregistered image via
+//! PnP -> triangulate its new points -> periodic bundle adjustment.
+//!
+//! This is the "robust fallback" pipeline from PLAN.md; the `global`
+//! (GLOMAP-style rotation/translation-averaging) pipeline is still TODO and
+//! will become the speed-optimized default once implemented. Simplifications
+//! deliberately kept small and documented rather than hidden:
+//! - Seed-pair choice is "most inlier matches", not COLMAP's fuller
+//!   well-conditioned-ness score (inlier count + triangulation angle spread).
+//! - No iterative re-triangulation/track-merging pass after registration -
+//!   points are triangulated once when first formed and only ever refined
+//!   (not re-triangulated from scratch) by later bundle adjustment.
+//! - Point color is a fixed placeholder, not sampled from the source images.
+//! All three are reasonable follow-ups once the end-to-end pipeline is
+//! validated against COLMAP (PLAN.md §7), not needed for it to be correct.
+
+use std::collections::HashMap;
+
+use nalgebra::Vector3;
+use sfm_core::{
+    Camera, CameraModel, FeatureSet, Image, Point3D, Pose, Reconstruction, TrackElement,
+    TwoViewGeometryRecord,
+};
+use sfm_geometry::{
+    essential::to_normalized, pnp_ransac, refine_pose_gauss_newton, reprojection_error_normalized,
+    triangulate_normalized, triangulation_angle,
+};
+
+pub struct ImageInput {
+    pub image_id: u32,
+    pub camera_id: u32,
+    pub name: String,
+    pub features: FeatureSet,
+}
+
+pub struct PairInput {
+    pub i: usize,
+    pub j: usize,
+    pub geometry: TwoViewGeometryRecord,
+}
+
+pub struct ReconstructionInput {
+    pub images: Vec<ImageInput>,
+    pub cameras: HashMap<u32, Camera>,
+    pub pairs: Vec<PairInput>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct IncrementalParams {
+    pub min_triangulation_angle_deg: f64,
+    /// Stricter than `min_triangulation_angle_deg`, and used only to *rank*
+    /// candidate seed pairs (see `well_conditioned_match_count`). A seed pair
+    /// picked by raw inlier count alone tends to be the pair of *most
+    /// similar* viewpoints - short baseline relative to scene depth - which
+    /// gives every triangulated point a small angle regardless of the
+    /// scene's true 3D structure (the classic bas-relief ambiguity: a short
+    /// baseline makes even genuinely 3D scenes look nearly flat). A flat-
+    /// looking point cloud is exactly what breaks the linear PnP-DLT solver
+    /// used to register every subsequent image (see `sfm-geometry::pnp`
+    /// module docs), so the seed - and only the seed - needs a real,
+    /// wide-baseline check, not just the same lenient bar every other point
+    /// triangulation uses.
+    pub seed_min_triangulation_angle_deg: f64,
+    /// Seed candidates need at least this many raw verified matches, on top
+    /// of the angle-based scoring above - otherwise a *sparse* wide-baseline
+    /// pair (few matches, but a good fraction of them happen to clear the
+    /// angle bar) can outscore a dense, reliable pair whose baseline is
+    /// merely narrower, and win seed selection anyway. A seed built from a
+    /// handful of points is thin and noise-sensitive regardless of how wide
+    /// its baseline nominally is, and produced a visibly worse reconstruction
+    /// than a seed picked from a well-matched pair in real testing (see
+    /// PLAN.md's real-data-testing entries) - this floor is the fix.
+    pub seed_min_matches: usize,
+    pub max_reprojection_error_px: f64,
+    pub min_pnp_correspondences: usize,
+    pub pnp_ransac_threshold_px: f64,
+    pub pnp_ransac_max_iterations: usize,
+    pub run_ba_every_n_images: usize,
+    pub ba_robust_loss: sfm_ba::RobustLoss,
+    /// Whether to refine camera intrinsics (focal length, principal point,
+    /// distortion) alongside poses/points. On by default: without this, a
+    /// camera's intrinsics are whatever the initial width-based guess from
+    /// `sfm extract` was, forever - measurably worse calibration than COLMAP
+    /// on real test data (see PLAN.md's real-data-testing entry). Exposed as
+    /// a flag mainly for isolating intrinsics-refinement bugs during testing.
+    pub refine_intrinsics: bool,
+}
+
+impl Default for IncrementalParams {
+    fn default() -> Self {
+        IncrementalParams {
+            min_triangulation_angle_deg: 2.0,
+            seed_min_triangulation_angle_deg: 6.0,
+            seed_min_matches: 100,
+            max_reprojection_error_px: 4.0,
+            min_pnp_correspondences: 12,
+            pnp_ransac_threshold_px: 8.0,
+            pnp_ransac_max_iterations: 2000,
+            run_ba_every_n_images: 5,
+            ba_robust_loss: sfm_ba::RobustLoss::Huber,
+            refine_intrinsics: true,
+        }
+    }
+}
+
+struct PointWork {
+    xyz: Vector3<f64>,
+    track: Vec<(usize, u32)>, // (image compact idx, keypoint idx)
+}
+
+fn keypoint_px(features: &FeatureSet, idx: u32) -> (f64, f64) {
+    let kp = features.keypoints[idx as usize];
+    (kp.x as f64, kp.y as f64)
+}
+
+/// Look up an image's keypoint index within a stored `(i < j)` pairwise match
+/// list, returning `(this_kp, other_kp)` regardless of which side `this_idx`
+/// was stored as.
+fn oriented_matches(pair: &PairInput, this_idx: usize) -> Option<Vec<(u32, u32)>> {
+    if this_idx == pair.i {
+        Some(pair.geometry.inlier_matches.clone())
+    } else if this_idx == pair.j {
+        Some(
+            pair.geometry
+                .inlier_matches
+                .iter()
+                .map(|&(a, b)| (b, a))
+                .collect(),
+        )
+    } else {
+        None
+    }
+}
+
+pub fn run_incremental(input: &ReconstructionInput, params: &IncrementalParams) -> Reconstruction {
+    let n = input.images.len();
+    if n < 2 || input.pairs.is_empty() {
+        return Reconstruction::new();
+    }
+
+    // Mutable working copy of every camera's intrinsics - starts as the
+    // initial guess from `sfm extract`, refined in place by
+    // `run_bundle_adjustment` as registration proceeds. Everything from here
+    // on (PnP registration, triangulation, the final export) reads *this*
+    // map, not `input.cameras`, so refined intrinsics actually take effect
+    // instead of being computed and discarded.
+    let cameras: HashMap<u32, CameraModel> = input
+        .cameras
+        .iter()
+        .map(|(&id, cam)| (id, cam.model))
+        .collect();
+
+    // (i, j) with i < j -> the pair's data, for O(1) neighbor lookups.
+    let mut pair_of: HashMap<(usize, usize), &PairInput> = HashMap::new();
+    let mut neighbors: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for pair in &input.pairs {
+        pair_of.insert((pair.i, pair.j), pair);
+        neighbors[pair.i].push(pair.j);
+        neighbors[pair.j].push(pair.i);
+    }
+
+    // Restrict seed candidates to the match graph's largest connected
+    // component. A seed picked purely by local pair quality can still be a
+    // structural dead end: on `temple_sparse_ring`, an isolated, otherwise
+    // disconnected pair with excellent match density and baseline won seed
+    // selection outright over every pair in the dataset's real ~13-image
+    // component, capping registration at 2/16 no matter what the rest of
+    // the pipeline did afterward - no seed placed outside a component can
+    // ever grow into it, whatever heuristics run downstream.
+    let mut component = vec![usize::MAX; n];
+    let mut component_sizes = Vec::new();
+    for start in 0..n {
+        if component[start] != usize::MAX {
+            continue;
+        }
+        let comp_id = component_sizes.len();
+        let mut stack = vec![start];
+        component[start] = comp_id;
+        let mut size = 0;
+        while let Some(node) = stack.pop() {
+            size += 1;
+            for &nb in &neighbors[node] {
+                if component[nb] == usize::MAX {
+                    component[nb] = comp_id;
+                    stack.push(nb);
+                }
+            }
+        }
+        component_sizes.push(size);
+    }
+    let largest_component = component_sizes
+        .iter()
+        .enumerate()
+        .max_by_key(|&(_, &s)| s)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+
+    // The pair with the most inlier matches is very often the pair of *most
+    // similar* viewpoints (adjacent photos on a walk, barely moved between
+    // shots) - exactly the wrong choice for a seed, since a short baseline
+    // relative to scene depth gives every point a tiny triangulation angle
+    // and next to nothing survives the angle filter below. Score candidates
+    // by how many of their matches would actually triangulate well instead.
+    let all_pairs: Vec<&PairInput> = input
+        .pairs
+        .iter()
+        .filter(|p| component[p.i] == largest_component)
+        .collect();
+    let dense_enough: Vec<&PairInput> = all_pairs
+        .iter()
+        .copied()
+        .filter(|p| p.geometry.inlier_matches.len() >= params.seed_min_matches)
+        .collect();
+    // Falls back to ranking every pair (ignoring the density floor) only if
+    // *no* pair clears it at all - a genuinely small/sparse input set should
+    // still get a best-effort seed rather than refusing to reconstruct.
+    let candidates: &[&PairInput] = if dense_enough.is_empty() {
+        &all_pairs
+    } else {
+        &dense_enough
+    };
+    // A seed picked purely by its own match quality can still sit in a
+    // sparse branch of an otherwise well-connected graph - COLMAP's own
+    // incremental mapper has the identical fallback (`FindNextInitImage`
+    // tries multiple candidate pairs) for exactly this reason: no static
+    // heuristic reliably predicts how far a *given* seed will actually grow
+    // once bridge/bootstrap paths and PnP successes/failures compound down
+    // the line, so the only fully reliable test is to try growing from it.
+    // Try the best few candidates by the existing quality score and keep
+    // whichever genuinely registers the most images.
+    let mut ranked: Vec<&PairInput> = candidates.to_vec();
+    ranked.sort_by_key(|p| {
+        std::cmp::Reverse(well_conditioned_match_count(
+            input,
+            &cameras,
+            p,
+            params.seed_min_triangulation_angle_deg,
+            params.max_reprojection_error_px,
+        ))
+    });
+    const MAX_SEED_TRIALS: usize = 8;
+
+    let mut best: Option<GrowthResult> = None;
+    for seed in ranked.iter().take(MAX_SEED_TRIALS) {
+        let result = grow_from_seed(
+            input,
+            params,
+            &pair_of,
+            &neighbors,
+            cameras.clone(),
+            seed.i,
+            seed.j,
+            &seed.geometry.pose,
+            &seed.geometry.inlier_matches,
+        );
+        let count = result.registered.iter().filter(|&&b| b).count();
+        let better = best
+            .as_ref()
+            .map(|b| count > b.registered.iter().filter(|&&x| x).count())
+            .unwrap_or(true);
+        if better {
+            best = Some(result);
+        }
+    }
+    let GrowthResult {
+        seed_i,
+        registered,
+        mut poses,
+        mut points,
+        mut cameras,
+    } = best.unwrap();
+
+    // One more fixed-intrinsics pass before the intrinsics-refining one:
+    // growth can end on a bootstrap registration (see the bridge-image
+    // fallback above), whose pose is inherently less certain than an
+    // ordinary RANSAC/GN-verified PnP registration - an immediate BA runs
+    // right after each bootstrap step, but the *last* growth step never
+    // gets a following correction pass before intrinsics refinement
+    // otherwise, letting one bootstrap's residual pose error leak directly
+    // into the focal length estimate.
+    run_bundle_adjustment(
+        input,
+        &mut cameras,
+        params,
+        seed_i,
+        &registered,
+        &mut poses,
+        &mut points,
+        false,
+    );
+
+    // Only this final bundle adjustment is allowed to touch intrinsics.
+    // Refining them *during* the loop would mean every periodic call sees a
+    // still-changing focal length, so images registered and points
+    // triangulated earlier keep getting computed against a stale
+    // intermediate calibration - later passes then have to both fix the
+    // intrinsics *and* retroactively correct everything built under the old
+    // ones, which measurably failed to fully reconverge within a reasonable
+    // iteration budget on real test data (see PLAN.md). Doing it once, at
+    // the end, from an otherwise-converged state is exactly the scenario
+    // `sfm-ba`'s joint-optimization test validates.
+    run_bundle_adjustment(
+        input,
+        &mut cameras,
+        params,
+        seed_i,
+        &registered,
+        &mut poses,
+        &mut points,
+        params.refine_intrinsics,
+    );
+
+    assemble_reconstruction(input, &cameras, &registered, &poses, &points)
+}
+
+struct GrowthResult {
+    seed_i: usize,
+    registered: Vec<bool>,
+    poses: Vec<Option<Pose>>,
+    points: Vec<PointWork>,
+    cameras: HashMap<u32, CameraModel>,
+}
+
+/// Grow a full reconstruction from one candidate seed pair: triangulate the
+/// seed, then repeatedly register the next-best unregistered image (via
+/// ordinary PnP, falling back to the bridge-image bootstrap when the match
+/// graph's local structure can't support PnP - see `run_incremental`'s
+/// caller for why both are needed). Takes its own owned `cameras` map so
+/// `run_incremental` can try several seeds independently, each from the same
+/// unrefined starting intrinsics, without one trial's periodic bundle
+/// adjustments contaminating another's.
+#[allow(clippy::too_many_arguments)]
+fn grow_from_seed(
+    input: &ReconstructionInput,
+    params: &IncrementalParams,
+    pair_of: &HashMap<(usize, usize), &PairInput>,
+    neighbors: &[Vec<usize>],
+    mut cameras: HashMap<u32, CameraModel>,
+    seed_i: usize,
+    seed_j: usize,
+    seed_pose: &Pose,
+    seed_matches: &[(u32, u32)],
+) -> GrowthResult {
+    let n = input.images.len();
+    let mut registered = vec![false; n];
+    let mut poses: Vec<Option<Pose>> = vec![None; n];
+    let mut points: Vec<PointWork> = Vec::new();
+    let mut obs_to_point: HashMap<(usize, u32), usize> = HashMap::new();
+    // Correspondence count at the time PnP last failed for this image, if it
+    // has failed at all - `None` means never attempted or never failed.
+    // Deliberately *not* a permanent exclusion: as more of the scene gets
+    // triangulated, an image that failed with too few/too-planar
+    // correspondences can pick up enough new ones on a later pass to
+    // succeed. Only skip re-attempting while nothing has changed since the
+    // last failure (otherwise every failed image gets retried, uselessly,
+    // every single iteration).
+    let mut failed_at_count: Vec<Option<usize>> = vec![None; n];
+    // Bridge pairs (see the fallback below) whose bootstrap attempt already
+    // failed validation - permanently excluded, unlike `failed_at_count`,
+    // since a bootstrap depends only on the pair's own cached raw matches
+    // (which never change), not on how much of the rest of the scene has
+    // been triangulated.
+    let mut bootstrap_failed: std::collections::HashSet<(usize, usize)> =
+        std::collections::HashSet::new();
+
+    poses[seed_i] = Some(Pose::identity());
+    poses[seed_j] = Some(*seed_pose);
+    registered[seed_i] = true;
+    registered[seed_j] = true;
+
+    triangulate_pair_matches(
+        input,
+        &cameras,
+        params,
+        seed_i,
+        seed_j,
+        seed_matches,
+        &poses,
+        &mut points,
+        &mut obs_to_point,
+    );
+
+    let mut images_registered_since_ba = 2usize;
+
+    loop {
+        // Next-best-view: the unregistered image with the most 2D-3D
+        // correspondences against already-triangulated points.
+        let mut best: Option<(usize, Vec<(usize, u32)>)> = None; // (image_idx, [(point_idx, kp_idx)])
+        for u in 0..n {
+            if registered[u] {
+                continue;
+            }
+            let mut correspondences: HashMap<u32, usize> = HashMap::new();
+            for &r in &neighbors[u] {
+                if !registered[r] {
+                    continue;
+                }
+                let (lo, hi) = (u.min(r), u.max(r));
+                let Some(pair) = pair_of.get(&(lo, hi)) else {
+                    continue;
+                };
+                let Some(matches) = oriented_matches(pair, u) else {
+                    continue;
+                };
+                for (k_u, k_r) in matches {
+                    if let Some(&point_idx) = obs_to_point.get(&(r, k_r)) {
+                        correspondences.entry(k_u).or_insert(point_idx);
+                    }
+                }
+            }
+            if correspondences.len() < params.min_pnp_correspondences {
+                continue;
+            }
+            // Skip re-attempting a previously-failed image unless it has
+            // picked up genuinely new correspondences since then (see
+            // `failed_at_count`'s docs) - avoids uselessly re-running PnP on
+            // the exact same data every single iteration.
+            if let Some(prev_count) = failed_at_count[u] {
+                if correspondences.len() <= prev_count {
+                    continue;
+                }
+            }
+            let better = best
+                .as_ref()
+                .map(|(_, c)| correspondences.len() > c.len())
+                .unwrap_or(true);
+            if better {
+                // Sort by keypoint index before handing this to PnP RANSAC:
+                // `correspondences` was just built from a `HashMap`, whose
+                // iteration order is randomized per-process (Rust's default
+                // hasher). PnP RANSAC's minimal samples are drawn by *index*
+                // into whatever order it receives, from a fixed internal
+                // seed - so an unsorted, run-to-run-random order silently
+                // makes the "fixed seed" sample a different actual 6-point
+                // subset each run, which for a near-planar point set can be
+                // the difference between a well-conditioned and a degenerate
+                // minimal sample. That was previously causing real run-to-run
+                // variance in registration count (7-9/11 on the same input).
+                let mut sorted: Vec<(u32, usize)> = correspondences.into_iter().collect();
+                sorted.sort_unstable_by_key(|&(k, _)| k);
+                best = Some((u, sorted.into_iter().map(|(k, p)| (p, k)).collect()));
+            }
+        }
+
+        let Some((u, correspondences)) = best else {
+            // Ordinary next-best-view found no unregistered image sharing
+            // enough already-triangulated points with a registered
+            // neighbor. That's expected once the match graph's *redundant*
+            // portion (anything reachable through a triangle - i.e.
+            // sharing an already-triangulated point via some third image)
+            // is exhausted: a chain-shaped remainder (a "bridge" image
+            // connected to the registered set by a single un-triangulated
+            // edge, with no triangle at all) can never satisfy that test,
+            // no matter how much of the rest of the scene gets
+            // triangulated first, since it shares zero already-
+            // triangulated points with its only registered neighbor by
+            // construction - not a thin correspondence set, an empty one.
+            // Try bootstrapping the best such bridge via its cached
+            // two-view relative pose to that neighbor instead.
+            if let Some(pair) = find_bridge_candidate(&input.pairs, &registered, &bootstrap_failed)
+            {
+                let (r, u) = if registered[pair.i] {
+                    (pair.i, pair.j)
+                } else {
+                    (pair.j, pair.i)
+                };
+                if try_bootstrap_bridge_image(
+                    input,
+                    &cameras,
+                    params,
+                    pair,
+                    u,
+                    r,
+                    &mut poses,
+                    &mut points,
+                    &mut obs_to_point,
+                ) {
+                    registered[u] = true;
+                    failed_at_count[u] = None;
+                    // Bootstrapped poses carry more uncertainty than an
+                    // ordinary RANSAC/GN-verified PnP registration - no
+                    // minimum inlier count backs them, and a bootstrap
+                    // chained off *another* bootstrap's approximate pose
+                    // (no independent correspondences to correct it either)
+                    // compounds that error. Pull everything back into
+                    // consistency immediately rather than letting error
+                    // accumulate across several chained bootstrap steps
+                    // before the periodic counter would otherwise trigger.
+                    run_bundle_adjustment(
+                        input,
+                        &mut cameras,
+                        params,
+                        seed_i,
+                        &registered,
+                        &mut poses,
+                        &mut points,
+                        false,
+                    );
+                    images_registered_since_ba = 0;
+                } else {
+                    bootstrap_failed.insert((pair.i, pair.j));
+                }
+                continue;
+            }
+            break;
+        };
+
+        let cam = cameras[&input.images[u].camera_id];
+        let points3d: Vec<Vector3<f64>> = correspondences
+            .iter()
+            .map(|&(p, _)| points[p].xyz)
+            .collect();
+        let points2d_norm: Vec<(f64, f64)> = correspondences
+            .iter()
+            .map(|&(_, k)| to_normalized(keypoint_px(&input.images[u].features, k), &cam))
+            .collect();
+        let avg_focal = (cam.focal_lengths().0 + cam.focal_lengths().1) / 2.0;
+        let threshold = params.pnp_ransac_threshold_px / avg_focal;
+
+        let Some((pose, inliers)) = pnp_ransac(
+            &points3d,
+            &points2d_norm,
+            threshold,
+            params.pnp_ransac_max_iterations,
+        ) else {
+            failed_at_count[u] = Some(correspondences.len());
+            continue;
+        };
+
+        poses[u] = Some(pose);
+        registered[u] = true;
+        for (idx, &(point_idx, k)) in correspondences.iter().enumerate() {
+            if inliers[idx] {
+                points[point_idx].track.push((u, k));
+                obs_to_point.insert((u, k), point_idx);
+            }
+        }
+
+        for &r in &neighbors[u] {
+            if !registered[r] {
+                continue;
+            }
+            let (lo, hi) = (u.min(r), u.max(r));
+            let Some(pair) = pair_of.get(&(lo, hi)) else {
+                continue;
+            };
+            let Some(matches) = oriented_matches(pair, u) else {
+                continue;
+            };
+            let fresh: Vec<(u32, u32)> = matches
+                .into_iter()
+                .filter(|&(k_u, k_r)| {
+                    !obs_to_point.contains_key(&(u, k_u)) && !obs_to_point.contains_key(&(r, k_r))
+                })
+                .collect();
+            triangulate_pair_matches(
+                input,
+                &cameras,
+                params,
+                u,
+                r,
+                &fresh,
+                &poses,
+                &mut points,
+                &mut obs_to_point,
+            );
+        }
+
+        images_registered_since_ba += 1;
+        if images_registered_since_ba >= params.run_ba_every_n_images {
+            // Intrinsics stay fixed during these in-loop passes (see
+            // `run_incremental`'s final call for why) - just keep
+            // poses/points internally consistent enough to keep registering
+            // more images correctly.
+            run_bundle_adjustment(
+                input,
+                &mut cameras,
+                params,
+                seed_i,
+                &registered,
+                &mut poses,
+                &mut points,
+                false,
+            );
+            images_registered_since_ba = 0;
+        }
+    }
+
+    GrowthResult {
+        seed_i,
+        registered,
+        poses,
+        points,
+        cameras,
+    }
+}
+
+/// How many of a candidate seed pair's matches would actually survive
+/// triangulation (positive depth, sufficient parallax angle, low
+/// reprojection error) if `i` were placed at the identity and `j` at the
+/// pair's recovered relative pose. Used only to *rank* seed candidates - the
+/// real triangulation (which also dedupes against already-claimed
+/// observations) happens afterward in `triangulate_pair_matches`.
+fn well_conditioned_match_count(
+    input: &ReconstructionInput,
+    cameras: &HashMap<u32, CameraModel>,
+    pair: &PairInput,
+    min_angle_deg: f64,
+    max_reprojection_error_px: f64,
+) -> usize {
+    let pose_a = Pose::identity();
+    let pose_b = pair.geometry.pose.clone();
+    let cam_a = cameras[&input.images[pair.i].camera_id];
+    let cam_b = cameras[&input.images[pair.j].camera_id];
+    let min_angle = min_angle_deg.to_radians();
+    let center_a = pose_a.camera_center();
+    let center_b = pose_b.camera_center();
+    let avg_focal_a = (cam_a.focal_lengths().0 + cam_a.focal_lengths().1) / 2.0;
+    let avg_focal_b = (cam_b.focal_lengths().0 + cam_b.focal_lengths().1) / 2.0;
+
+    pair.geometry
+        .inlier_matches
+        .iter()
+        .filter(|&&(ka, kb)| {
+            let obs_a = to_normalized(keypoint_px(&input.images[pair.i].features, ka), &cam_a);
+            let obs_b = to_normalized(keypoint_px(&input.images[pair.j].features, kb), &cam_b);
+            let Some(xyz) = triangulate_normalized(&[(pose_a.clone(), obs_a), (pose_b.clone(), obs_b)]) else {
+                return false;
+            };
+            if triangulation_angle(&center_a, &center_b, &xyz) < min_angle {
+                return false;
+            }
+            let err_a = reprojection_error_normalized(&pose_a, &xyz, obs_a).map(|e| e * avg_focal_a);
+            let err_b = reprojection_error_normalized(&pose_b, &xyz, obs_b).map(|e| e * avg_focal_b);
+            matches!((err_a, err_b), (Some(a), Some(b)) if a <= max_reprojection_error_px && b <= max_reprojection_error_px)
+        })
+        .count()
+}
+
+/// Best not-yet-excluded pair straddling the registered/unregistered
+/// boundary (exactly one endpoint registered), ranked by raw inlier match
+/// count - the most trustworthy signal available for a pair we can't yet
+/// judge by triangulated-point overlap.
+fn find_bridge_candidate<'a>(
+    pairs: &'a [PairInput],
+    registered: &[bool],
+    excluded: &std::collections::HashSet<(usize, usize)>,
+) -> Option<&'a PairInput> {
+    pairs
+        .iter()
+        .filter(|p| registered[p.i] != registered[p.j])
+        .filter(|p| !excluded.contains(&(p.i, p.j)))
+        .max_by_key(|p| p.geometry.inlier_matches.len())
+}
+
+/// Median depth (in `r`'s own camera frame) of `r`'s already-triangulated
+/// points - a same-order-of-magnitude scene-scale guess for bootstrapping a
+/// neighbor's pose, since the two-view relative pose's translation carries
+/// only an arbitrary unit-length scale rather than the reconstruction's
+/// established one. Used only as a fallback when fewer than two cameras are
+/// registered yet (see `median_camera_baseline`, which is the better-
+/// matched quantity for a camera-to-camera baseline and is preferred
+/// whenever there's enough registered geometry to compute it).
+fn median_point_depth(points: &[PointWork], r: usize, r_pose: &Pose) -> Option<f64> {
+    let mut depths: Vec<f64> = points
+        .iter()
+        .filter(|p| p.track.iter().any(|&(img, _)| img == r))
+        .map(|p| r_pose.transform_point(&p.xyz).z)
+        .filter(|&z| z > 1e-6)
+        .collect();
+    if depths.is_empty() {
+        return None;
+    }
+    depths.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    Some(depths[depths.len() / 2])
+}
+
+/// Median pairwise distance between already-registered camera centers - the
+/// right order-of-magnitude scale for bootstrapping *another* camera's
+/// position, unlike `median_point_depth` (a camera-to-scene quantity that
+/// can differ from camera-to-camera baseline by an order of magnitude for,
+/// e.g., a turntable/orbital capture of a small object - exactly
+/// `temple_sparse_ring`'s geometry, where using scene depth as the baseline
+/// guess badly overestimated it and made otherwise-good bootstrap poses
+/// fail triangulation-angle validation).
+fn median_camera_baseline(poses: &[Option<Pose>]) -> Option<f64> {
+    let centers: Vec<Vector3<f64>> = poses
+        .iter()
+        .filter_map(|p| p.as_ref().map(Pose::camera_center))
+        .collect();
+    if centers.len() < 2 {
+        return None;
+    }
+    let mut dists = Vec::new();
+    for i in 0..centers.len() {
+        for c in &centers[i + 1..] {
+            dists.push((centers[i] - c).norm());
+        }
+    }
+    dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    Some(dists[dists.len() / 2])
+}
+
+/// Absolute pose candidate for `u`, composed from `r`'s already-known
+/// absolute pose and the cached two-view relative pose between `u` and `r`
+/// (computed and RANSAC-verified back at match time). Rotation is exact;
+/// translation direction is exact but its magnitude is rescaled to
+/// `scale_guess` since the two-view estimate's own translation length is
+/// an arbitrary unit baseline, not the reconstruction's established scale.
+fn compose_pose_via_neighbor(pair: &PairInput, r: usize, r_pose: &Pose, scale_guess: f64) -> Pose {
+    let rel = &pair.geometry.pose;
+    let norm = rel.translation.norm();
+    let rel_t = if norm > 1e-9 {
+        rel.translation / norm * scale_guess
+    } else {
+        rel.translation
+    };
+
+    if r == pair.i {
+        // rel: X_u = rel.R * X_r + rel.t, with X_r meaning "r's camera
+        // frame treated as world" - substitute r's real absolute pose.
+        let rotation = rel.rotation * r_pose.rotation;
+        let translation = rel.rotation * r_pose.translation + rel_t;
+        Pose::from_rotation_translation(rotation, translation)
+    } else {
+        debug_assert_eq!(r, pair.j);
+        // rel: X_r = rel.R * X_u + rel.t  =>  X_u = rel.R^T * X_r - rel.R^T * rel.t
+        let rel_inv = rel.rotation.inverse();
+        let rotation = rel_inv * r_pose.rotation;
+        let translation = rel_inv * r_pose.translation - rel_inv * rel_t;
+        Pose::from_rotation_translation(rotation, translation)
+    }
+}
+
+/// Registers bridge image `u` against its sole registered neighbor `r` via
+/// `pair`'s cached two-view geometry rather than PnP-from-3D-points (see the
+/// call site in `run_incremental` for why ordinary PnP structurally can't
+/// handle this case). Validated by how much of the pair's own raw matches
+/// this pose then lets triangulate cleanly (positive depth, real parallax,
+/// low reprojection error) - this confirms the bootstrap's rotation and
+/// translation *direction* are sound (a sign/orientation blunder would
+/// triangulate almost nothing), though it can't confirm absolute scale,
+/// since two-view triangulation is self-consistent for any positive scale
+/// of the baseline. Rolls back cleanly and returns `false` if validation
+/// fails, so a bad candidate never pollutes the map.
+#[allow(clippy::too_many_arguments)]
+fn try_bootstrap_bridge_image(
+    input: &ReconstructionInput,
+    cameras: &HashMap<u32, CameraModel>,
+    params: &IncrementalParams,
+    pair: &PairInput,
+    u: usize,
+    r: usize,
+    poses: &mut [Option<Pose>],
+    points: &mut Vec<PointWork>,
+    obs_to_point: &mut HashMap<(usize, u32), usize>,
+) -> bool {
+    let r_pose = poses[r].expect("neighbor is registered");
+    let base_scale = median_camera_baseline(poses)
+        .or_else(|| median_point_depth(points, r, &r_pose))
+        .unwrap_or(1.0);
+
+    let Some(matches) = oriented_matches(pair, u) else {
+        return false;
+    };
+    let cam_u = cameras[&input.images[u].camera_id];
+
+    // Any of `u`'s matches with `r` that happen to already have a
+    // triangulated 3D point (visible via some third, already-registered
+    // image) let us nonlinearly correct the bootstrap's scale and any
+    // small rotation/translation error before trusting it - same solver
+    // ordinary PnP uses to polish its own linear estimate, just invoked
+    // directly since a bridge image structurally has too few of these to
+    // run RANSAC/DLT at all (that's exactly why it needed this fallback).
+    let existing: Vec<(Vector3<f64>, (f64, f64))> = matches
+        .iter()
+        .filter_map(|&(k_u, k_r)| {
+            let point_idx = *obs_to_point.get(&(r, k_r))?;
+            let obs = to_normalized(keypoint_px(&input.images[u].features, k_u), &cam_u);
+            Some((points[point_idx].xyz, obs))
+        })
+        .collect();
+
+    let min_gain = ((matches.len() as f64 * 0.1).ceil() as usize)
+        .max(3)
+        .min(matches.len());
+
+    // `base_scale` is only an order-of-magnitude guess (the relative pose's
+    // own translation carries no scale information at all), and the
+    // triangulation-angle validation below is scale-*sensitive* - a
+    // baseline placed too near or far relative to the true one collapses
+    // or distorts every triangulated angle even when rotation and
+    // direction are exactly right. Sweep a small multiplier grid around
+    // the guess rather than betting everything on it being correct;
+    // nonlinear refinement against `existing` (when available) then cleans
+    // up whatever residual error the winning multiplier still has.
+    for multiplier in [1.0, 0.3, 3.0, 0.1, 10.0, 0.03, 30.0, 0.01, 100.0] {
+        let scale_guess = base_scale * multiplier;
+        let candidate = compose_pose_via_neighbor(pair, r, &r_pose, scale_guess);
+        let pose = if existing.len() >= 3 {
+            let (p3, p2): (Vec<_>, Vec<_>) = existing.iter().cloned().unzip();
+            refine_pose_gauss_newton(&candidate, &p3, &p2, 15)
+        } else {
+            candidate
+        };
+
+        poses[u] = Some(pose);
+        let before = points.len();
+        triangulate_pair_matches(
+            input,
+            cameras,
+            params,
+            u,
+            r,
+            &matches,
+            poses,
+            points,
+            obs_to_point,
+        );
+        let gained = points.len() - before;
+
+        if gained >= min_gain {
+            return true;
+        }
+        for new_point in &points[before..] {
+            for &(img, kp) in &new_point.track {
+                obs_to_point.remove(&(img, kp));
+            }
+        }
+        points.truncate(before);
+        poses[u] = None;
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn triangulate_pair_matches(
+    input: &ReconstructionInput,
+    cameras: &HashMap<u32, CameraModel>,
+    params: &IncrementalParams,
+    a: usize,
+    b: usize,
+    matches: &[(u32, u32)],
+    poses: &[Option<Pose>],
+    points: &mut Vec<PointWork>,
+    obs_to_point: &mut HashMap<(usize, u32), usize>,
+) {
+    let (Some(pose_a), Some(pose_b)) = (poses[a].clone(), poses[b].clone()) else {
+        return;
+    };
+    let cam_a = cameras[&input.images[a].camera_id];
+    let cam_b = cameras[&input.images[b].camera_id];
+    let min_angle = params.min_triangulation_angle_deg.to_radians();
+    let center_a = pose_a.camera_center();
+    let center_b = pose_b.camera_center();
+
+    for &(ka, kb) in matches {
+        if obs_to_point.contains_key(&(a, ka)) || obs_to_point.contains_key(&(b, kb)) {
+            continue;
+        }
+        let obs_a = to_normalized(keypoint_px(&input.images[a].features, ka), &cam_a);
+        let obs_b = to_normalized(keypoint_px(&input.images[b].features, kb), &cam_b);
+        let Some(xyz) = triangulate_normalized(&[(pose_a.clone(), obs_a), (pose_b.clone(), obs_b)])
+        else {
+            continue;
+        };
+
+        let angle = triangulation_angle(&center_a, &center_b, &xyz);
+        if angle < min_angle {
+            continue;
+        }
+        let avg_focal_a = (cam_a.focal_lengths().0 + cam_a.focal_lengths().1) / 2.0;
+        let avg_focal_b = (cam_b.focal_lengths().0 + cam_b.focal_lengths().1) / 2.0;
+        let err_a = reprojection_error_normalized(&pose_a, &xyz, obs_a).map(|e| e * avg_focal_a);
+        let err_b = reprojection_error_normalized(&pose_b, &xyz, obs_b).map(|e| e * avg_focal_b);
+        let (Some(err_a), Some(err_b)) = (err_a, err_b) else {
+            continue;
+        };
+        if err_a > params.max_reprojection_error_px || err_b > params.max_reprojection_error_px {
+            continue;
+        }
+
+        let point_idx = points.len();
+        points.push(PointWork {
+            xyz,
+            track: vec![(a, ka), (b, kb)],
+        });
+        obs_to_point.insert((a, ka), point_idx);
+        obs_to_point.insert((b, kb), point_idx);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_bundle_adjustment(
+    input: &ReconstructionInput,
+    cameras: &mut HashMap<u32, CameraModel>,
+    params: &IncrementalParams,
+    seed_i: usize,
+    registered: &[bool],
+    poses: &mut [Option<Pose>],
+    points: &mut [PointWork],
+    allow_intrinsics: bool,
+) {
+    // Compact-index remap: BA only sees registered images and points with a
+    // usable (>=2 observation) track.
+    let image_ids: Vec<usize> = (0..registered.len()).filter(|&i| registered[i]).collect();
+    let image_pos: HashMap<usize, usize> = image_ids
+        .iter()
+        .enumerate()
+        .map(|(compact, &orig)| (orig, compact))
+        .collect();
+    if image_ids.len() < 2 {
+        return;
+    }
+
+    let point_ids: Vec<usize> = (0..points.len())
+        .filter(|&p| points[p].track.len() >= 2)
+        .collect();
+
+    let mut camera_of_image: Vec<usize> = Vec::new();
+    let mut camera_list: Vec<CameraModel> = Vec::new();
+    let mut camera_id_list: Vec<u32> = Vec::new();
+    let mut camera_index_of: HashMap<u32, usize> = HashMap::new();
+    for &orig in &image_ids {
+        let cam_id = input.images[orig].camera_id;
+        let idx = *camera_index_of.entry(cam_id).or_insert_with(|| {
+            camera_list.push(cameras[&cam_id]);
+            camera_id_list.push(cam_id);
+            camera_list.len() - 1
+        });
+        camera_of_image.push(idx);
+    }
+
+    let ba_poses: Vec<Pose> = image_ids
+        .iter()
+        .map(|&orig| poses[orig].clone().unwrap())
+        .collect();
+    let ba_points: Vec<Vector3<f64>> = point_ids.iter().map(|&p| points[p].xyz).collect();
+    let fixed_poses: Vec<bool> = image_ids.iter().map(|&orig| orig == seed_i).collect();
+
+    let mut observations = Vec::new();
+    for (compact_p, &orig_p) in point_ids.iter().enumerate() {
+        for &(img_idx, kp_idx) in &points[orig_p].track {
+            let Some(&compact_img) = image_pos.get(&img_idx) else {
+                continue;
+            };
+            let (x, y) = keypoint_px(&input.images[img_idx].features, kp_idx);
+            observations.push(sfm_ba::Observation {
+                image_idx: compact_img,
+                point_idx: compact_p,
+                x,
+                y,
+            });
+        }
+    }
+    if observations.is_empty() {
+        return;
+    }
+
+    // Cameras are optimized *jointly* with poses/points in one linear system
+    // (`BaInput::fixed_cameras`), not as a separate alternating pass - see
+    // `sfm_ba`'s module docs for why an earlier alternating design measurably
+    // failed to correct calibration on real photos (a wrong-but-self-
+    // consistent focal length has almost no gradient once poses/points have
+    // already converged to fit it; only a joint solve's combined Jacobian can
+    // reliably escape that).
+    //
+    // Refine focal length and distortion but hold the principal point fixed
+    // at its initial guess: unlike focal length, it's weakly constrained by
+    // ordinary photos, and jointly refining it anyway measurably made
+    // calibration *worse* on real test data (see PLAN.md) - matching why
+    // COLMAP holds it fixed by default too.
+    let fixed_camera_params = sfm_ba::default_fixed_params_mask(&camera_list);
+    // The intrinsics-enabled call happens exactly once (see the caller), so
+    // it can afford a much larger iteration budget to fully reconverge
+    // poses/points around the newly-refined intrinsics; periodic pose/point-
+    // only passes during growth stay at the default for speed.
+    let max_iterations = if allow_intrinsics {
+        200
+    } else {
+        sfm_ba::BaParams::default().max_iterations
+    };
+    let ba_params = sfm_ba::BaParams {
+        robust_loss: params.ba_robust_loss,
+        max_iterations,
+        ..Default::default()
+    };
+
+    // A bootstrap-triangulated point's *scale* is only a guess, never
+    // independently verified against the reconstruction's established
+    // baseline the way an ordinary two-view triangulation between two
+    // already-trusted poses is (see `PointWork::from_bootstrap`'s docs) -
+    // exclude those observations from the intrinsics-refining pass so they
+    // can't bias a *shared* focal length, even under Huber loss (which
+    // down-weights an outlier's gradient but never removes it, and can't
+    // catch a self-consistent-but-wrong-scale point at all since its
+    // reprojection error looks fine). Only applied when doing so leaves
+    // every non-fixed image still covered by at least one observation -
+    // otherwise that image's pose block would be entirely unconstrained in
+    // this pass, so fall back to the full set for safety.
+    // An earlier attempt excluded bootstrap-sourced points' observations
+    // from this pass entirely (their triangulated *scale* is only a guess,
+    // never independently verified against the reconstruction's
+    // established baseline - see `PointWork::from_bootstrap`'s docs, still
+    // accurate motivation). Reverted: on `temple_sparse_ring`'s long
+    // bootstrap-heavy chain, excluding even *some* observations left enough
+    // points with only one surviving observation (2 equations for 3
+    // unknowns) to destabilize the shared Schur-complement solve outright -
+    // reprojection error went from 0.31px to 25.7px, not just "somewhat
+    // worse". `filter_and_reoptimize`'s residual-based filtering below is
+    // the safer tool for this: it only ever drops an observation whose
+    // *current* fit is actually bad, never blind-drops sound ones.
+    let build_input = |fixed_cameras: Vec<bool>, obs: &[sfm_ba::Observation]| sfm_ba::BaInput {
+        camera_of_image: camera_of_image.clone(),
+        cameras: camera_list.clone(),
+        poses: ba_poses.clone(),
+        points: ba_points.clone(),
+        observations: obs.to_vec(),
+        fixed_poses: fixed_poses.clone(),
+        fixed_cameras,
+        fixed_camera_params: fixed_camera_params.clone(),
+    };
+
+    // Judge the two candidates by *plain* mean reprojection error, not the
+    // robust-loss-weighted cost `bundle_adjust` itself optimizes against:
+    // Huber/Cauchy loss is deliberately forgiving of outliers mid-iteration,
+    // which also makes it a poor judge of whether the final fit is actually
+    // good (see `sfm_ba::mean_reprojection_error`'s docs).
+    let eval_error = |output: &sfm_ba::BaOutput| -> f64 {
+        sfm_ba::mean_reprojection_error(&sfm_ba::BaInput {
+            camera_of_image: camera_of_image.clone(),
+            cameras: output.cameras.clone(),
+            poses: output.poses.clone(),
+            points: output.points.clone(),
+            observations: observations.clone(),
+            fixed_poses: vec![],
+            fixed_cameras: vec![],
+            fixed_camera_params: vec![],
+        })
+    };
+
+    // Only the intrinsics-refining pass gets outlier filtering: it's the one
+    // place a few badly-triangulated points can actually bias a *shared*
+    // parameter (focal length/distortion) rather than just their own
+    // already-somewhat-independent pose/point, and periodic in-loop calls
+    // during growth favor speed over this extra refinement.
+    let run_ba = |fixed_cameras: Vec<bool>| -> sfm_ba::BaOutput {
+        if allow_intrinsics {
+            filter_and_reoptimize(
+                build_input(fixed_cameras, &observations),
+                &ba_params,
+                params.max_reprojection_error_px,
+            )
+        } else {
+            sfm_ba::bundle_adjust(build_input(fixed_cameras, &observations), &ba_params)
+        }
+    };
+
+    let fixed_output = run_ba(vec![true; camera_list.len()]);
+
+    // Self-calibration (recovering intrinsics from image observations alone)
+    // needs real diversity in camera motion to be well-conditioned. Two
+    // distinct failure modes showed up on real test data with too little of
+    // it (see PLAN.md): a narrow-baseline capture can leave the fit *worse*
+    // than not refining at all (caught by the error comparison below); and,
+    // more insidiously, with very few images a flexible-enough distortion
+    // model can *lower* reprojection error by fitting a wildly unphysical
+    // coefficient that "explains away" a wrong focal length on the
+    // particular points available, rather than genuinely correcting it - a
+    // classic sparse-data overfit that a plain error comparison won't catch
+    // (its whole point is to look like a better fit). Require a minimum
+    // number of genuinely different views per camera before trusting it with
+    // any intrinsics refinement at all, on top of the error comparison.
+    const MIN_IMAGES_PER_CAMERA_FOR_INTRINSICS: usize = 5;
+    let mut images_per_camera = vec![0usize; camera_list.len()];
+    for &c in &camera_of_image {
+        images_per_camera[c] += 1;
+    }
+    let any_camera_eligible = images_per_camera
+        .iter()
+        .any(|&n| n >= MIN_IMAGES_PER_CAMERA_FOR_INTRINSICS);
+
+    let output = if allow_intrinsics && any_camera_eligible {
+        let free_fixed_cameras: Vec<bool> = images_per_camera
+            .iter()
+            .map(|&n| n < MIN_IMAGES_PER_CAMERA_FOR_INTRINSICS)
+            .collect();
+        let free_output = run_ba(free_fixed_cameras);
+        // Belt-and-suspenders plausibility bound: a real photographic lens's
+        // radial/tangential distortion coefficients are essentially never
+        // this large, so an optimizer output that produces one is treated as
+        // a bad optimum outright, regardless of what its own reprojection
+        // error says.
+        let distortion_is_plausible = free_output
+            .cameras
+            .iter()
+            .all(|cam| cam.opencv_distortion().iter().all(|&d| d.abs() < 2.0));
+        if distortion_is_plausible && eval_error(&free_output) < eval_error(&fixed_output) {
+            free_output
+        } else {
+            fixed_output
+        }
+    } else {
+        fixed_output
+    };
+
+    for (compact, &orig) in image_ids.iter().enumerate() {
+        poses[orig] = Some(output.poses[compact].clone());
+    }
+    for (compact, &orig) in point_ids.iter().enumerate() {
+        points[orig].xyz = output.points[compact];
+    }
+    for (idx, &cam_id) in camera_id_list.iter().enumerate() {
+        cameras.insert(cam_id, output.cameras[idx]);
+    }
+}
+
+/// Iteratively drops observations whose reprojection error (under the
+/// current fit) exceeds `threshold_px`, re-running bundle adjustment on the
+/// survivors each round - COLMAP's `FilterObservations`/`FilterPoints`
+/// pattern. Huber loss down-weights an outlier's gradient contribution but
+/// never removes it entirely; a handful of badly-triangulated points (most
+/// commonly from a lower-confidence bootstrap registration, see
+/// `try_bootstrap_bridge_image`) can still measurably drag a *shared*
+/// camera's intrinsics away from the true value even under robust loss,
+/// which is exactly what widened `sceaux_castle`'s focal length error once
+/// bootstrap-registered images 10/11 started contributing to the same
+/// joint solve - see PLAN.md.
+fn filter_and_reoptimize(
+    input: sfm_ba::BaInput,
+    ba_params: &sfm_ba::BaParams,
+    threshold_px: f64,
+) -> sfm_ba::BaOutput {
+    let camera_of_image = input.camera_of_image.clone();
+    let fixed_poses = input.fixed_poses.clone();
+    let fixed_cameras = input.fixed_cameras.clone();
+    let fixed_camera_params = input.fixed_camera_params.clone();
+    let mut observations = input.observations.clone();
+
+    let mut output = sfm_ba::bundle_adjust(input, ba_params);
+
+    const FILTER_ROUNDS: usize = 2;
+    const MIN_OBSERVATIONS: usize = 12;
+    for _ in 0..FILTER_ROUNDS {
+        let before = observations.len();
+        observations.retain(|obs| {
+            let pose = &output.poses[obs.image_idx];
+            let cam = &output.cameras[camera_of_image[obs.image_idx]];
+            let point = &output.points[obs.point_idx];
+            let pc = pose.transform_point(point);
+            if pc.z <= 1e-9 {
+                return false;
+            }
+            let (px, py) = cam.project(&pc);
+            ((px - obs.x).powi(2) + (py - obs.y).powi(2)).sqrt() <= threshold_px
+        });
+        if observations.len() == before || observations.len() < MIN_OBSERVATIONS {
+            break;
+        }
+        output = sfm_ba::bundle_adjust(
+            sfm_ba::BaInput {
+                camera_of_image: camera_of_image.clone(),
+                cameras: output.cameras.clone(),
+                poses: output.poses.clone(),
+                points: output.points.clone(),
+                observations: observations.clone(),
+                fixed_poses: fixed_poses.clone(),
+                fixed_cameras: fixed_cameras.clone(),
+                fixed_camera_params: fixed_camera_params.clone(),
+            },
+            ba_params,
+        );
+    }
+    output
+}
+
+fn assemble_reconstruction(
+    input: &ReconstructionInput,
+    cameras: &HashMap<u32, CameraModel>,
+    registered: &[bool],
+    poses: &[Option<Pose>],
+    points: &[PointWork],
+) -> Reconstruction {
+    let mut recon = Reconstruction::new();
+    // Only cameras actually used by a registered image are meaningful in the
+    // output, but including all input cameras verbatim is harmless and simpler.
+    // Width/height come from the original input (they never change); the
+    // intrinsic model itself comes from `cameras`, which carries whatever
+    // `run_bundle_adjustment` refined it to - `input.cameras` would still
+    // have the pre-refinement initial guess.
+    for (&camera_id, camera) in &input.cameras {
+        let mut camera = camera.clone();
+        if let Some(&refined) = cameras.get(&camera_id) {
+            camera.model = refined;
+        }
+        recon.cameras.insert(camera_id, camera);
+    }
+
+    for (idx, image_input) in input.images.iter().enumerate() {
+        if !registered[idx] {
+            continue;
+        }
+        let pose = poses[idx].clone().unwrap();
+        let mut image = Image::new_unregistered(
+            image_input.image_id,
+            image_input.camera_id,
+            image_input.name.clone(),
+        );
+        image.pose = pose;
+        image.keypoints = image_input
+            .features
+            .keypoints
+            .iter()
+            .map(|kp| (kp.x, kp.y))
+            .collect();
+        image.point3d_ids = vec![None; image.keypoints.len()];
+        recon.images.insert(image_input.image_id, image);
+    }
+
+    let mut next_id = 1u64;
+    for point in points {
+        if point.track.len() < 2 {
+            continue;
+        }
+        let mut track_elements = Vec::new();
+        let mut total_error = 0.0;
+        let mut n_err = 0usize;
+        for &(image_idx, kp_idx) in &point.track {
+            if !registered[image_idx] {
+                continue;
+            }
+            let pose = poses[image_idx].as_ref().unwrap();
+            let cam = &cameras[&input.images[image_idx].camera_id];
+            // Exact pixel-space error via the camera's full projection
+            // (including distortion), *not* `to_normalized` +
+            // `reprojection_error_normalized`: that pair ignores distortion
+            // entirely (fine for triangulation/PnP inputs when `k` is still
+            // the initial all-zero guess, but wrong - understating error by
+            // however much distortion the final refined model actually has -
+            // once bundle adjustment has refined a nonzero `k`).
+            let (obs_x, obs_y) = keypoint_px(&input.images[image_idx].features, kp_idx);
+            let pc = pose.transform_point(&point.xyz);
+            if pc.z > 1e-9 {
+                let (px, py) = cam.project(&pc);
+                let e = ((px - obs_x).powi(2) + (py - obs_y).powi(2)).sqrt();
+                total_error += e;
+                n_err += 1;
+            }
+            track_elements.push(TrackElement {
+                image_id: input.images[image_idx].image_id,
+                point2d_idx: kp_idx,
+            });
+        }
+        if track_elements.len() < 2 {
+            continue;
+        }
+        let mean_error = if n_err > 0 {
+            total_error / n_err as f64
+        } else {
+            0.0
+        };
+
+        let point3d_id = next_id;
+        next_id += 1;
+        recon.points3d.insert(
+            point3d_id,
+            Point3D {
+                id: point3d_id,
+                xyz: point.xyz,
+                color: [180, 180, 180],
+                error: mean_error,
+                track: track_elements.clone(),
+            },
+        );
+        for te in &track_elements {
+            if let Some(image) = recon.images.get_mut(&te.image_id) {
+                if let Some(slot) = image.point3d_ids.get_mut(te.point2d_idx as usize) {
+                    *slot = Some(point3d_id);
+                }
+            }
+        }
+    }
+
+    recon
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nalgebra::UnitQuaternion;
+    use sfm_core::{Descriptors, Keypoint};
+
+    fn pinhole(f: f64, w: u32, h: u32) -> Camera {
+        Camera {
+            camera_id: 1,
+            model: CameraModel::SimplePinhole {
+                f,
+                cx: w as f64 / 2.0,
+                cy: h as f64 / 2.0,
+            },
+            width: w,
+            height: h,
+        }
+    }
+
+    /// True relative pose of camera `j` given camera `i` as the identity
+    /// reference frame - i.e. what `sfm-match`'s essential-matrix decomposition
+    /// would (up to scale) recover for that pair. Used here to hand
+    /// `run_incremental` an exact synthetic view graph without going through
+    /// real feature matching.
+    fn relative_pose(true_poses: &[Pose], i: usize, j: usize) -> Pose {
+        let ri_inv = true_poses[i].rotation.inverse();
+        let rotation = true_poses[j].rotation * ri_inv;
+        let translation = true_poses[j].translation - rotation * true_poses[i].translation;
+        Pose::from_rotation_translation(rotation, translation)
+    }
+
+    #[test]
+    fn incremental_pipeline_recovers_synthetic_multiview_scene() {
+        let cam = pinhole(750.0, 640, 480);
+        let true_poses = vec![
+            Pose::identity(),
+            Pose::from_rotation_translation(
+                UnitQuaternion::from_euler_angles(0.0, 0.12, 0.0),
+                Vector3::new(0.6, 0.0, 0.05),
+            ),
+            Pose::from_rotation_translation(
+                UnitQuaternion::from_euler_angles(0.05, 0.22, -0.02),
+                Vector3::new(1.1, 0.08, 0.15),
+            ),
+            Pose::from_rotation_translation(
+                UnitQuaternion::from_euler_angles(-0.03, 0.3, 0.01),
+                Vector3::new(1.6, -0.05, 0.3),
+            ),
+        ];
+        let true_points: Vec<Vector3<f64>> = (0..40)
+            .map(|i| {
+                let t = i as f64;
+                Vector3::new(
+                    0.5 * (t * 0.37).sin(),
+                    0.4 * (t * 0.53).cos(),
+                    4.0 + 0.08 * t,
+                )
+            })
+            .collect();
+
+        let mut images = Vec::new();
+        for (idx, pose) in true_poses.iter().enumerate() {
+            let mut keypoints = Vec::with_capacity(true_points.len());
+            for point in &true_points {
+                let (x, y) = cam.model.project(&pose.transform_point(point));
+                keypoints.push(Keypoint {
+                    x: x as f32,
+                    y: y as f32,
+                    scale: 1.0,
+                    angle: 0.0,
+                    response: 1.0,
+                });
+            }
+            let n = keypoints.len();
+            images.push(ImageInput {
+                image_id: (idx + 1) as u32,
+                camera_id: 1,
+                name: format!("img{idx}.png"),
+                features: FeatureSet {
+                    keypoints,
+                    descriptors: Descriptors::Float32 {
+                        dim: 1,
+                        data: vec![0.0; n],
+                    },
+                },
+            });
+        }
+
+        // Every pair sees the full point set, which makes seed-pair choice
+        // ("most inlier matches") a tie between all 6 pairs; `max_by_key`
+        // breaks ties by taking the *last* candidate, so without forcing a
+        // winner the seed (and therefore the whole reconstruction's gauge/
+        // anchor frame) would land on an arbitrary pair instead of (0, 1) -
+        // equally valid, but not what this test's ground-truth comparison
+        // assumes. Give every other pair one fewer match so (0, 1) uniquely
+        // wins and the reconstruction is anchored at camera 0, matching
+        // `true_poses[0] == identity`.
+        let mut pairs = Vec::new();
+        for i in 0..images.len() {
+            for j in (i + 1)..images.len() {
+                let count = if (i, j) == (0, 1) {
+                    true_points.len()
+                } else {
+                    true_points.len() - 1
+                };
+                let matches: Vec<(u32, u32)> = (0..count as u32).map(|k| (k, k)).collect();
+                pairs.push(PairInput {
+                    i,
+                    j,
+                    geometry: TwoViewGeometryRecord {
+                        pose: relative_pose(&true_poses, i, j),
+                        inlier_matches: matches,
+                    },
+                });
+            }
+        }
+
+        let mut cameras = HashMap::new();
+        cameras.insert(1u32, cam);
+        let input = ReconstructionInput {
+            images,
+            cameras,
+            pairs,
+        };
+
+        let recon = run_incremental(&input, &IncrementalParams::default());
+
+        assert_eq!(
+            recon.images.len(),
+            4,
+            "expected all 4 synthetic images to register"
+        );
+        assert!(
+            recon.points3d.len() >= 30,
+            "expected most points to survive triangulation, got {}",
+            recon.points3d.len()
+        );
+
+        // Every registered image's pose should match ground truth (up to the
+        // seed-anchored gauge - camera 0 is fixed at identity, and the seed
+        // pair's exact relative pose fixes scale too, so no alignment step
+        // should be needed for a noiseless synthetic scene).
+        for image in recon.images.values() {
+            let true_idx = (image.id - 1) as usize;
+            let true_pose = &true_poses[true_idx];
+            let center_err = (image.pose.camera_center() - true_pose.camera_center()).norm();
+            assert!(
+                center_err < 0.05,
+                "image {} camera center off by {center_err}",
+                image.id
+            );
+            let angle_err = image.pose.rotation.angle_to(&true_pose.rotation);
+            assert!(
+                angle_err < 0.01,
+                "image {} rotation off by {angle_err} rad",
+                image.id
+            );
+        }
+
+        for point in recon.points3d.values() {
+            let te = &point.track[0];
+            let true_idx = te.point2d_idx as usize;
+            let err = (point.xyz - true_points[true_idx]).norm();
+            assert!(
+                err < 0.05,
+                "point {} off by {err}: got {:?} want {:?}",
+                point.id,
+                point.xyz,
+                true_points[true_idx]
+            );
+        }
+    }
+}

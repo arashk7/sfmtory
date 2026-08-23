@@ -1,0 +1,23 @@
+/target
+
+# Third-party test datasets (see data/README.md) - not ours to redistribute,
+# and large binary image sets don't belong in git history anyway. Re-fetch
+# with the commands in data/README.md. data/README.md itself stays tracked.
+/data/*
+!/data/README.md
+
+# graphify's generated knowledge-graph output
+/graphify-out
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+
+# Local env overrides
+.env
+.env.local

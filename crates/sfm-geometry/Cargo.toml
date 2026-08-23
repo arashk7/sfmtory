@@ -1,0 +1,9 @@
+[package]
+name = "sfm-geometry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sfm-core = { path = "../sfm-core" }
+nalgebra.workspace = true

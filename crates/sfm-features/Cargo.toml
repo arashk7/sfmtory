@@ -1,0 +1,16 @@
+[package]
+name = "sfm-features"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sfm-core = { path = "../sfm-core" }
+image.workspace = true
+imageproc.workspace = true
+nalgebra.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+
+[dev-dependencies]

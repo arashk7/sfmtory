@@ -1,0 +1,11 @@
+[package]
+name = "sfm-ba"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sfm-core = { path = "../sfm-core" }
+nalgebra.workspace = true
+rayon.workspace = true
+tracing.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "sfm-match"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sfm-core = { path = "../sfm-core" }
+sfm-geometry = { path = "../sfm-geometry" }
+rayon.workspace = true
+nalgebra.workspace = true
