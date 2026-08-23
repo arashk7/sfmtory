@@ -35,24 +35,31 @@ pub struct DetectorConfig {
 }
 
 impl DetectorConfig {
+    /// Detector-specific `max_features` caps start at each detector's own
+    /// sensible built-in default (e.g. SIFT's 8000, matching the same order
+    /// of magnitude as COLMAP's own default `max_num_features=8192`) - not
+    /// uncapped. An earlier version reset both to `None` here unconditionally
+    /// (only a user-supplied `--max-features` could ever cap anything),
+    /// which combined with other detector-accuracy fixes measurably
+    /// ballooned real per-image feature counts to ~4-5x *more* than COLMAP's
+    /// own default, not just matching it - purely more low-quality/marginal
+    /// keypoints diluting the strong ones and slowing every downstream
+    /// O(n^2) matching pair for no accuracy benefit (see PLAN.md's
+    /// accuracy/density investigation). Call `with_max_features` to override
+    /// this default explicitly (e.g. from a CLI flag).
     pub fn new(kind: DetectorKind) -> Self {
-        let mut sift = sift::SiftParams::default();
-        let mut orb = orb::OrbParams::default();
         DetectorConfig {
             kind,
             max_features: None,
-            sift: {
-                sift.max_features = None;
-                sift
-            },
-            orb: {
-                orb.max_features = None;
-                orb
-            },
+            sift: sift::SiftParams::default(),
+            orb: orb::OrbParams::default(),
             aruco: aruco::ArucoParams::default(),
         }
     }
 
+    /// Overrides both detectors' `max_features` cap. Pass `None` to
+    /// explicitly request *uncapped* extraction (not the default - see
+    /// `new`'s doc comment for why unbounded isn't the baseline behavior).
     pub fn with_max_features(mut self, max: Option<usize>) -> Self {
         self.max_features = max;
         self.sift.max_features = max;

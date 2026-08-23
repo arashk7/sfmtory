@@ -1,11 +1,19 @@
 //! Descriptor matching: brute-force mutual-nearest-neighbor with Lowe's ratio
 //! test for float (SIFT) and binary (ORB) descriptors, and exact-ID matching
-//! for ArUco marker corners. Brute force is O(n1*n2) per image pair, which is
-//! fine at the max-features counts this project defaults to but becomes the
-//! bottleneck on very large (>5000 features/image) sets - a kd-tree (e.g. the
-//! `kiddo` crate) for the float case is the obvious next speed upgrade if
-//! profiling shows this dominating `sfm match` runtime; see PLAN.md.
+//! for ArUco marker corners. Brute force is O(n1*n2) per image pair - not
+//! replaced with an approximate/tree-based search (a kd-tree degrades to
+//! near-brute-force well before 128 dimensions, which is exactly SIFT's
+//! descriptor size, so it wouldn't actually help here), but the *inner*
+//! per-pair distance computation matters a lot: `match_float` computes the
+//! bulk squared-distance grid as one dense matrix multiply (the same
+//! "quadratic expansion" trick COLMAP/FAISS use for large-scale L2 descriptor
+//! matching - `|a-b|^2 = |a|^2 + |b|^2 - 2*a.b`), not a naive
+//! O(n1*n2*dim) scalar loop; both float and binary matching also compute
+//! each pairwise distance exactly once (see `match_float`/`match_binary`'s
+//! own doc comments) rather than once for the forward pass and again for the
+//! reverse cross-check.
 
+use nalgebra::DMatrix;
 use sfm_core::Descriptors;
 
 #[derive(Debug, Clone, Copy)]
@@ -49,46 +57,64 @@ fn match_float(d1: &Descriptors, d2: &Descriptors, ratio: f32) -> Vec<(u32, u32)
     if n1 == 0 || n2 == 0 {
         return Vec::new();
     }
-    let sq_dist =
-        |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum() };
+    let (Descriptors::Float32 { dim, data: data1 }, Descriptors::Float32 { data: data2, .. }) =
+        (d1, d2)
+    else {
+        return Vec::new();
+    };
+    let dim = *dim as usize;
 
-    let forward: Vec<Option<usize>> = (0..n1)
-        .map(|i| {
-            let qi = d1.float_row(i).unwrap();
-            let (mut best_j, mut best, mut second) = (usize::MAX, f32::MAX, f32::MAX);
-            for j in 0..n2 {
-                let dist = sq_dist(qi, d2.float_row(j).unwrap());
-                if dist < best {
-                    second = best;
-                    best = dist;
-                    best_j = j;
-                } else if dist < second {
-                    second = dist;
-                }
-            }
-            if best_j != usize::MAX && best < ratio * ratio * second {
-                Some(best_j)
-            } else {
-                None
-            }
-        })
-        .collect();
+    // Bulk squared distances via the quadratic expansion
+    // `|a-b|^2 = |a|^2 + |b|^2 - 2*a.b`: the `a.b` term for *every* (i, j)
+    // pair is one dense n1xn2 matrix multiply, not an O(n1*n2*dim) scalar
+    // loop - see this module's doc comment for why that matters so much
+    // more now that SIFT's default feature counts were raised to match
+    // COLMAP's own (~10k/image, not ~5k; see PLAN.md's accuracy/density
+    // investigation). `max(0.0)` guards against a tiny negative value from
+    // floating-point cancellation when `a` and `b` are nearly identical.
+    let x1 = DMatrix::from_row_slice(n1, dim, data1);
+    let x2 = DMatrix::from_row_slice(n2, dim, data2);
+    let dot = &x1 * x2.transpose();
+    let norm1: Vec<f32> = (0..n1).map(|i| x1.row(i).norm_squared()).collect();
+    let norm2: Vec<f32> = (0..n2).map(|j| x2.row(j).norm_squared()).collect();
 
-    let mut out = Vec::new();
-    for (i, m) in forward.iter().enumerate() {
-        let Some(j) = *m else { continue };
-        // Mutual-NN cross-check: is `i` also `j`'s nearest neighbor in set 1?
-        let qj = d2.float_row(j).unwrap();
-        let (mut best_k, mut best) = (usize::MAX, f32::MAX);
-        for k in 0..n1 {
-            let dist = sq_dist(qj, d1.float_row(k).unwrap());
-            if dist < best {
-                best = dist;
-                best_k = k;
+    // Single pass over the resulting n1*n2 distance grid, updating both
+    // directions' running best/second-best as we go - row `i`'s forward
+    // best+second-best (for the ratio test) and column `j`'s reverse best
+    // (for the mutual-NN cross-check) simultaneously, rather than a forward
+    // pass followed by a full O(n1) search per match just to find its
+    // reverse nearest neighbor.
+    let mut best1 = vec![f32::MAX; n1];
+    let mut second1 = vec![f32::MAX; n1];
+    let mut best1_idx = vec![u32::MAX; n1];
+    let mut best2 = vec![f32::MAX; n2];
+    let mut best2_idx = vec![u32::MAX; n2];
+
+    for i in 0..n1 {
+        for j in 0..n2 {
+            let dist = (norm1[i] + norm2[j] - 2.0 * dot[(i, j)]).max(0.0);
+            if dist < best1[i] {
+                second1[i] = best1[i];
+                best1[i] = dist;
+                best1_idx[i] = j as u32;
+            } else if dist < second1[i] {
+                second1[i] = dist;
+            }
+            if dist < best2[j] {
+                best2[j] = dist;
+                best2_idx[j] = i as u32;
             }
         }
-        if best_k == i {
-            out.push((i as u32, j as u32));
+    }
+
+    let mut out = Vec::new();
+    for i in 0..n1 {
+        let j = best1_idx[i];
+        if j == u32::MAX || best1[i] >= ratio * ratio * second1[i] {
+            continue;
+        }
+        if best2_idx[j as usize] == i as u32 {
+            out.push((i as u32, j));
         }
     }
     out
@@ -103,42 +129,41 @@ fn match_binary(d1: &Descriptors, d2: &Descriptors, ratio: f32) -> Vec<(u32, u32
     if n1 == 0 || n2 == 0 {
         return Vec::new();
     }
-    let forward: Vec<Option<usize>> = (0..n1)
-        .map(|i| {
-            let qi = d1.binary_row(i).unwrap();
-            let (mut best_j, mut best, mut second) = (usize::MAX, u32::MAX, u32::MAX);
-            for j in 0..n2 {
-                let dist = hamming(qi, d2.binary_row(j).unwrap());
-                if dist < best {
-                    second = best;
-                    best = dist;
-                    best_j = j;
-                } else if dist < second {
-                    second = dist;
-                }
-            }
-            if best_j != usize::MAX && (best as f32) < ratio * (second as f32) {
-                Some(best_j)
-            } else {
-                None
-            }
-        })
-        .collect();
+    // Single-pass forward+reverse nearest-neighbor computation - see
+    // `match_float`'s doc comment for why this replaced two separate passes
+    // over the same n1*n2 grid.
+    let mut best1 = vec![u32::MAX; n1];
+    let mut second1 = vec![u32::MAX; n1];
+    let mut best1_idx = vec![u32::MAX; n1];
+    let mut best2 = vec![u32::MAX; n2];
+    let mut best2_idx = vec![u32::MAX; n2];
 
-    let mut out = Vec::new();
-    for (i, m) in forward.iter().enumerate() {
-        let Some(j) = *m else { continue };
-        let qj = d2.binary_row(j).unwrap();
-        let (mut best_k, mut best) = (usize::MAX, u32::MAX);
-        for k in 0..n1 {
-            let dist = hamming(qj, d1.binary_row(k).unwrap());
-            if dist < best {
-                best = dist;
-                best_k = k;
+    for i in 0..n1 {
+        let qi = d1.binary_row(i).unwrap();
+        for j in 0..n2 {
+            let dist = hamming(qi, d2.binary_row(j).unwrap());
+            if dist < best1[i] {
+                second1[i] = best1[i];
+                best1[i] = dist;
+                best1_idx[i] = j as u32;
+            } else if dist < second1[i] {
+                second1[i] = dist;
+            }
+            if dist < best2[j] {
+                best2[j] = dist;
+                best2_idx[j] = i as u32;
             }
         }
-        if best_k == i {
-            out.push((i as u32, j as u32));
+    }
+
+    let mut out = Vec::new();
+    for i in 0..n1 {
+        let j = best1_idx[i];
+        if j == u32::MAX || (best1[i] as f32) >= ratio * (second1[i] as f32) {
+            continue;
+        }
+        if best2_idx[j as usize] == i as u32 {
+            out.push((i as u32, j));
         }
     }
     out

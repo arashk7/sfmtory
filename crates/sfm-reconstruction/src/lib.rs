@@ -831,6 +831,11 @@ fn try_bootstrap_bridge_image(
         for (img, kp, point_idx) in completions {
             points[point_idx].track.retain(|&(i, k)| !(i == img && k == kp));
             obs_to_point.remove(&(img, kp));
+            // The completion's own position update (if any) was computed
+            // including the observation just removed above - recompute
+            // from what's actually left so a rejected bootstrap trial can
+            // never leave a point's `xyz` reflecting an undone observation.
+            retriangulate_point(input, cameras, params, poses, points, point_idx);
         }
         for new_point in &points[before..] {
             for &(img, kp) in &new_point.track {
@@ -841,6 +846,103 @@ fn try_bootstrap_bridge_image(
         poses[u] = None;
     }
     false
+}
+
+/// Shared by `triangulate_and_complete_tracks` (gating a new observation
+/// added to an existing point) and `retriangulate_point` (gating a wholesale
+/// position update from a point's full track) - deliberately much stricter
+/// than `IncrementalParams::max_reprojection_error_px` (the bar for creating
+/// a brand new point from a fresh 2-view match): both mutate an *already-
+/// trusted* point in place rather than living or dying on their own, so a
+/// marginal case doesn't fail cleanly the way a marginal new point does - it
+/// degrades a point every other observation already relies on. Tuned
+/// empirically against all three real test datasets, together with
+/// `triangulate_and_complete_tracks`'s `bootstrap_registered` gate (also
+/// required - even at this threshold, allowing completions *from*
+/// bootstrap-registered cameras measurably hurt `temple_sparse_ring`'s
+/// focal-length accuracy, a dataset that leans heavily on bootstrap
+/// registrations): the 4px fresh-triangulation bar regressed all three
+/// datasets outright (worst case, `temple_sparse_ring`: reprojection error
+/// 0.38px -> 0.72px, intrinsics rejected entirely); 0.5px improves
+/// `sceaux_castle` (3.1% -> 2.78% focal error) and `temple_ring` (1.2% ->
+/// 0.99%) while leaving `temple_sparse_ring` within noise of its prior
+/// result (3.7% -> 3.86%).
+const COMPLETION_MAX_REPROJECTION_ERROR_PX: f64 = 0.5;
+
+/// Recomputes `points[point_idx]`'s 3D position from its *entire* current
+/// track (every current observation, using each observation's current
+/// pose) - not just the two views that originally triangulated it. Closes
+/// the literal gap `triangulate_and_complete_tracks` otherwise leaves open:
+/// a completion adds a *new* observation to a point's track, but until this
+/// function is called against it, the point's actual `xyz` stays frozen at
+/// whatever the original two-view estimate produced - the new (and every
+/// other) observation only ever reaches bundle adjustment as a reprojection
+/// target, never as evidence for a better triangulated position.
+///
+/// Replaces `xyz` only if the fresh N-view triangulation succeeds, clears
+/// `min_triangulation_angle_deg`, and every observation reprojects within
+/// `COMPLETION_MAX_REPROJECTION_ERROR_PX` (the same strict bar completions
+/// themselves use, not the looser `max_reprojection_error_px` fresh two-view
+/// triangulation uses) - this mutates an *already-established* point's
+/// position wholesale, a stronger action than a completion's single added
+/// observation, so it gets at least as strict a bar. A retriangulation that
+/// fails these is rejected outright, keeping the point's previous (still
+/// valid) position rather than replacing a known-good point with a worse one.
+fn retriangulate_point(
+    input: &ReconstructionInput,
+    cameras: &HashMap<u32, CameraModel>,
+    params: &IncrementalParams,
+    poses: &[Option<Pose>],
+    points: &mut [PointWork],
+    point_idx: usize,
+) {
+    if points[point_idx].track.len() < 2 {
+        return;
+    }
+
+    let views: Vec<(Pose, (f64, f64), usize)> = points[point_idx]
+        .track
+        .iter()
+        .filter_map(|&(img_idx, kp_idx)| {
+            let pose = poses[img_idx]?;
+            let cam = &cameras[&input.images[img_idx].camera_id];
+            let obs = to_normalized(keypoint_px(&input.images[img_idx].features, kp_idx), cam);
+            Some((pose, obs, img_idx))
+        })
+        .collect();
+    if views.len() < 2 {
+        return;
+    }
+
+    let dlt_input: Vec<(Pose, (f64, f64))> = views.iter().map(|&(p, o, _)| (p, o)).collect();
+    let Some(xyz) = triangulate_normalized(&dlt_input) else {
+        return;
+    };
+
+    let min_angle = params.min_triangulation_angle_deg.to_radians();
+    let centers: Vec<Vector3<f64>> = views.iter().map(|&(p, _, _)| p.camera_center()).collect();
+    let mut max_angle = 0.0_f64;
+    for i in 0..centers.len() {
+        for j in (i + 1)..centers.len() {
+            max_angle = max_angle.max(triangulation_angle(&centers[i], &centers[j], &xyz));
+        }
+    }
+    if max_angle < min_angle {
+        return;
+    }
+
+    for &(pose, obs, img_idx) in &views {
+        let cam = &cameras[&input.images[img_idx].camera_id];
+        let avg_focal = (cam.focal_lengths().0 + cam.focal_lengths().1) / 2.0;
+        let Some(err) = reprojection_error_normalized(&pose, &xyz, obs) else {
+            return;
+        };
+        if err * avg_focal > COMPLETION_MAX_REPROJECTION_ERROR_PX {
+            return;
+        }
+    }
+
+    points[point_idx].xyz = xyz;
 }
 
 /// For each match in `matches`, either extends an already-triangulated
@@ -894,24 +996,6 @@ fn triangulate_and_complete_tracks(
     let avg_focal_a = (cam_a.focal_lengths().0 + cam_a.focal_lengths().1) / 2.0;
     let avg_focal_b = (cam_b.focal_lengths().0 + cam_b.focal_lengths().1) / 2.0;
 
-    // Deliberately much stricter than `max_reprojection_error_px` (the bar
-    // for creating a brand new point from a fresh 2-view match): a
-    // completion touches an *already-trusted* point's existing track
-    // in-place rather than living or dying on its own, so a marginal one
-    // doesn't fail cleanly the way a marginal new point does - it degrades
-    // a point every other observation already relies on. Tuned empirically
-    // against all three real test datasets, together with the
-    // `bootstrap_registered` gate below (also required - even at this
-    // threshold, allowing completions *from* bootstrap-registered cameras
-    // measurably hurt `temple_sparse_ring`'s focal-length accuracy, a
-    // dataset that leans heavily on bootstrap registrations): the 4px
-    // fresh-triangulation bar regressed all three datasets outright (worst
-    // case, `temple_sparse_ring`: reprojection error 0.38px -> 0.72px,
-    // intrinsics rejected entirely); 0.5px improves `sceaux_castle` (3.1% ->
-    // 2.78% focal error) and `temple_ring` (1.2% -> 0.99%) while leaving
-    // `temple_sparse_ring` within noise of its prior result (3.7% -> 3.86%).
-    const COMPLETION_MAX_REPROJECTION_ERROR_PX: f64 = 0.5;
-
     let mut fresh: Vec<(u32, u32)> = Vec::new();
     let mut completions: Vec<(usize, u32, usize)> = Vec::new();
     for &(ka, kb) in matches {
@@ -926,6 +1010,7 @@ fn triangulate_and_complete_tracks(
                         points[point_idx].track.push((b, kb));
                         obs_to_point.insert((b, kb), point_idx);
                         completions.push((b, kb, point_idx));
+                        retriangulate_point(input, cameras, params, poses, points, point_idx);
                     }
                 }
             }
@@ -936,6 +1021,7 @@ fn triangulate_and_complete_tracks(
                         points[point_idx].track.push((a, ka));
                         obs_to_point.insert((a, ka), point_idx);
                         completions.push((a, ka, point_idx));
+                        retriangulate_point(input, cameras, params, poses, points, point_idx);
                     }
                 }
             }

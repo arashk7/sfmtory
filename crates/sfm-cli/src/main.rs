@@ -266,8 +266,16 @@ fn cmd_extract(args: ExtractArgs) -> Result<()> {
     if args.gpu {
         eprintln!("note: --gpu has no effect for {:?} (classical CPU detector); GPU is used for the learned detectors once implemented", args.detector);
     }
-    let config = sfm_features::DetectorConfig::new(detector_kind)
-        .with_max_features(args.max_features.map(|v| v as usize));
+    // Leave each detector's own built-in `max_features` default in place
+    // unless `--max-features` was passed explicitly - see
+    // `DetectorConfig::new`'s doc comment for why `None` here must mean
+    // "use the default", not "uncapped".
+    let config = match args.max_features {
+        Some(n) => {
+            sfm_features::DetectorConfig::new(detector_kind).with_max_features(Some(n as usize))
+        }
+        None => sfm_features::DetectorConfig::new(detector_kind),
+    };
 
     let image_paths = list_images_sorted(&project.config.images_dir)?;
     if image_paths.is_empty() {
@@ -276,17 +284,39 @@ fn cmd_extract(args: ExtractArgs) -> Result<()> {
 
     // Decoding + detection is embarrassingly parallel and touches no shared
     // state; only the sqlite writes afterward need to be sequential.
-    let detected: Vec<Result<(PathBuf, (u32, u32), sfm_core::FeatureSet)>> = image_paths
-        .par_iter()
-        .map(|path| {
-            let (w, h) = image::image_dimensions(path)
-                .with_context(|| format!("reading dimensions of {}", path.display()))?;
-            let features = sfm_features::detect_file(path, &config)
-                .map_err(|e| anyhow::anyhow!("{e}"))
-                .with_context(|| format!("detecting features in {}", path.display()))?;
-            Ok((path.clone(), (w, h), features))
-        })
-        .collect();
+    //
+    // Runs on a bounded-width local thread pool, not the rayon global default
+    // (`num_cpus`): SIFT's 2x upsample path (applied below
+    // `UPSAMPLE_MAX_MIN_DIM` - see `SiftParams`) roughly doubles per-image
+    // peak memory for the Gaussian/DoG pyramid on top of the 4x from the
+    // extra octave itself, and `num_cpus` upsampled photos in flight
+    // simultaneously measurably OOM-killed extraction on a real (memory-
+    // constrained) machine during development - upsampling is now gated off
+    // for already-high-resolution photos for accuracy reasons of its own
+    // (see `sift`'s module doc comment), which incidentally removes most of
+    // the original risk, but this bound is left in place as a safety margin
+    // for small/upsampled-photo datasets rather than re-widened. Capped at 4
+    // regardless of core count as a simple, safe bound rather than trying to
+    // size it from available memory at runtime.
+    let extraction_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(rayon::current_num_threads().min(4))
+        .build()
+        .context("building extraction thread pool")?;
+    let detected: Vec<Result<(PathBuf, (u32, u32), sfm_core::FeatureSet)>> =
+        extraction_pool.install(|| {
+            image_paths
+                .par_iter()
+                .map(|path| {
+                    let (w, h) = image::image_dimensions(path).with_context(|| {
+                        format!("reading dimensions of {}", path.display())
+                    })?;
+                    let features = sfm_features::detect_file(path, &config)
+                        .map_err(|e| anyhow::anyhow!("{e}"))
+                        .with_context(|| format!("detecting features in {}", path.display()))?;
+                    Ok((path.clone(), (w, h), features))
+                })
+                .collect()
+        });
 
     let db = Database::open(&project.database_path())?;
     let mut camera_by_dims: HashMap<(u32, u32), u32> = HashMap::new();

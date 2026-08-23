@@ -25,11 +25,14 @@ pub struct VerificationParams {
     /// absolute inlier count is high and the pose is solid. A real pair with
     /// 83-133 correct RANSAC inliers got rejected here at the previous
     /// default of 0.25 purely on ratio, costing real registrations - see
-    /// PLAN.md's real-data-testing entry. COLMAP's own two-view verification
-    /// doesn't gate on a hard inlier ratio at all, only absolute count;
-    /// `min_inliers` alone (COLMAP's own default value) is the primary
-    /// defense, with a low ratio floor kept only as a sanity backstop
-    /// against a degenerate handful-of-coincidental-matches case.
+    /// PLAN.md's real-data-testing entry. Now matches COLMAP's own default
+    /// exactly (`TwoViewGeometryOptions::min_inlier_ratio = 0.0`, confirmed
+    /// via `pycolmap`): no ratio gate at all, `min_inliers` alone (also
+    /// COLMAP's own default value, 15) is the entire defense. An even lower
+    /// non-zero floor was tried as a "sanity backstop" against a degenerate
+    /// handful-of-coincidental-matches case, but measurably cost verified
+    /// pairs relative to COLMAP on real data without evidence it ever
+    /// caught a real bad pair - removed rather than kept on spec.
     pub min_inliers: usize,
     pub min_inlier_ratio: f64,
 }
@@ -41,7 +44,7 @@ impl Default for VerificationParams {
             ransac_threshold_px: 4.0,
             ransac_max_iterations: 2000,
             min_inliers: 15,
-            min_inlier_ratio: 0.05,
+            min_inlier_ratio: 0.0,
         }
     }
 }

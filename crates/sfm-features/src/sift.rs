@@ -4,11 +4,24 @@
 //! (US6711293) expired in 2020, so this is free to use commercially; this is
 //! an original implementation (no code taken from any existing SIFT).
 //!
-//! One deliberate deviation from Lowe's original: no 2x pre-upsampling of the
-//! input image (which he uses to find more low-contrast keypoints at the cost
-//! of ~4x the compute). Trading a little recall on tiny/blurry features for
-//! speed matches this project's "as fast as possible" goal; upsampling can be
-//! added later as a `--detector sift --upsample` flag if a scene needs it.
+//! 2x pre-upsampling (Lowe's original construction, also COLMAP's/VLFeat's
+//! default `first_octave=-1`) is applied only *below* `UPSAMPLE_MAX_MIN_DIM`,
+//! not unconditionally. This was tried both ways on real data (see PLAN.md's
+//! accuracy/density investigation), and unconditional upsampling measurably
+//! *hurt* an already-high-resolution dataset (`sceaux_castle`, 2832x2128
+//! originals). With a fixed per-image `max_features` budget, upsampling adds
+//! a whole extra (finest) octave of keypoints drawn from interpolated, not
+//! genuinely new, pixel data, and those keypoints compete in
+//! `FeatureSet::truncate_to_strongest`'s top-K selection against, and
+//! measurably crowd out, better and more viewpoint-stable keypoints from the
+//! native-resolution octaves. Verified head-to-head on `sceaux_castle` at an
+//! identical 8000/image cap: 44/55 pairs verified and 15684 inlier matches
+//! with upsampling off, vs. only 30/55 pairs and 5125 matches with it on - a
+//! real quality regression, not just extra compute. Upsampling still
+//! measurably *helps* low-resolution photos (`temple_sparse_ring`'s 640x480
+//! originals), where there's no native-resolution surplus to dilute in the
+//! first place, hence the size-conditional default rather than a blanket
+//! on/off choice.
 
 use nalgebra::{Matrix3, Vector3};
 use sfm_core::{Descriptors, FeatureSet, Keypoint};
@@ -25,20 +38,15 @@ pub struct SiftParams {
     /// Double the image before building the first octave (Lowe's original
     /// construction, also COLMAP's/VLFeat's default) - finds substantially
     /// more low-contrast/small keypoints, at roughly 4x the compute *and
-    /// memory* of the first octave. Matters most on already-small images:
-    /// skipping it leaves very little resolution for anything past the
-    /// first octave or two, which measurably starved feature counts on
-    /// `temple_sparse_ring` (640x480 photos) specifically - see PLAN.md.
-    /// Only actually applied below `UPSAMPLE_MAX_MIN_DIM` (see `detect`):
-    /// full-resolution photos (`sceaux_castle`'s ~2832x2128 originals) have
-    /// no shortage of resolution to begin with, and the same 4x blowup that
-    /// helps a small image OOM-crashed this exact environment when applied
-    /// unconditionally to 11 of them extracted in parallel.
+    /// memory* of the first octave. Only actually applied below
+    /// `UPSAMPLE_MAX_MIN_DIM` (see `detect`) even when `true` - see the
+    /// module doc comment for why unconditional upsampling regressed match
+    /// quality on high-resolution photos specifically.
     pub upsample: bool,
 }
 
 /// Upsampling is skipped above this original min-dimension regardless of
-/// `SiftParams::upsample` - see that field's docs.
+/// `SiftParams::upsample` - see the module doc comment.
 const UPSAMPLE_MAX_MIN_DIM: u32 = 1600;
 
 impl Default for SiftParams {
@@ -46,7 +54,14 @@ impl Default for SiftParams {
         SiftParams {
             scales_per_octave: 3,
             sigma0: 1.6,
-            contrast_threshold: 0.04,
+            // Effective per-scale threshold is `contrast_threshold /
+            // scales_per_octave` (see `find_octave_extrema`) - COLMAP/VLFeat's
+            // own default `peak_threshold` (0.02/3 = 0.00667) is already
+            // stated in that same per-scale form, equivalent to a
+            // `contrast_threshold` of 0.02, not 0.04. The stricter (2x) value
+            // here measurably starved feature counts relative to COLMAP on
+            // real data (see PLAN.md's accuracy/density investigation).
+            contrast_threshold: 0.02,
             edge_threshold: 10.0,
             max_features: Some(8000),
             upsample: true,
