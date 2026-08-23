@@ -21,3 +21,6 @@ Thumbs.db
 # Local env overrides
 .env
 .env.local
+
+decisions.md
+PLAN.md
