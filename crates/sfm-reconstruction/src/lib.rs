@@ -363,6 +363,15 @@ fn grow_from_seed(
     // been triangulated.
     let mut bootstrap_failed: std::collections::HashSet<(usize, usize)> =
         std::collections::HashSet::new();
+    // Which images were registered via the bridge bootstrap rather than
+    // ordinary RANSAC/GN-verified PnP - used to gate track completion (see
+    // `triangulate_and_complete_tracks`'s docs): a bootstrap pose is
+    // inherently less certain, and letting its observations extend
+    // *other* images' already-trusted points measurably hurt calibration
+    // accuracy on `temple_sparse_ring` (a dataset that leans heavily on
+    // bootstrap registrations) even at a strict completion threshold,
+    // while helping on datasets with few or no bootstrap registrations.
+    let mut bootstrap_registered = vec![false; n];
 
     poses[seed_i] = Some(Pose::identity());
     poses[seed_j] = Some(*seed_pose);
@@ -475,9 +484,11 @@ fn grow_from_seed(
                     &mut poses,
                     &mut points,
                     &mut obs_to_point,
+                    &bootstrap_registered,
                 ) {
                     registered[u] = true;
                     failed_at_count[u] = None;
+                    bootstrap_registered[u] = true;
                     // Bootstrapped poses carry more uncertainty than an
                     // ordinary RANSAC/GN-verified PnP registration - no
                     // minimum inlier count backs them, and a bootstrap
@@ -548,23 +559,7 @@ fn grow_from_seed(
             let Some(matches) = oriented_matches(pair, u) else {
                 continue;
             };
-            let fresh: Vec<(u32, u32)> = matches
-                .into_iter()
-                .filter(|&(k_u, k_r)| {
-                    !obs_to_point.contains_key(&(u, k_u)) && !obs_to_point.contains_key(&(r, k_r))
-                })
-                .collect();
-            triangulate_pair_matches(
-                input,
-                &cameras,
-                params,
-                u,
-                r,
-                &fresh,
-                &poses,
-                &mut points,
-                &mut obs_to_point,
-            );
+            triangulate_and_complete_tracks(input, &cameras, params, u, r, &matches, &poses, &mut points, &mut obs_to_point, &bootstrap_registered);
         }
 
         images_registered_since_ba += 1;
@@ -755,11 +750,19 @@ fn try_bootstrap_bridge_image(
     poses: &mut [Option<Pose>],
     points: &mut Vec<PointWork>,
     obs_to_point: &mut HashMap<(usize, u32), usize>,
+    bootstrap_registered: &[bool],
 ) -> bool {
     let r_pose = poses[r].expect("neighbor is registered");
     let base_scale = median_camera_baseline(poses)
         .or_else(|| median_point_depth(points, r, &r_pose))
         .unwrap_or(1.0);
+
+    // `u` isn't marked bootstrap-registered in the caller's array yet (that
+    // only happens once this function returns `true`), but it unavoidably
+    // will be - treat it as such for `triangulate_and_complete_tracks`'s
+    // gating purposes regardless of the outcome here.
+    let mut bootstrap_registered_with_u = bootstrap_registered.to_vec();
+    bootstrap_registered_with_u[u] = true;
 
     let Some(matches) = oriented_matches(pair, u) else {
         return false;
@@ -807,21 +810,14 @@ fn try_bootstrap_bridge_image(
 
         poses[u] = Some(pose);
         let before = points.len();
-        triangulate_pair_matches(
-            input,
-            cameras,
-            params,
-            u,
-            r,
-            &matches,
-            poses,
-            points,
-            obs_to_point,
-        );
-        let gained = points.len() - before;
+        let (gained, completions) = triangulate_and_complete_tracks(input, cameras, params, u, r, &matches, poses, points, obs_to_point, &bootstrap_registered_with_u);
 
         if gained >= min_gain {
             return true;
+        }
+        for (img, kp, point_idx) in completions {
+            points[point_idx].track.retain(|&(i, k)| !(i == img && k == kp));
+            obs_to_point.remove(&(img, kp));
         }
         for new_point in &points[before..] {
             for &(img, kp) in &new_point.track {
@@ -832,6 +828,118 @@ fn try_bootstrap_bridge_image(
         poses[u] = None;
     }
     false
+}
+
+/// For each match in `matches`, either extends an already-triangulated
+/// point's track (if exactly one side already maps to a point, and the new
+/// observation reprojects that point's *already-established* 3D position
+/// within `max_reprojection_error_px` - verified before trusting it, since
+/// the claiming side's own pose may not be independently confirmed, e.g.
+/// mid bridge-bootstrap) or hands the match to `triangulate_pair_matches`
+/// as a candidate for a brand new point (if neither side is claimed yet).
+/// Matches where the "new" side already belongs to a *different* point are
+/// left alone (rare - a genuinely ambiguous/duplicate match).
+///
+/// This closes a real gap: ordinary per-pair triangulation previously only
+/// ever created points from *fresh* (both-sides-unclaimed) matches, silently
+/// discarding any match where the far side already had a point instead of
+/// using it to extend that point's track with one more observation - which
+/// meant many real, additional viewing angles of already-triangulated
+/// points never reached bundle adjustment at all. More viewing angles per
+/// point is exactly what a self-calibration solve needs to be well-
+/// conditioned (see decisions.md's "Known open gaps").
+///
+/// Returns `(gained, completions)`: `gained` is the total number of new
+/// observations successfully added (completions plus new points' own
+/// tracks) - a stronger validation signal than raw triangulation success
+/// for e.g. the bridge bootstrap, since a completion is checked against an
+/// *independently already-scaled* 3D position, unlike fresh two-view
+/// triangulation, which is self-consistent for any positive baseline scale
+/// and so can't by itself confirm a bootstrap pose's scale is right.
+/// `completions` lists exactly what was added, `(image, keypoint,
+/// point_idx)`, so a caller that needs to roll back a rejected attempt
+/// (again, the bootstrap path) can undo precisely these track mutations -
+/// unlike new points, which a simple `Vec::truncate` handles.
+#[allow(clippy::too_many_arguments)]
+fn triangulate_and_complete_tracks(
+    input: &ReconstructionInput,
+    cameras: &HashMap<u32, CameraModel>,
+    params: &IncrementalParams,
+    a: usize,
+    b: usize,
+    matches: &[(u32, u32)],
+    poses: &[Option<Pose>],
+    points: &mut Vec<PointWork>,
+    obs_to_point: &mut HashMap<(usize, u32), usize>,
+    bootstrap_registered: &[bool],
+) -> (usize, Vec<(usize, u32, usize)>) {
+    let (Some(pose_a), Some(pose_b)) = (poses[a], poses[b]) else {
+        return (0, Vec::new());
+    };
+    let cam_a = cameras[&input.images[a].camera_id];
+    let cam_b = cameras[&input.images[b].camera_id];
+    let avg_focal_a = (cam_a.focal_lengths().0 + cam_a.focal_lengths().1) / 2.0;
+    let avg_focal_b = (cam_b.focal_lengths().0 + cam_b.focal_lengths().1) / 2.0;
+
+    // Deliberately much stricter than `max_reprojection_error_px` (the bar
+    // for creating a brand new point from a fresh 2-view match): a
+    // completion touches an *already-trusted* point's existing track
+    // in-place rather than living or dying on its own, so a marginal one
+    // doesn't fail cleanly the way a marginal new point does - it degrades
+    // a point every other observation already relies on. Tuned empirically
+    // against all three real test datasets, together with the
+    // `bootstrap_registered` gate below (also required - even at this
+    // threshold, allowing completions *from* bootstrap-registered cameras
+    // measurably hurt `temple_sparse_ring`'s focal-length accuracy, a
+    // dataset that leans heavily on bootstrap registrations): the 4px
+    // fresh-triangulation bar regressed all three datasets outright (worst
+    // case, `temple_sparse_ring`: reprojection error 0.38px -> 0.72px,
+    // intrinsics rejected entirely); 0.5px improves `sceaux_castle` (3.1% ->
+    // 2.78% focal error) and `temple_ring` (1.2% -> 0.99%) while leaving
+    // `temple_sparse_ring` within noise of its prior result (3.7% -> 3.86%).
+    const COMPLETION_MAX_REPROJECTION_ERROR_PX: f64 = 0.5;
+
+    let mut fresh: Vec<(u32, u32)> = Vec::new();
+    let mut completions: Vec<(usize, u32, usize)> = Vec::new();
+    for &(ka, kb) in matches {
+        let claim_a = obs_to_point.get(&(a, ka)).copied();
+        let claim_b = obs_to_point.get(&(b, kb)).copied();
+        match (claim_a, claim_b) {
+            (None, None) => fresh.push((ka, kb)),
+            (Some(point_idx), None) if !bootstrap_registered[b] => {
+                let obs_b = to_normalized(keypoint_px(&input.images[b].features, kb), &cam_b);
+                if let Some(err) = reprojection_error_normalized(&pose_b, &points[point_idx].xyz, obs_b) {
+                    if err * avg_focal_b <= COMPLETION_MAX_REPROJECTION_ERROR_PX {
+                        points[point_idx].track.push((b, kb));
+                        obs_to_point.insert((b, kb), point_idx);
+                        completions.push((b, kb, point_idx));
+                    }
+                }
+            }
+            (None, Some(point_idx)) if !bootstrap_registered[a] => {
+                let obs_a = to_normalized(keypoint_px(&input.images[a].features, ka), &cam_a);
+                if let Some(err) = reprojection_error_normalized(&pose_a, &points[point_idx].xyz, obs_a) {
+                    if err * avg_focal_a <= COMPLETION_MAX_REPROJECTION_ERROR_PX {
+                        points[point_idx].track.push((a, ka));
+                        obs_to_point.insert((a, ka), point_idx);
+                        completions.push((a, ka, point_idx));
+                    }
+                }
+            }
+            // Catches both `(Some(_), Some(_))` (both sides already
+            // claimed, possibly by different points) and a completion
+            // whose guard above rejected it for being bootstrap-sourced -
+            // in both cases, leave the match alone rather than triangulate
+            // or complete anything from it.
+            _ => {}
+        }
+    }
+
+    let before = points.len();
+    triangulate_pair_matches(input, cameras, params, a, b, &fresh, poses, points, obs_to_point);
+    let new_points = points.len() - before;
+
+    (completions.len() + new_points, completions)
 }
 
 #[allow(clippy::too_many_arguments)]

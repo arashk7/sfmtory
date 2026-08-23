@@ -15,6 +15,8 @@ sfm-features = { path = "../sfm-features" }
 sfm-match = { path = "../sfm-match" }
 sfm-geometry = { path = "../sfm-geometry" }
 sfm-reconstruction = { path = "../sfm-reconstruction" }
+sfm-ba = { path = "../sfm-ba" }
+nalgebra.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 serde.workspace = true

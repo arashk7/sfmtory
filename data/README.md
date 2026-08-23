@@ -113,9 +113,9 @@ full discussion:
 |---|---|---|---|
 | Verified pairs | 41 / 55 | 21 / 120 | 246 / 1081 |
 | Images registered | **11 / 11** | **16 / 16** | **47 / 47** |
-| 3D points | ~2870 | ~920 | ~6650 |
-| Mean reprojection error | 0.42px | 0.38px | **0.30px** |
-| Recovered focal length | 2996.0 (true 2905.88, 3.1% off) | 1466.4 (true ~1523.15, 3.7% off) | **1504.8** (true ~1523.15, **1.2%** off) |
+| 3D points | ~2930 | ~920 | ~6630 |
+| Mean reprojection error | 0.42px | 0.37px | **0.30px** |
+| Recovered focal length | 2986.7 (true 2905.88, 2.78% off) | 1464.3 (true ~1523.15, 3.86% off) | **1508.1** (true ~1523.15, **0.99%** off) |
 
 For comparison, **real COLMAP** (`pycolmap`, run head-to-head on the exact same photos,
 single shared camera per dataset):
@@ -134,14 +134,16 @@ sample rejection, nonlinear PnP polish, connected-component-aware multi-seed sel
 a bridge-image bootstrap for chain-shaped match graphs, and SIFT's 2x upsampling for
 small images). **On `temple_ring` - the largest, best-conditioned dataset - sfmtory
 beats COLMAP outright on all three metrics**: reprojection error (0.30px vs. 0.32px)
-and focal length error (1.2% vs. 2.0%), on top of the tied registration count. On the
+and focal length error (0.99% vs. 2.0%), on top of the tied registration count. On the
 two smaller/harder datasets, focal length accuracy is still somewhat behind COLMAP's
-(3.1% vs. 2.3% on `sceaux_castle`, 3.7% vs. 0.02% on `temple_sparse_ring`) - an
-outlier-filtering pass in bundle adjustment closed most of `sceaux_castle`'s gap (was
-5.4%), and switching from numerical to exact analytic Jacobians (now implemented for
-every supported camera model, not just the one both original test datasets use) closed
-most of `temple_sparse_ring`'s (was 6.3%) - validated against real Ceres Solver output
+(2.78% vs. 2.3% on `sceaux_castle`, 3.86% vs. 0.02% on `temple_sparse_ring`) - an
+outlier-filtering pass in bundle adjustment, switching from numerical to exact analytic
+Jacobians (now implemented for every supported camera model, not just the one both
+original test datasets use), and track completion (extending existing points' tracks
+with new observations from later-registered images, not just creating fresh points)
+together closed most of the original gap (`sceaux_castle` was 5.4%; `temple_sparse_ring`
+was 6.3%) - the analytic-Jacobian fix was validated against real Ceres Solver output
 during development, though sfmtory has no runtime dependency on Ceres, and on that same
 comparison the native solver held up *more* reliably deterministic than Ceres itself on
-this specific hard problem. See `decisions.md`'s "Analytic Jacobians" and "Known open
-gaps" for the full story.
+this specific hard problem. See `decisions.md`'s "Track completion", "Analytic
+Jacobians", and "Known open gaps" for the full story.

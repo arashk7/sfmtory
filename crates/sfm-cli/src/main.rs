@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use nalgebra::Vector3;
 use rayon::prelude::*;
 use sfm_core::{Camera, CameraModel};
 
@@ -227,29 +228,6 @@ fn cmd_project_new(dir: &PathBuf, images: &PathBuf) -> Result<()> {
         project.config.images_dir.display()
     );
     println!("Next: sfm extract --project {}", project.root.display());
-    Ok(())
-}
-
-/// Placeholder for a not-yet-implemented pipeline stage: still opens the
-/// project, still records a log entry (so `logs/` reflects every invocation),
-/// but reports the real status instead of pretending to have run.
-fn not_yet_implemented(
-    project: &Project,
-    stage: &str,
-    planned: &str,
-    started: Instant,
-) -> Result<()> {
-    let payload = serde_json::json!({
-        "stage": stage,
-        "status": "not_implemented",
-        "planned_behavior": planned,
-        "elapsed_ms": started.elapsed().as_millis(),
-    });
-    let log_path = project.record_log(stage, &payload)?;
-    eprintln!(
-        "`{stage}` is not implemented yet (see PLAN.md). Logged to {}.",
-        log_path.display()
-    );
     Ok(())
 }
 
@@ -581,18 +559,196 @@ fn cmd_map(args: MapArgs) -> Result<()> {
     Ok(())
 }
 
+/// Standalone global bundle-adjustment pass on an existing `sparse/0` model:
+/// load it via `sfm-io`, convert to `sfm_ba::BaInput`, run BA, write the
+/// refined poses/points/(optionally) intrinsics back to the same directory.
+/// Deliberately plumbing-only, per PLAN.md - the iterative re-triangulation
+/// half of "refine" (recomputing 3D positions from extended tracks, not just
+/// re-optimizing existing ones) is still future work.
 fn cmd_refine(args: RefineArgs) -> Result<()> {
     let started = Instant::now();
     let project = Project::open(&args.project)?;
-    not_yet_implemented(
-        &project,
-        "refine",
-        &format!(
-            "global bundle adjustment robust_loss={:?} refine_intrinsics={}",
-            args.robust_loss, args.refine_intrinsics
-        ),
-        started,
-    )
+    let sparse_dir = project.sparse_dir();
+    let mut recon = sfm_io::read_colmap_model(&sparse_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to read sparse model from {} (run `sfm map` first): {e}",
+            sparse_dir.display()
+        )
+    })?;
+
+    if recon.images.len() < 2 {
+        bail!(
+            "need at least 2 registered images in {} to refine",
+            sparse_dir.display()
+        );
+    }
+    if recon.points3d.is_empty() {
+        bail!("no 3D points in {} to refine", sparse_dir.display());
+    }
+
+    // Compact-index remap, same pattern as `sfm-reconstruction`'s in-loop BA:
+    // one pose per registered image, one intrinsics block per physical
+    // camera (shared across images using it), one point per `points3d` entry.
+    let image_ids: Vec<u32> = recon.images.keys().copied().collect();
+    let image_pos: HashMap<u32, usize> = image_ids
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| (id, i))
+        .collect();
+
+    let mut camera_list: Vec<CameraModel> = Vec::new();
+    let mut camera_id_list: Vec<u32> = Vec::new();
+    let mut camera_index_of: HashMap<u32, usize> = HashMap::new();
+    let mut camera_of_image: Vec<usize> = Vec::with_capacity(image_ids.len());
+    for &id in &image_ids {
+        let camera_id = recon.images[&id].camera_id;
+        let idx = *camera_index_of.entry(camera_id).or_insert_with(|| {
+            camera_list.push(recon.cameras[&camera_id].model);
+            camera_id_list.push(camera_id);
+            camera_list.len() - 1
+        });
+        camera_of_image.push(idx);
+    }
+
+    let poses: Vec<sfm_core::Pose> = image_ids.iter().map(|id| recon.images[id].pose).collect();
+
+    let point_ids: Vec<u64> = recon.points3d.keys().copied().collect();
+    let point_pos: HashMap<u64, usize> = point_ids
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| (id, i))
+        .collect();
+    let points: Vec<Vector3<f64>> = point_ids.iter().map(|id| recon.points3d[id].xyz).collect();
+
+    let mut observations = Vec::new();
+    for (&pid, &compact_p) in &point_pos {
+        for te in &recon.points3d[&pid].track {
+            let (Some(&compact_img), Some(image)) =
+                (image_pos.get(&te.image_id), recon.images.get(&te.image_id))
+            else {
+                continue;
+            };
+            let Some(&(x, y)) = image.keypoints.get(te.point2d_idx as usize) else {
+                continue;
+            };
+            observations.push(sfm_ba::Observation {
+                image_idx: compact_img,
+                point_idx: compact_p,
+                x: x as f64,
+                y: y as f64,
+            });
+        }
+    }
+    if observations.is_empty() {
+        bail!("no observations linking tracked points to registered images; nothing to refine");
+    }
+
+    // Reprojection error is invariant under a similarity transform of the
+    // whole scene (see `BaInput::fixed_poses`'s docs), so at least one pose
+    // must be anchored - image 0 (in id order) is as good a choice as any
+    // for a standalone refine pass.
+    let fixed_poses: Vec<bool> = (0..image_ids.len()).map(|i| i == 0).collect();
+    let (fixed_cameras, fixed_camera_params) = if args.refine_intrinsics {
+        (
+            vec![false; camera_list.len()],
+            sfm_ba::default_fixed_params_mask(&camera_list),
+        )
+    } else {
+        (vec![true; camera_list.len()], Vec::new())
+    };
+
+    let robust_loss = match args.robust_loss {
+        RobustLossArg::Huber => sfm_ba::RobustLoss::Huber,
+        RobustLossArg::Cauchy => sfm_ba::RobustLoss::Cauchy,
+    };
+    let ba_params = sfm_ba::BaParams {
+        robust_loss,
+        max_iterations: 200,
+        ..Default::default()
+    };
+    let ba_input = sfm_ba::BaInput {
+        camera_of_image,
+        cameras: camera_list,
+        poses,
+        points,
+        observations,
+        fixed_poses,
+        fixed_cameras,
+        fixed_camera_params,
+    };
+
+    let before_error = recon.mean_reprojection_error();
+    let output = sfm_ba::bundle_adjust(ba_input, &ba_params);
+
+    for (compact, &id) in image_ids.iter().enumerate() {
+        recon.images.get_mut(&id).unwrap().pose = output.poses[compact];
+    }
+    for (compact, &id) in point_ids.iter().enumerate() {
+        recon.points3d.get_mut(&id).unwrap().xyz = output.points[compact];
+    }
+    if args.refine_intrinsics {
+        for (idx, &cam_id) in camera_id_list.iter().enumerate() {
+            recon.cameras.get_mut(&cam_id).unwrap().model = output.cameras[idx];
+        }
+    }
+
+    // Recompute each point's reported error (pixel-space, including
+    // distortion) against the just-refined poses/intrinsics - same
+    // formula `sfm-reconstruction::assemble_reconstruction` uses.
+    for point in recon.points3d.values_mut() {
+        let mut total = 0.0;
+        let mut n = 0usize;
+        for te in &point.track {
+            let Some(image) = recon.images.get(&te.image_id) else {
+                continue;
+            };
+            let Some(&(x, y)) = image.keypoints.get(te.point2d_idx as usize) else {
+                continue;
+            };
+            let cam = &recon.cameras[&image.camera_id].model;
+            let pc = image.pose.transform_point(&point.xyz);
+            if pc.z > 1e-9 {
+                let (px, py) = cam.project(&pc);
+                total += ((px - x as f64).powi(2) + (py - y as f64).powi(2)).sqrt();
+                n += 1;
+            }
+        }
+        if n > 0 {
+            point.error = total / n as f64;
+        }
+    }
+
+    let after_error = recon.mean_reprojection_error();
+
+    sfm_io::write_colmap_model(&recon, &sparse_dir)
+        .map_err(|e| anyhow::anyhow!("writing refined sparse model: {e}"))?;
+
+    let payload = serde_json::json!({
+        "stage": "refine",
+        "status": "ok",
+        "robust_loss": format!("{:?}", args.robust_loss),
+        "refine_intrinsics": args.refine_intrinsics,
+        "num_images": image_ids.len(),
+        "num_points3d": point_ids.len(),
+        "initial_cost": output.initial_cost,
+        "final_cost": output.final_cost,
+        "iterations_run": output.iterations_run,
+        "mean_reprojection_error_px_before": before_error,
+        "mean_reprojection_error_px_after": after_error,
+        "elapsed_ms": started.elapsed().as_millis(),
+    });
+    let log_path = project.record_log("refine", &payload)?;
+    println!(
+        "Refined {} images / {} points3d: mean reprojection error {:.3}px -> {:.3}px ({} LM iterations). Wrote {}. Logged to {}.",
+        image_ids.len(),
+        point_ids.len(),
+        before_error,
+        after_error,
+        output.iterations_run,
+        sparse_dir.display(),
+        log_path.display()
+    );
+    Ok(())
 }
 
 fn cmd_export(args: ExportArgs) -> Result<()> {

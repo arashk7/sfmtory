@@ -19,7 +19,7 @@ planned as an optional layer on top of this pipeline — see [Roadmap](#roadmap)
 > 47 images). sfmtory **matches or beats COLMAP's registration count on all three**
 > (11/11, 16/16 beating COLMAP's 13/16, and 47/47), and on the largest/best-conditioned
 > dataset (`temple_ring`, 47 images) **beats COLMAP outright on every metric** -
-> registration, reprojection error (0.30px vs. 0.32px), and focal length accuracy (1.2%
+> registration, reprojection error (0.30px vs. 0.32px), and focal length accuracy (0.99%
 > vs. 2.0%). On the two smaller datasets, focal-length accuracy is still somewhat behind
 > COLMAP's. See [Status vs. COLMAP](#status-vs-colmap) below for the real numbers and
 > caveats before trusting this for anything production-critical. [PLAN.md](PLAN.md)
@@ -126,13 +126,13 @@ the same real photos for all three test sets in [`data/`](data/README.md):
 |---|---|---|
 | `sceaux_castle` (11 images) registered | **11/11** | 11/11 |
 | `sceaux_castle` mean reprojection error | **0.42px** | 0.62px |
-| `sceaux_castle` focal length error vs. known truth | 3.1% | **2.3%** |
+| `sceaux_castle` focal length error vs. known truth | 2.78% | **2.3%** |
 | `temple_sparse_ring` (16 images) registered | **16/16** | 13/16 |
-| `temple_sparse_ring` mean reprojection error | 0.38px | **0.22px** |
-| `temple_sparse_ring` focal length error vs. known truth | 3.7% | **0.02%** |
+| `temple_sparse_ring` mean reprojection error | 0.37px | **0.22px** |
+| `temple_sparse_ring` focal length error vs. known truth | 3.86% | **0.02%** |
 | `temple_ring` (47 images) registered | 47/47 | 47/47 |
 | `temple_ring` mean reprojection error | **0.30px** | 0.32px |
-| `temple_ring` focal length error vs. known truth | **1.2%** | 2.0% |
+| `temple_ring` focal length error vs. known truth | **0.99%** | 2.0% |
 
 **sfmtory matches or beats COLMAP's registration count on all three datasets**, and on
 the largest/best-conditioned one (`temple_ring`, 47 images) **beats COLMAP outright on
@@ -141,23 +141,24 @@ to close what used to be a large registration-count gap (non-deterministic RANSA
 sampling, a degenerate-PnP-sample gap, a missing nonlinear pose refinement, disconnected
 seed selection, a chain-graph bootstrap fallback, and SIFT upsampling for small images).
 The honest remaining gap is **focal length accuracy on the two smaller datasets**: still
-somewhat behind COLMAP's on `sceaux_castle` (3.1% vs. 2.3%) and `temple_sparse_ring`
-(3.7% vs. 0.02%) — see [Known limitations](#known-limitations) below. There's no
+somewhat behind COLMAP's on `sceaux_castle` (2.78% vs. 2.3%) and `temple_sparse_ring`
+(3.86% vs. 0.02%) — see [Known limitations](#known-limitations) below. There's no
 `BENCHMARKS.md` write-up yet and `sfm eval`'s automated comparison logic is still a stub
 (this comparison was run by hand against real COLMAP output), so treat this as real,
 reproducible data points rather than a comprehensive benchmark suite.
 
 ## Known limitations
 
-- **Focal length error is behind COLMAP's on the two smaller datasets** (3.1% vs. 2.3%
-  on `sceaux_castle`, 3.7% vs. 0.02% on `temple_sparse_ring`), despite registration
+- **Focal length error is behind COLMAP's on the two smaller datasets** (2.78% vs. 2.3%
+  on `sceaux_castle`, 3.86% vs. 0.02% on `temple_sparse_ring`), despite registration
   count and reprojection error now matching or beating COLMAP on all three, and despite
   beating COLMAP on focal length too on the largest dataset (`temple_ring`, 47 images:
-  1.2% vs. 2.0%). An outlier-filtering pass in the final bundle adjustment closed most
-  of `sceaux_castle`'s gap (was 5.4%), and switching from numerical to exact analytic
-  Jacobians for every camera model closed most of `temple_sparse_ring`'s (was 6.3%) -
-  see [`decisions.md`](decisions.md)'s "Known open gaps" for what's been tried and ruled
-  out on the remainder.
+  0.99% vs. 2.0%). An outlier-filtering pass in the final bundle adjustment, switching
+  from numerical to exact analytic Jacobians for every camera model, and track
+  completion (extending existing points' tracks with new observations, not just
+  creating fresh points) together closed most of the original gap (`sceaux_castle` was
+  5.4%; `temple_sparse_ring` was 6.3%) - see [`decisions.md`](decisions.md)'s "Known
+  open gaps" for what's been tried and ruled out on the remainder.
 - `sfm map --pipeline global` (the eventually-intended default, GLOMAP-style) isn't
   implemented — pass `--pipeline incremental` explicitly.
 - Camera intrinsics (focal length + distortion) *are* refined jointly with poses/points

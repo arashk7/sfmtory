@@ -184,13 +184,13 @@ As of this writing, expect:
 ```
 Extracted 56378 features across 11 images (Sift).
 Verified 41/55 pairs, 7654 inlier matches total.
-Registered 11/11 images, 2869 points3d, mean reprojection error 0.427px.
-Exported 11 images / 2869 points to /tmp/castle/export
+Registered 11/11 images, 2927 points3d, mean reprojection error 0.424px.
+Exported 11 images / 2927 points to /tmp/castle/export
 ```
 
 Check `/tmp/castle/export/cameras.txt`'s focal length against the dataset's known-true
 value in `data/sceaux_castle/K.txt` (`2905.88`): sfmtory recovers something in the same
-ballpark (currently ~3.1% off, vs. real COLMAP's own 2.3% on the same photos - close but
+ballpark (currently ~2.78% off, vs. real COLMAP's own 2.3% on the same photos - close but
 not yet matching; see [`decisions.md`](../decisions.md)'s "Known open gaps"). `sfm-ba`'s
 bundle adjustment jointly refines focal length and distortion alongside poses/points,
 with the principal point (`cx`/`cy`) deliberately held fixed, and filters out
@@ -202,9 +202,11 @@ the full rationale.
 several real-data-driven fixes to the incremental registration pipeline (non-
 deterministic RANSAC sampling, linear PnP-DLT accepting degenerate near-coplanar
 samples, a missing nonlinear reprojection-error pose refinement, connected-component-
-aware seed selection, and a bootstrap fallback for images whose match-graph
-connectivity is too thin for ordinary PnP - see `decisions.md` for the full diagnosis of
-each). Mean reprojection error (0.42px) is meaningfully better than COLMAP's 0.62px.
+aware seed selection, a bootstrap fallback for images whose match-graph connectivity is
+too thin for ordinary PnP, and track completion extending existing points' tracks with
+observations that used to be silently discarded - see `decisions.md` for the full
+diagnosis of each). Mean reprojection error (0.42px) is meaningfully better than
+COLMAP's 0.62px.
 
 ### Middlebury temple (small object, unusual sparse view sampling)
 
@@ -220,7 +222,7 @@ Expect:
 ```
 Extracted 12736 features across 16 images (Sift).
 Verified 21/120 pairs, 2194 inlier matches total.
-Registered 16/16 images, 921 points3d, mean reprojection error 0.378px.
+Registered 16/16 images, 921 points3d, mean reprojection error 0.368px.
 ```
 
 **All 16 images register, beating real COLMAP's 13/16 on this same set.** This dataset's
@@ -229,7 +231,7 @@ across all 16, versus ~12700 now) - enabling SIFT's Lowe-original 2x pre-upsampl
 small images fixed that, which in turn gave the match graph enough density and triangle
 redundancy (rather than a near-linear chain) for ordinary PnP and the bootstrap fallback
 to reach every image. Focal length is still further behind COLMAP here than on
-`sceaux_castle` (~3.7% off vs. COLMAP's ~0.02%) - see `decisions.md`'s "Known open gaps".
+`sceaux_castle` (~3.86% off vs. COLMAP's ~0.02%) - see `decisions.md`'s "Known open gaps".
 
 For a rigorous accuracy check rather than eyeballing reprojection error, compare
 `/tmp/temple/sparse/0/images.txt`'s recovered poses against `data/temple_sparse_ring/
@@ -253,12 +255,12 @@ Expect:
 ```
 Extracted 37786 features across 47 images (Sift).
 Verified 246/1081 pairs, 34768 inlier matches total.
-Registered 47/47 images, 6647 points3d, mean reprojection error 0.298px.
+Registered 47/47 images, 6634 points3d, mean reprojection error 0.297px.
 ```
 
 **All 47 images register, tying real COLMAP's 47/47 - and sfmtory beats COLMAP outright
 on both other metrics here**: 0.30px mean reprojection error vs. COLMAP's 0.32px, and
-1.2% focal length error vs. COLMAP's 2.0% (recovered focal 1504.8 vs. the dataset's true
+0.99% focal length error vs. COLMAP's 2.0% (recovered focal 1508.1 vs. the dataset's true
 ~1523.15). This is the same physical object/rig/intrinsics as `temple_sparse_ring`
 above, just a real ring capture instead of that dataset's sparse two-latitude-band
 sampling - more images gives self-calibration a genuinely better-conditioned problem to
