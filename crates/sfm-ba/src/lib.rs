@@ -15,10 +15,10 @@
 //! cam_0 .. cam_{m-1}]` (6 dof per pose, 3-8 dof per camera depending on
 //! model), with each observation contributing to *two* camera-side blocks
 //! (its image's pose, and that image's camera) instead of one. Point
-//! elimination generalizes cleanly: `points_to_obs` now stores a
-//! [`BlockRef`] (pose or camera) alongside each point-coupling sub-matrix,
-//! and the same "sum over all pairs of an point's contributing blocks" Schur
-//! formula applies regardless of which kind of block each side is.
+//! elimination generalizes cleanly: `points_to_obs` stores an [`EBlock`]
+//! (pose or camera) alongside each point-coupling sub-matrix, and the same
+//! "sum over all pairs of a point's contributing blocks" Schur formula
+//! applies regardless of which kind of block each side is.
 //!
 //! Two deliberate simplifications versus a production solver like Ceres,
 //! both documented here rather than hidden:
@@ -51,6 +51,7 @@ pub use intrinsics::{default_fixed_params_mask, refine_intrinsics, IntrinsicsRef
 use nalgebra::{DMatrix, DVector, Matrix3, Matrix6, SMatrix, SVector, Vector3, Vector6};
 use rayon::prelude::*;
 use sfm_core::{CameraModel, Pose};
+
 
 #[derive(Debug, Clone, Copy)]
 pub struct Observation {
@@ -94,19 +95,117 @@ pub struct BaInput {
     pub fixed_camera_params: Vec<Vec<bool>>,
 }
 
-/// One block of the reduced camera-side linear system: either an image's
-/// 6-dof pose or a physical camera's intrinsics block.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BlockRef {
-    Pose(usize),
-    Camera(usize),
+/// Per-point coupling block (`E` in the Schur literature), split by variable
+/// kind: pose couplings are always 6x3 and stay on the stack, camera
+/// couplings are `k x 3` for a model-dependent `k` and need the dynamic type.
+/// The pose/pose pairing dominates real problems by orders of magnitude (many
+/// images, typically one shared camera that is usually fixed during growth),
+/// so keeping that arm allocation-free is what makes the Schur build fast.
+enum EBlock {
+    Pose(usize, SMatrix<f64, 6, 3>),
+    Camera(usize, DMatrix<f64>),
 }
 
-impl BlockRef {
-    fn offset_dim(&self, cam_offset: &[usize], cam_dof: &[usize]) -> (usize, usize) {
-        match *self {
-            BlockRef::Pose(i) => (6 * i, 6),
-            BlockRef::Camera(c) => (cam_offset[c], cam_dof[c]),
+/// One point's contribution to the reduced camera system: `-E C^-1 E^T` into
+/// `s`, `+E C^-1 g_pt` into `rhs`. Points are independent of each other, so
+/// this is also the unit of parallelism (see its call sites).
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn accumulate_point_schur(
+    cinv: &Matrix3<f64>,
+    obs_list: &[EBlock],
+    c_rhs_p: &Vector3<f64>,
+    pose_slot: &[usize],
+    cam_slot: &[usize],
+    s: &mut DMatrix<f64>,
+    rhs: &mut DVector<f64>,
+) {
+    for (idx_i, block_i) in obs_list.iter().enumerate() {
+        match block_i {
+            EBlock::Pose(i, e_i) => {
+                let off_i = pose_slot[*i];
+                // Hoisted out of the inner loop: halves the multiplications
+                // versus recomputing `E_i C^-1` for every `j`.
+                let ec: SMatrix<f64, 6, 3> = e_i * cinv;
+                for (idx_j, block_j) in obs_list.iter().enumerate().skip(idx_i) {
+                    match block_j {
+                        EBlock::Pose(j, e_j) => {
+                            let off_j = pose_slot[*j];
+                            let blk: Matrix6<f64> = ec * e_j.transpose();
+                            let mut d = s.view_mut((off_i, off_j), (6, 6));
+                            d -= blk;
+                            // Each unordered pair is visited once (the
+                            // `skip(idx_i)` above); mirror it to recover the
+                            // transpose term a full double loop would add.
+                            // Keyed on entry index, not slot offset: two
+                            // distinct observations can share a slot when
+                            // their images share a camera, and that pair
+                            // still needs both terms.
+                            if idx_j != idx_i {
+                                let mut dt = s.view_mut((off_j, off_i), (6, 6));
+                                dt -= blk.transpose();
+                            }
+                        }
+                        EBlock::Camera(c, e_j) => {
+                            let off_j = cam_slot[*c];
+                            let k = e_j.nrows();
+                            let ec_d = DMatrix::from_column_slice(6, 3, ec.as_slice());
+                            let blk = &ec_d * e_j.transpose();
+                            let mut d = s.view_mut((off_i, off_j), (6, k));
+                            d -= &blk;
+                            let mut dt = s.view_mut((off_j, off_i), (k, 6));
+                            dt -= blk.transpose();
+                        }
+                    }
+                }
+            }
+            EBlock::Camera(c, e_i) => {
+                let off_i = cam_slot[*c];
+                let ki = e_i.nrows();
+                let cinv_d = DMatrix::from_column_slice(3, 3, cinv.as_slice());
+                let ec_d = e_i * &cinv_d;
+                for (idx_j, block_j) in obs_list.iter().enumerate().skip(idx_i) {
+                    match block_j {
+                        EBlock::Pose(j, e_j) => {
+                            let off_j = pose_slot[*j];
+                            let e_j_d = DMatrix::from_column_slice(6, 3, e_j.as_slice());
+                            let blk = &ec_d * e_j_d.transpose();
+                            let mut d = s.view_mut((off_i, off_j), (ki, 6));
+                            d -= &blk;
+                            let mut dt = s.view_mut((off_j, off_i), (6, ki));
+                            dt -= blk.transpose();
+                        }
+                        EBlock::Camera(c2, e_j) => {
+                            let off_j = cam_slot[*c2];
+                            let kj = e_j.nrows();
+                            let blk = &ec_d * e_j.transpose();
+                            let mut d = s.view_mut((off_i, off_j), (ki, kj));
+                            d -= &blk;
+                            if idx_j != idx_i {
+                                let mut dt = s.view_mut((off_j, off_i), (kj, ki));
+                                dt -= blk.transpose();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let cinv_g: Vector3<f64> = cinv * c_rhs_p;
+    for block in obs_list {
+        match block {
+            EBlock::Pose(i, e_i) => {
+                let contrib: Vector6<f64> = e_i * cinv_g;
+                let mut dest = rhs.rows_mut(pose_slot[*i], 6);
+                dest += contrib;
+            }
+            EBlock::Camera(c, e_i) => {
+                let cinv_g_d = DVector::from_column_slice(cinv_g.as_slice());
+                let contrib = e_i * &cinv_g_d;
+                let mut dest = rhs.rows_mut(cam_slot[*c], e_i.nrows());
+                dest += contrib;
+            }
         }
     }
 }
@@ -650,25 +749,73 @@ pub fn bundle_adjust(mut input: BaInput, params: &BaParams) -> BaOutput {
     let num_points = input.points.len();
     let num_cameras = input.cameras.len();
     let cam_dof: Vec<usize> = input.cameras.iter().map(|c| c.params().len()).collect();
-    let pose_dim_total = 6 * num_images;
-    let mut cam_offset = vec![0usize; num_cameras];
-    {
-        let mut acc = pose_dim_total;
-        for c in 0..num_cameras {
-            cam_offset[c] = acc;
-            acc += cam_dof[c];
+
+    // Variable indexing: only *free* poses and cameras get a slot in the
+    // normal equations. Fixed ones (`fixed_poses`/`fixed_cameras`) are absent
+    // from the linear system entirely rather than being carried as identity
+    // rows that trivially solve to zero. That matters a lot for local bundles
+    // (see `sfm-reconstruction`'s `BaScope::Local`), where most images in the
+    // problem are present only to constrain points and are held fixed: the
+    // dense Cholesky is O(n^3) in this dimension, so dropping the fixed
+    // blocks shrinks it by the cube of the free fraction.
+    const FIXED: usize = usize::MAX;
+    let mut pose_slot = vec![FIXED; num_images];
+    let mut cam_slot = vec![FIXED; num_cameras];
+    let mut total_dim = 0usize;
+    for i in 0..num_images {
+        if !input.fixed_poses.get(i).copied().unwrap_or(false) {
+            pose_slot[i] = total_dim;
+            total_dim += 6;
         }
     }
-    let total_dim = pose_dim_total + cam_dof.iter().sum::<usize>();
+    for c in 0..num_cameras {
+        if cam_dof[c] > 0 && !input.fixed_cameras.get(c).copied().unwrap_or(false) {
+            cam_slot[c] = total_dim;
+            total_dim += cam_dof[c];
+        }
+    }
+    if total_dim == 0 {
+        let initial_cost = total_cost(&input, params);
+        return BaOutput {
+            poses: input.poses,
+            points: input.points,
+            cameras: input.cameras,
+            initial_cost,
+            final_cost: initial_cost,
+            iterations_run: 0,
+        };
+    }
+
+    // Allocated once and reused across every outer iteration and damping
+    // retry (see the Schur-build loop).
+    let mut s_buf = DMatrix::<f64>::zeros(total_dim, total_dim);
+    let mut rhs_buf = DVector::<f64>::zeros(total_dim);
 
     let initial_cost = total_cost(&input, params);
     let mut lambda = params.initial_lambda;
 
     let mut cost = initial_cost;
+    // Nielsen's rejection-growth factor: doubles on each consecutive
+    // rejection so a badly-scaled region is escaped geometrically, and resets
+    // to 2 whenever a step is accepted.
+    let mut nu = 2.0f64;
     let mut iterations_run = 0;
+
+    // Ceres/COLMAP's own default `function_tolerance` (relative cost
+    // decrease below which the solver considers itself converged, distinct
+    // from `max_iterations` which only bounds the *worst* case). Without
+    // this, a call whose `max_iterations` is generously sized for a hard
+    // problem (e.g. the once-per-reconstruction intrinsics-refining pass)
+    // burns its full iteration budget on every problem, including the many
+    // easy, already-near-converged periodic in-loop calls during growth,
+    // each accepting a long tail of negligible steps - measurably the
+    // dominant cost of `sfm map`'s wall-clock time on real datasets (see
+    // decisions.md).
+    const FUNCTION_TOLERANCE: f64 = 1e-6;
 
     for _outer in 0..params.max_iterations {
         iterations_run += 1;
+        let cost_before_iter = cost;
 
         // Per-observation Jacobians, computed once per outer iteration and
         // reused across the inner lambda-retry loop below.
@@ -719,10 +866,16 @@ pub fn bundle_adjust(mut input: BaInput, params: &BaParams) -> BaOutput {
             .collect();
         let mut c_diag = vec![Matrix3::<f64>::zeros(); num_points];
         let mut c_rhs = vec![Vector3::<f64>::zeros(); num_points];
-        // Generalized over `BlockRef` (pose or camera) so a single point's
-        // Schur elimination naturally covers pose-pose, pose-camera, and
-        // camera-camera coupling with the same code (see module docs).
-        let mut points_to_obs: Vec<Vec<(BlockRef, DMatrix<f64>)>> = vec![Vec::new(); num_points];
+        // Per-point coupling blocks (`E` in the Schur literature), kept in a
+        // split representation: pose couplings are always 6x3 and are stored
+        // as stack-allocated fixed-size matrices, while camera couplings are
+        // k x 3 for a model-dependent k and need the dynamic type. The
+        // pose-pose pairing dominates by orders of magnitude on real problems
+        // (many images, typically one shared camera that's usually held fixed
+        // during growth), so keeping it off the heap is what makes the Schur
+        // build fast - this loop runs once per point *per damping retry*.
+        let mut points_to_obs: Vec<Vec<EBlock>> =
+            (0..num_points).map(|_| Vec::new()).collect();
 
         for p in &prepared {
             let w = p.weight;
@@ -732,84 +885,73 @@ pub fn bundle_adjust(mut input: BaInput, params: &BaParams) -> BaOutput {
             c_diag[p.point_idx] += w * p.jx.transpose() * p.jx;
             c_rhs[p.point_idx] += w * p.jx.transpose() * p.r;
 
-            let pose_fixed = input.fixed_poses.get(p.image_idx).copied().unwrap_or(false);
-            let cam_fixed = input
-                .fixed_cameras
-                .get(p.camera_idx)
-                .copied()
-                .unwrap_or(false);
-            let jx_d = DMatrix::from_column_slice(2, 3, p.jx.as_slice());
-            let r_d = DVector::from_column_slice(p.r.as_slice());
+            let pose_free = pose_slot[p.image_idx] != FIXED;
+            let cam_free = cam_slot[p.camera_idx] != FIXED;
 
-            if !pose_fixed {
+            if pose_free {
                 b_pose_diag[p.image_idx] += w * p.jp.transpose() * p.jp;
                 b_pose_rhs[p.image_idx] += w * p.jp.transpose() * p.r;
-                let e_pose = w * p.jp.transpose() * p.jx;
-                let e_pose_d = DMatrix::from_column_slice(6, 3, e_pose.as_slice());
-                points_to_obs[p.point_idx].push((BlockRef::Pose(p.image_idx), e_pose_d));
+                let e_pose: SMatrix<f64, 6, 3> = w * p.jp.transpose() * p.jx;
+                points_to_obs[p.point_idx].push(EBlock::Pose(p.image_idx, e_pose));
             }
-            if !cam_fixed {
+            if cam_free {
+                let jx_d = DMatrix::from_column_slice(2, 3, p.jx.as_slice());
+                let r_d = DVector::from_column_slice(p.r.as_slice());
                 b_cam_diag[p.camera_idx] += w * p.jc.transpose() * &p.jc;
                 b_cam_rhs[p.camera_idx] += w * p.jc.transpose() * &r_d;
                 let e_cam = w * p.jc.transpose() * &jx_d;
-                points_to_obs[p.point_idx].push((BlockRef::Camera(p.camera_idx), e_cam));
+                points_to_obs[p.point_idx].push(EBlock::Camera(p.camera_idx, e_cam));
             }
-            if !pose_fixed && !cam_fixed {
+            if pose_free && cam_free {
                 let jp_d = DMatrix::from_column_slice(2, 6, p.jp.as_slice());
                 pose_cam_cross[p.image_idx] += w * jp_d.transpose() * &p.jc;
             }
         }
 
+
         // Try increasing damping until we find an accepted (cost-reducing) step.
         let mut accepted = false;
         for _inner in 0..8 {
-            let mut s = DMatrix::<f64>::zeros(total_dim, total_dim);
-            let mut rhs = DVector::<f64>::zeros(total_dim);
+            // Reused across damping retries rather than reallocated: this is
+            // the hot loop, and a fresh zeroed `total_dim^2` allocation per
+            // retry was measurable overhead.
+            s_buf.fill(0.0);
+            rhs_buf.fill(0.0);
+            let s = &mut s_buf;
+            let rhs = &mut rhs_buf;
 
             for i in 0..num_images {
-                if input.fixed_poses.get(i).copied().unwrap_or(false) {
-                    // Decoupled identity block: no other block references a
-                    // fixed pose's rows/columns (see the accumulation loop
-                    // above), so this trivially solves to delta = 0.
-                    s.view_mut((6 * i, 6 * i), (6, 6))
-                        .copy_from(&Matrix6::identity());
+                let off = pose_slot[i];
+                if off == FIXED {
                     continue;
                 }
                 let damped =
                     b_pose_diag[i] + Matrix6::from_diagonal(&b_pose_diag[i].diagonal()) * lambda;
-                s.view_mut((6 * i, 6 * i), (6, 6)).copy_from(&damped);
-                rhs.rows_mut(6 * i, 6).copy_from(&(-b_pose_rhs[i]));
+                s.view_mut((off, off), (6, 6)).copy_from(&damped);
+                rhs.rows_mut(off, 6).copy_from(&(-b_pose_rhs[i]));
             }
 
             for c in 0..num_cameras {
                 let k = cam_dof[c];
-                if k == 0 {
-                    continue;
-                }
-                if input.fixed_cameras.get(c).copied().unwrap_or(false) {
-                    s.view_mut((cam_offset[c], cam_offset[c]), (k, k))
-                        .copy_from(&DMatrix::<f64>::identity(k, k));
+                let off = cam_slot[c];
+                if k == 0 || off == FIXED {
                     continue;
                 }
                 let diag = b_cam_diag[c].diagonal();
                 let damped = &b_cam_diag[c] + DMatrix::from_diagonal(&diag) * lambda;
-                s.view_mut((cam_offset[c], cam_offset[c]), (k, k))
-                    .copy_from(&damped);
-                rhs.rows_mut(cam_offset[c], k)
-                    .copy_from(&(-b_cam_rhs[c].clone()));
+                s.view_mut((off, off), (k, k)).copy_from(&damped);
+                rhs.rows_mut(off, k).copy_from(&(-b_cam_rhs[c].clone()));
             }
 
             for i in 0..num_images {
                 let c = input.camera_of_image[i];
-                let pose_fixed = input.fixed_poses.get(i).copied().unwrap_or(false);
-                let cam_fixed = input.fixed_cameras.get(c).copied().unwrap_or(false);
-                if pose_fixed || cam_fixed || cam_dof[c] == 0 {
+                let (po, co) = (pose_slot[i], cam_slot[c]);
+                if po == FIXED || co == FIXED || cam_dof[c] == 0 {
                     continue;
                 }
                 let cross = &pose_cam_cross[i];
-                s.view_mut((6 * i, cam_offset[c]), (6, cam_dof[c]))
-                    .copy_from(cross);
-                s.view_mut((cam_offset[c], 6 * i), (cam_dof[c], 6))
+                s.view_mut((po, co), (6, cam_dof[c])).copy_from(cross);
+                s.view_mut((co, po), (cam_dof[c], 6))
                     .copy_from(&cross.transpose());
             }
 
@@ -822,22 +964,81 @@ pub fn bundle_adjust(mut input: BaInput, params: &BaParams) -> BaOutput {
                 cp_inv[p] = damped.try_inverse();
             }
 
-            for p in 0..num_points {
-                let Some(cinv) = cp_inv[p] else { continue };
-                let cinv_d = DMatrix::from_column_slice(3, 3, cinv.as_slice());
-                let c_rhs_d = DVector::from_column_slice(c_rhs[p].as_slice());
-                let obs_list = &points_to_obs[p];
-                for (block_i, e_i) in obs_list {
-                    let (off_i, dim_i) = block_i.offset_dim(&cam_offset, &cam_dof);
-                    for (block_j, e_j) in obs_list {
-                        let (off_j, dim_j) = block_j.offset_dim(&cam_offset, &cam_dof);
-                        let block = e_i * &cinv_d * e_j.transpose();
-                        let mut dest = s.view_mut((off_i, off_j), (dim_i, dim_j));
-                        dest -= block;
+            // Point elimination. Parallel over points only when the
+            // problem is big enough to pay for it: each rayon worker needs
+            // its own `total_dim^2` accumulator, which on the many small
+            // local bundles during growth costs far more to allocate and
+            // zero than the elimination itself - and those already run
+            // inside an outer parallel loop over seed candidates, so nesting
+            // there just oversubscribes the pool. Measured: unconditionally
+            // parallelizing this made `temple_ring` 2x *slower* overall.
+            // `current_thread_index().is_some()` means this call is already
+            // running inside a rayon worker - i.e. it is one of the parallel
+            // seed-candidate growths, which have the whole pool saturated
+            // already. Nesting there only oversubscribes and pays the
+            // per-worker accumulator cost for nothing; the top-level final
+            // bundles run on the main thread and do get the speedup.
+            const PARALLEL_SCHUR_MIN_POINTS: usize = 1500;
+            let parallel_schur =
+                num_points >= PARALLEL_SCHUR_MIN_POINTS && rayon::current_thread_index().is_none();
+            if parallel_schur {
+                // Chunked by hand into exactly one range per worker rather
+                // than letting rayon subdivide freely: each chunk allocates
+                // and later reduces a dense `total_dim^2` accumulator, so the
+                // number of chunks - not the number of points - sets the
+                // overhead. Leaving rayon to split adaptively produced
+                // hundreds of those and was slower than running serially.
+                let nthreads = rayon::current_num_threads().max(1);
+                let chunk = num_points.div_ceil(nthreads).max(1);
+                let (s_acc, rhs_acc) = (0..nthreads)
+                    .into_par_iter()
+                    .map(|t| {
+                        let lo = (t * chunk).min(num_points);
+                        let hi = ((t + 1) * chunk).min(num_points);
+                        let mut ps = DMatrix::<f64>::zeros(total_dim, total_dim);
+                        let mut pr = DVector::<f64>::zeros(total_dim);
+                        for p in lo..hi {
+                            if let Some(cinv) = cp_inv[p] {
+                                accumulate_point_schur(
+                                    &cinv,
+                                    &points_to_obs[p],
+                                    &c_rhs[p],
+                                    &pose_slot,
+                                    &cam_slot,
+                                    &mut ps,
+                                    &mut pr,
+                                );
+                            }
+                        }
+                        (ps, pr)
+                    })
+                    .reduce(
+                        || {
+                            (
+                                DMatrix::<f64>::zeros(total_dim, total_dim),
+                                DVector::<f64>::zeros(total_dim),
+                            )
+                        },
+                        |(mut a_s, a_r), (b_s, b_r)| {
+                            a_s += b_s;
+                            (a_s, a_r + b_r)
+                        },
+                    );
+                *s += s_acc;
+                *rhs += rhs_acc;
+            } else {
+                for p in 0..num_points {
+                    if let Some(cinv) = cp_inv[p] {
+                        accumulate_point_schur(
+                            &cinv,
+                            &points_to_obs[p],
+                            &c_rhs[p],
+                            &pose_slot,
+                            &cam_slot,
+                            s,
+                            rhs,
+                        );
                     }
-                    let rhs_contrib = e_i * &cinv_d * &c_rhs_d;
-                    let mut dest = rhs.rows_mut(off_i, dim_i);
-                    dest += rhs_contrib;
                 }
             }
 
@@ -855,7 +1056,10 @@ pub fn bundle_adjust(mut input: BaInput, params: &BaParams) -> BaOutput {
                     if !fixed || k >= cam_dof[c] {
                         continue;
                     }
-                    let row = cam_offset[c] + k;
+                    if cam_slot[c] == FIXED {
+                        continue;
+                    }
+                    let row = cam_slot[c] + k;
                     for col in 0..total_dim {
                         s[(row, col)] = 0.0;
                         s[(col, row)] = 0.0;
@@ -867,17 +1071,26 @@ pub fn bundle_adjust(mut input: BaInput, params: &BaParams) -> BaOutput {
 
             // Enforce exact symmetry (should already hold analytically; this
             // guards against float asymmetry breaking the Cholesky solve).
-            let s_sym = 0.5 * (&s + s.transpose());
+            let s_sym = 0.5 * (&*s + s.transpose());
 
-            let delta = match nalgebra::linalg::Cholesky::new(s_sym.clone()) {
-                Some(chol) => chol.solve(&rhs),
-                None => match s_sym.lu().solve(&rhs) {
-                    Some(sol) => sol,
-                    None => {
-                        lambda *= 3.0;
-                        continue;
+            // `Cholesky::new` consumes its argument, so the LU fallback
+            // rebuilds `s_sym` rather than cloning it up front - the clone
+            // cost a full `total_dim^2` copy on *every* iteration to serve a
+            // path that only runs when the reduced system is not positive
+            // definite, which on a well-damped problem is essentially never.
+            let delta = match nalgebra::linalg::Cholesky::new(s_sym) {
+                Some(chol) => chol.solve(&*rhs),
+                None => {
+                    let s_sym = 0.5 * (&*s + s.transpose());
+                    match s_sym.lu().solve(&*rhs) {
+                        Some(sol) => sol,
+                        None => {
+                            lambda *= nu;
+                            nu *= 2.0;
+                            continue;
+                        }
                     }
-                },
+                }
             };
 
             // delta_pt = -C^-1 * (g_pt + E^T * delta), from the second
@@ -887,20 +1100,37 @@ pub fn bundle_adjust(mut input: BaInput, params: &BaParams) -> BaOutput {
             let mut delta_point = vec![Vector3::<f64>::zeros(); num_points];
             for p in 0..num_points {
                 let Some(cinv) = cp_inv[p] else { continue };
-                let mut acc_d = DVector::from_column_slice(c_rhs[p].as_slice());
-                for (block_i, e_i) in &points_to_obs[p] {
-                    let (off_i, dim_i) = block_i.offset_dim(&cam_offset, &cam_dof);
-                    let dc = delta.rows(off_i, dim_i).into_owned();
-                    acc_d += e_i.transpose() * dc;
+                let mut acc: Vector3<f64> = c_rhs[p];
+                for block in &points_to_obs[p] {
+                    match block {
+                        EBlock::Pose(i, e_i) => {
+                            let dc: Vector6<f64> =
+                                Vector6::from_iterator(delta.rows(pose_slot[*i], 6).iter().copied());
+                            acc += e_i.transpose() * dc;
+                        }
+                        EBlock::Camera(c, e_i) => {
+                            let k = e_i.nrows();
+                            let dc = delta.rows(cam_slot[*c], k).into_owned();
+                            let contrib = e_i.transpose() * dc;
+                            acc += Vector3::new(contrib[0], contrib[1], contrib[2]);
+                        }
+                    }
                 }
-                let acc = Vector3::new(acc_d[0], acc_d[1], acc_d[2]);
                 delta_point[p] = -(cinv * acc);
             }
 
             let mut trial_poses = input.poses.clone();
             for i in 0..num_images {
                 let d: SVector<f64, 6> =
-                    SVector::<f64, 6>::from_iterator(delta.rows(6 * i, 6).iter().copied());
+                    if pose_slot[i] == FIXED {
+                        // Held fixed: absent from the reduced system, so its
+                        // increment is exactly zero by construction.
+                        SVector::<f64, 6>::zeros()
+                    } else {
+                        SVector::<f64, 6>::from_iterator(
+                            delta.rows(pose_slot[i], 6).iter().copied(),
+                        )
+                    };
                 trial_poses[i] = perturb_pose(&input.poses[i], &d);
             }
             let mut trial_points = input.points.clone();
@@ -912,10 +1142,10 @@ pub fn bundle_adjust(mut input: BaInput, params: &BaParams) -> BaOutput {
             let mut cameras_valid = true;
             for c in 0..num_cameras {
                 let k = cam_dof[c];
-                if k == 0 || input.fixed_cameras.get(c).copied().unwrap_or(false) {
+                if k == 0 || cam_slot[c] == FIXED {
                     continue;
                 }
-                let dc = delta.rows(cam_offset[c], k);
+                let dc = delta.rows(cam_slot[c], k);
                 let mut new_params = trial_cameras[c].params();
                 for j in 0..k {
                     new_params[j] += dc[j];
@@ -945,20 +1175,48 @@ pub fn bundle_adjust(mut input: BaInput, params: &BaParams) -> BaOutput {
             };
             let trial_cost = total_cost(&trial_input, params);
 
+            // Nielsen's trust-region update, driven by the gain ratio
+            // `rho` (actual decrease over the decrease the linearized model
+            // predicted) rather than a fixed multiply-or-divide. A step that
+            // matched its prediction well shrinks the damping aggressively,
+            // pushing the next iteration toward a full Gauss-Newton step; a
+            // step that overshot backs off geometrically. The fixed +-3x
+            // schedule this replaces needed roughly twice as many outer
+            // iterations to reach the same cost on real problems, because it
+            // could neither loosen quickly on well-behaved regions nor
+            // tighten fast enough on badly-scaled ones.
             if trial_cost.is_finite() && trial_cost < cost {
                 input.poses = trial_poses;
                 input.points = trial_points;
                 input.cameras = trial_cameras;
                 cost = trial_cost;
+                // Aggressive shrink on every accepted step, driving lambda
+                // toward a full Gauss-Newton step. Measured against
+                // Nielsen's gain-ratio-proportional shrink
+                // (`1-(2*rho-1)^3`), which is the textbook choice: on these
+                // problems it was consistently *worse* (10637 vs. 8452 outer
+                // iterations on `temple_ring`), because it keeps damping high
+                // through the long well-behaved tail where these problems
+                // spend most of their iterations.
                 lambda = (lambda / 3.0).max(1e-12);
+                nu = 2.0;
                 accepted = true;
                 break;
             } else {
-                lambda *= 3.0;
+                // Rejections do use Nielsen's geometric growth rather than a
+                // fixed 3x: consecutive rejections mean the linearization is
+                // badly scaled here, and doubling the growth factor each time
+                // escapes that in a couple of retries instead of creeping.
+                lambda *= nu;
+                nu *= 2.0;
             }
         }
 
         if !accepted {
+            break;
+        }
+        let rel_decrease = (cost_before_iter - cost) / cost_before_iter.max(1e-12);
+        if rel_decrease < FUNCTION_TOLERANCE {
             break;
         }
     }

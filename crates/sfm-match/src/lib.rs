@@ -1,11 +1,13 @@
 pub mod descriptor_match;
 pub mod pairing;
+pub mod vocab;
 
 use sfm_core::{CameraModel, FeatureSet, TwoViewGeometryRecord};
 use sfm_geometry::{estimate_two_view_geometry, to_normalized};
 
 pub use descriptor_match::{match_descriptors, MatchParams};
 pub use pairing::{exhaustive_pairs, sequential_pairs};
+pub use vocab::{vocab_tree_pairs, VocabParams};
 
 #[derive(Debug, Clone, Copy)]
 pub struct VerificationParams {

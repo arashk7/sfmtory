@@ -799,7 +799,8 @@ pub fn run_global(input: &super::ReconstructionInput, params: &GlobalParams) -> 
         &registered,
         &mut poses,
         &mut points,
-        false,
+        crate::IntrinsicsMode::Fixed,
+        crate::BaScope::Global,
     );
     run_bundle_adjustment(
         input,
@@ -810,7 +811,8 @@ pub fn run_global(input: &super::ReconstructionInput, params: &GlobalParams) -> 
         &registered,
         &mut poses,
         &mut points,
-        params.refine_intrinsics,
+        if params.refine_intrinsics { crate::IntrinsicsMode::FreeGuarded } else { crate::IntrinsicsMode::Fixed },
+        crate::BaScope::Global,
     );
 
     assemble_reconstruction(input, &cameras, &registered, &poses, &points)
@@ -880,6 +882,8 @@ mod tests {
             image_id: (idx + 1) as u32,
             camera_id: 1,
             name: format!("img{idx}.png"),
+            initial_pose: None,
+            pose_fixed: false,
             features: FeatureSet {
                 keypoints,
                 descriptors: Descriptors::Float32 {
@@ -968,6 +972,7 @@ mod tests {
             images,
             cameras,
             pairs,
+            fixed_cameras: Default::default(),
         };
 
         let recon = run_global(&input, &GlobalParams::default());
@@ -1071,6 +1076,7 @@ mod tests {
             images,
             cameras,
             pairs,
+            fixed_cameras: Default::default(),
         };
 
         let recon = run_global(&input, &GlobalParams::default());

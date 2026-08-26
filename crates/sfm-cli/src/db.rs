@@ -39,6 +39,12 @@ impl Database {
                 name TEXT NOT NULL UNIQUE,
                 width INTEGER NOT NULL,
                 height INTEGER NOT NULL,
+                -- Dataset-layout provenance (see `dataset::DiscoveredImage`).
+                -- Kept so later stages and reports can name a feature by where
+                -- it came from; `-1` marks a merged row spanning captures.
+                capture_id INTEGER NOT NULL DEFAULT 0,
+                phys_camera_id INTEGER NOT NULL DEFAULT 0,
+                image_index INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY(camera_id) REFERENCES cameras(id)
             );
             CREATE TABLE IF NOT EXISTS keypoints (
@@ -140,6 +146,7 @@ impl Database {
         Ok(cameras)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_image(
         &self,
         id: u32,
@@ -147,11 +154,17 @@ impl Database {
         name: &str,
         width: u32,
         height: u32,
+        capture_id: i64,
+        phys_camera_id: u32,
+        image_index: u32,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO images (id, camera_id, name, width, height) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(id) DO UPDATE SET camera_id=excluded.camera_id, name=excluded.name, width=excluded.width, height=excluded.height",
-            params![id, camera_id, name, width, height],
+            "INSERT INTO images (id, camera_id, name, width, height, capture_id, phys_camera_id, image_index)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET camera_id=excluded.camera_id, name=excluded.name,
+               width=excluded.width, height=excluded.height, capture_id=excluded.capture_id,
+               phys_camera_id=excluded.phys_camera_id, image_index=excluded.image_index",
+            params![id, camera_id, name, width, height, capture_id, phys_camera_id, image_index],
         )?;
         Ok(())
     }

@@ -63,7 +63,18 @@ impl Default for SiftParams {
             // real data (see PLAN.md's accuracy/density investigation).
             contrast_threshold: 0.02,
             edge_threshold: 10.0,
-            max_features: Some(8000),
+            // Close to (but not far above) `sceaux_castle`'s own natural,
+            // uncapped per-image yield at this `contrast_threshold` with
+            // upsampling off (~9950/image; COLMAP's own default extraction
+            // reaches ~10807/image on the same photos) - the previous 8000
+            // measurably truncated real matches, and raising it to 12000
+            // closed a large chunk of the point-density gap to COLMAP
+            // (7971 vs. COLMAP's 7927 points3d on `sceaux_castle`, up from
+            // 6162, with reprojection error still beating COLMAP's own) at
+            // a proportionate (not runaway) matching-time cost. Doesn't
+            // affect smaller/lower-detail photos at all - their natural
+            // yield stays well under either cap.
+            max_features: Some(12000),
             upsample: true,
         }
     }

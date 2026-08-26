@@ -1,8 +1,10 @@
+mod aruco_tuning;
+mod dataset;
 mod db;
 mod project;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -16,7 +18,7 @@ use project::Project;
 
 #[derive(Parser)]
 #[command(
-    name = "sfm",
+    name = "sfmtory",
     version,
     about = "Advanced sparse structure-from-motion / camera calibration, no GUI."
 )]
@@ -32,8 +34,9 @@ enum Commands {
         #[command(subcommand)]
         action: ProjectAction,
     },
-    /// Stage 1: detect keypoints/descriptors for every image into the project database.
-    Extract(ExtractArgs),
+    /// Stage 1: detect keypoints/descriptors for every image into the project cache.
+    #[command(alias = "extract")]
+    Feature(FeatureArgs),
     /// Stage 2: pair images and match+geometrically-verify their features.
     Match(MatchArgs),
     /// Stage 3: run sparse reconstruction (poses + 3D points) from verified matches.
@@ -54,7 +57,8 @@ enum Commands {
 
 #[derive(clap::Args)]
 struct DebugPairArgs {
-    #[arg(long)]
+    /// Project directory. Defaults to the current directory.
+    #[arg(long, default_value = ".")]
     project: PathBuf,
     #[arg(long)]
     image1: u32,
@@ -74,8 +78,9 @@ enum ProjectAction {
 }
 
 #[derive(clap::Args)]
-struct ExtractArgs {
-    #[arg(long)]
+struct FeatureArgs {
+    /// Project directory. Defaults to the current directory.
+    #[arg(long, default_value = ".")]
     project: PathBuf,
     #[arg(long, value_enum, default_value_t = DetectorArg::Sift)]
     detector: DetectorArg,
@@ -83,6 +88,17 @@ struct ExtractArgs {
     aruco_dict: Option<String>,
     #[arg(long)]
     max_features: Option<u32>,
+    /// Search ArUco detector and image-preprocessing parameters for ones that
+    /// work best on this dataset, then save them to the project so later runs
+    /// reuse them automatically.
+    #[arg(long)]
+    find_params: bool,
+    /// Merge each camera's features across captures into a single feature set
+    /// per (camera, image slot). For a rig of fixed cameras photographing a
+    /// target that moves between captures, this is what turns N captures into
+    /// N times the observations of one unmoved viewpoint.
+    #[arg(long)]
+    merge_multicaps: bool,
     #[arg(long)]
     gpu: bool,
 }
@@ -100,7 +116,8 @@ enum DetectorArg {
 
 #[derive(clap::Args)]
 struct MatchArgs {
-    #[arg(long)]
+    /// Project directory. Defaults to the current directory.
+    #[arg(long, default_value = ".")]
     project: PathBuf,
     #[arg(long, value_enum, default_value_t = PairingArg::Sequential)]
     pairing: PairingArg,
@@ -129,7 +146,8 @@ enum MatcherArg {
 
 #[derive(clap::Args)]
 struct MapArgs {
-    #[arg(long)]
+    /// Project directory. Defaults to the current directory.
+    #[arg(long, default_value = ".")]
     project: PathBuf,
     #[arg(long, value_enum, default_value_t = PipelineArg::Global)]
     pipeline: PipelineArg,
@@ -143,7 +161,8 @@ enum PipelineArg {
 
 #[derive(clap::Args)]
 struct RefineArgs {
-    #[arg(long)]
+    /// Project directory. Defaults to the current directory.
+    #[arg(long, default_value = ".")]
     project: PathBuf,
     #[arg(long, value_enum, default_value_t = RobustLossArg::Huber)]
     robust_loss: RobustLossArg,
@@ -159,11 +178,13 @@ enum RobustLossArg {
 
 #[derive(clap::Args)]
 struct ExportArgs {
-    #[arg(long)]
+    /// Project directory. Defaults to the current directory.
+    #[arg(long, default_value = ".")]
     project: PathBuf,
-    #[arg(long, value_enum)]
+    /// Output format. Defaults to COLMAP text.
+    #[arg(long, value_enum, default_value_t = ExportFormatArg::ColmapText)]
     format: ExportFormatArg,
-    /// Defaults to the project's `export/` directory if omitted.
+    /// Destination. Defaults to the project's `export/` directory.
     #[arg(long)]
     out: Option<PathBuf>,
 }
@@ -186,7 +207,8 @@ struct EvalArgs {
 
 #[derive(clap::Args)]
 struct RunArgs {
-    #[arg(long)]
+    /// Project directory. Defaults to the current directory.
+    #[arg(long, default_value = ".")]
     project: PathBuf,
     #[arg(long, value_enum, default_value_t = DetectorArg::Sift)]
     detector: DetectorArg,
@@ -206,7 +228,7 @@ fn main() -> Result<()> {
         Commands::Project { action } => match action {
             ProjectAction::New { dir, images } => cmd_project_new(&dir, &images),
         },
-        Commands::Extract(args) => cmd_extract(args),
+        Commands::Feature(args) => cmd_feature(args),
         Commands::Match(args) => cmd_match(args),
         Commands::Map(args) => cmd_map(args),
         Commands::Refine(args) => cmd_refine(args),
@@ -227,107 +249,205 @@ fn cmd_project_new(dir: &PathBuf, images: &PathBuf) -> Result<()> {
         project.root.display(),
         project.config.images_dir.display()
     );
-    println!("Next: sfm extract --project {}", project.root.display());
+    println!("Next: sfmtory feature --project {}", project.root.display());
     Ok(())
 }
 
-const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "tif", "tiff", "bmp"];
-
-fn is_image_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| IMAGE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
+/// Starting intrinsics for a declared camera with no `params` given: the same
+/// wide-FOV focal guess the resolution-grouped path uses, expressed in
+/// whichever model was requested. Distortion terms start at zero.
+fn default_camera_model(name: &str, w: u32, h: u32) -> Option<CameraModel> {
+    let f = w.max(h) as f64 * 1.2;
+    let (cx, cy) = (w as f64 / 2.0, h as f64 / 2.0);
+    let params: Vec<f64> = match name {
+        "SIMPLE_PINHOLE" => vec![f, cx, cy],
+        "PINHOLE" => vec![f, f, cx, cy],
+        "SIMPLE_RADIAL" => vec![f, cx, cy, 0.0],
+        "RADIAL" => vec![f, cx, cy, 0.0, 0.0],
+        "OPENCV" => vec![f, f, cx, cy, 0.0, 0.0, 0.0, 0.0],
+        "OPENCV_FISHEYE" => vec![f, f, cx, cy, 0.0, 0.0, 0.0, 0.0],
+        _ => return None,
+    };
+    CameraModel::from_name_and_params(name, &params)
 }
 
-fn list_images_sorted(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
-        .with_context(|| format!("reading images directory {}", dir.display()))?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| is_image_file(p))
-        .collect();
-    paths.sort();
-    Ok(paths)
-}
-
-fn cmd_extract(args: ExtractArgs) -> Result<()> {
+fn cmd_feature(args: FeatureArgs) -> Result<()> {
     let started = Instant::now();
     let project = Project::open(&args.project)?;
+    let stage_dir = project.prepare_stage("feature")?;
+    std::fs::create_dir_all(project.cache_dir())?;
 
     let detector_kind = match args.detector {
         DetectorArg::Sift => sfm_features::DetectorKind::Sift,
         DetectorArg::Orb => sfm_features::DetectorKind::Orb,
         DetectorArg::Aruco => sfm_features::DetectorKind::Aruco,
+        DetectorArg::Disk => sfm_features::DetectorKind::Disk,
         other => bail!(
-            "detector {other:?} is not implemented yet (see PLAN.md); available now: sift, orb, aruco"
+            "detector {other:?} is not implemented yet (see PLAN.md); available now: sift, orb, aruco, disk"
         ),
     };
-    if args.gpu {
-        eprintln!("note: --gpu has no effect for {:?} (classical CPU detector); GPU is used for the learned detectors once implemented", args.detector);
+    if args.gpu && args.detector != DetectorArg::Disk {
+        eprintln!("note: --gpu has no effect for {:?} (classical CPU detector); GPU is used for the learned `disk` detector", args.detector);
     }
-    // Leave each detector's own built-in `max_features` default in place
-    // unless `--max-features` was passed explicitly - see
-    // `DetectorConfig::new`'s doc comment for why `None` here must mean
-    // "use the default", not "uncapped".
-    let config = match args.max_features {
+
+    let (discovered, layout) = dataset::discover(&project.config.images_dir)?;
+    let num_captures = discovered
+        .iter()
+        .map(|d| d.capture_id)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let num_phys_cameras = discovered
+        .iter()
+        .map(|d| d.camera_id)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    println!(
+        "Found {} images ({:?} layout: {num_captures} capture(s), {num_phys_cameras} camera(s)) in {}",
+        discovered.len(),
+        layout,
+        project.config.images_dir.display()
+    );
+
+    let mut config = match args.max_features {
         Some(n) => {
             sfm_features::DetectorConfig::new(detector_kind).with_max_features(Some(n as usize))
         }
         None => sfm_features::DetectorConfig::new(detector_kind),
     };
+    config.disk.use_gpu = args.gpu;
 
-    let image_paths = list_images_sorted(&project.config.images_dir)?;
-    if image_paths.is_empty() {
-        bail!("no images found in {}", project.config.images_dir.display());
+    // ArUco parameter handling: search on request, otherwise reuse whatever a
+    // previous search saved, otherwise defaults.
+    if detector_kind == sfm_features::DetectorKind::Aruco {
+        if args.find_params {
+            let best = aruco_tuning::find_params(&discovered)?;
+            aruco_tuning::save(&project.aruco_params_path(), &best)?;
+            println!(
+                "Saved tuned ArUco parameters to {}",
+                project.aruco_params_path().display()
+            );
+            config.aruco = best;
+        } else if let Some(saved) = aruco_tuning::load(&project.aruco_params_path())? {
+            println!(
+                "Using tuned ArUco parameters from {}",
+                project.aruco_params_path().display()
+            );
+            config.aruco = saved;
+        }
+    } else if args.find_params {
+        bail!("--find-params applies to `--detector aruco` only");
     }
 
     // Decoding + detection is embarrassingly parallel and touches no shared
-    // state; only the sqlite writes afterward need to be sequential.
-    //
-    // Runs on a bounded-width local thread pool, not the rayon global default
-    // (`num_cpus`): SIFT's 2x upsample path (applied below
-    // `UPSAMPLE_MAX_MIN_DIM` - see `SiftParams`) roughly doubles per-image
-    // peak memory for the Gaussian/DoG pyramid on top of the 4x from the
-    // extra octave itself, and `num_cpus` upsampled photos in flight
-    // simultaneously measurably OOM-killed extraction on a real (memory-
-    // constrained) machine during development - upsampling is now gated off
-    // for already-high-resolution photos for accuracy reasons of its own
-    // (see `sift`'s module doc comment), which incidentally removes most of
-    // the original risk, but this bound is left in place as a safety margin
-    // for small/upsampled-photo datasets rather than re-widened. Capped at 4
-    // regardless of core count as a simple, safe bound rather than trying to
-    // size it from available memory at runtime.
-    let extraction_pool = rayon::ThreadPoolBuilder::new()
+    // state; only the sqlite writes afterward need to be sequential. Bounded
+    // pool width for the same memory reason documented on the detectors.
+    let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(rayon::current_num_threads().min(4))
         .build()
-        .context("building extraction thread pool")?;
-    let detected: Vec<Result<(PathBuf, (u32, u32), sfm_core::FeatureSet)>> =
-        extraction_pool.install(|| {
-            image_paths
-                .par_iter()
-                .map(|path| {
-                    let (w, h) = image::image_dimensions(path).with_context(|| {
-                        format!("reading dimensions of {}", path.display())
-                    })?;
-                    let features = sfm_features::detect_file(path, &config)
-                        .map_err(|e| anyhow::anyhow!("{e}"))
-                        .with_context(|| format!("detecting features in {}", path.display()))?;
-                    Ok((path.clone(), (w, h), features))
-                })
-                .collect()
-        });
+        .context("building feature-extraction thread pool")?;
+    let detected: Vec<Result<(u32, u32, sfm_core::FeatureSet)>> = pool.install(|| {
+        discovered
+            .par_iter()
+            .map(|d| {
+                let (w, h) = image::image_dimensions(&d.path)
+                    .with_context(|| format!("reading dimensions of {}", d.path.display()))?;
+                let mut features = sfm_features::detect_file(&d.path, &config)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+                    .with_context(|| format!("detecting features in {}", d.path.display()))?;
+                // Stamp the capture so a fiducial that moved between captures
+                // cannot match itself across them.
+                sfm_features::aruco::stamp_capture_id(&mut features, d.capture_id);
+                Ok((w, h, features))
+            })
+            .collect()
+    });
+
+    let mut records: Vec<(dataset::DiscoveredImage, u32, u32, sfm_core::FeatureSet)> = Vec::new();
+    for (d, r) in discovered.into_iter().zip(detected) {
+        let (w, h, f) = r?;
+        records.push((d, w, h, f));
+    }
+
+    if args.merge_multicaps {
+        records = merge_across_captures(records, num_captures)?;
+    }
 
     let db = Database::open(&project.database_path())?;
     let mut camera_by_dims: HashMap<(u32, u32), u32> = HashMap::new();
     let mut next_camera_id = db.max_camera_id()? + 1;
     let mut next_image_id = db.max_image_id()? + 1;
+    let declared = &project.config.cameras;
+    let mut declared_ids: HashMap<usize, u32> = HashMap::new();
+    let mut phys_camera_ids: HashMap<u32, u32> = HashMap::new();
     let mut per_image = Vec::new();
     let mut total_features = 0usize;
+    let mut corner_rows: Vec<String> = Vec::new();
 
-    for result in detected {
-        let (path, (w, h), features) = result?;
-        let camera_id = if let Some(id) = camera_by_dims.get(&(w, h)) {
+    for (d, w, h, features) in &records {
+        let (w, h) = (*w, *h);
+        // Camera assignment, most explicit source first: declared `[[cameras]]`
+        // globs, then the physical camera the layout identified, then image
+        // resolution. The middle case is what keeps several same-resolution
+        // cameras in a rig from collapsing into one intrinsics block.
+        let camera_id = if !declared.is_empty() {
+            let which = declared
+                .iter()
+                .position(|c| project::glob_match(&c.images, &d.name))
+                .with_context(|| {
+                    format!(
+                        "image {} matches none of the {} declared [[cameras]] globs in sfm.toml \
+                         (add a catch-all `images = \"*\"` entry if that is intended)",
+                        d.name,
+                        declared.len()
+                    )
+                })?;
+            if let Some(&id) = declared_ids.get(&which) {
+                id
+            } else {
+                let cfg = &declared[which];
+                let id = next_camera_id;
+                next_camera_id += 1;
+                let model_name = cfg.model.as_deref().unwrap_or("SIMPLE_RADIAL");
+                let model = match &cfg.params {
+                    Some(params) => CameraModel::from_name_and_params(model_name, params)
+                        .with_context(|| {
+                            format!(
+                                "camera \"{}\": model {model_name} does not accept {} parameters",
+                                cfg.name,
+                                params.len()
+                            )
+                        })?,
+                    None => default_camera_model(model_name, w, h).with_context(|| {
+                        format!("camera \"{}\": unknown model {model_name}", cfg.name)
+                    })?,
+                };
+                db.upsert_camera(&Camera { camera_id: id, model, width: w, height: h })?;
+                eprintln!(
+                    "camera {id} \"{}\" ({model_name}{}){}",
+                    cfg.name,
+                    if cfg.params.is_some() { ", known intrinsics" } else { "" },
+                    if cfg.refine == Some(false) { ", held fixed" } else { "" }
+                );
+                declared_ids.insert(which, id);
+                id
+            }
+        } else if num_phys_cameras > 1 {
+            match phys_camera_ids.get(&d.camera_id) {
+                Some(&id) => id,
+                None => {
+                    let id = next_camera_id;
+                    next_camera_id += 1;
+                    db.upsert_camera(&Camera {
+                        camera_id: id,
+                        model: default_camera_model("SIMPLE_RADIAL", w, h).unwrap(),
+                        width: w,
+                        height: h,
+                    })?;
+                    phys_camera_ids.insert(d.camera_id, id);
+                    id
+                }
+            }
+        } else if let Some(id) = camera_by_dims.get(&(w, h)) {
             *id
         } else if let Some(id) = db.find_camera_id_by_dims(w, h)? {
             camera_by_dims.insert((w, h), id);
@@ -335,74 +455,206 @@ fn cmd_extract(args: ExtractArgs) -> Result<()> {
         } else {
             let id = next_camera_id;
             next_camera_id += 1;
-            // Initial focal-length guess (no EXIF/sensor data yet): a wide
-            // ~53deg horizontal FOV, the same rule of thumb COLMAP falls back
-            // on. Refined for real once `sfm-ba` exists.
-            let f = w.max(h) as f64 * 1.2;
-            let camera = Camera {
+            db.upsert_camera(&Camera {
                 camera_id: id,
-                model: CameraModel::SimpleRadial {
-                    f,
-                    cx: w as f64 / 2.0,
-                    cy: h as f64 / 2.0,
-                    k: 0.0,
-                },
+                model: default_camera_model("SIMPLE_RADIAL", w, h).unwrap(),
                 width: w,
                 height: h,
-            };
-            db.upsert_camera(&camera)?;
+            })?;
             camera_by_dims.insert((w, h), id);
             id
         };
 
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.to_string_lossy().to_string());
-        let image_id = if let Some(id) = db.find_image_id_by_name(&name)? {
-            id
-        } else {
-            let id = next_image_id;
-            next_image_id += 1;
-            id
+        let image_id = match db.find_image_id_by_name(&d.name)? {
+            Some(id) => id,
+            None => {
+                let id = next_image_id;
+                next_image_id += 1;
+                id
+            }
         };
-        db.upsert_image(image_id, camera_id, &name, w, h)?;
+        // A merged row spans captures, so it has no single capture of origin.
+        let capture_col = if args.merge_multicaps && num_captures > 1 {
+            -1
+        } else {
+            d.capture_id as i64
+        };
+        db.upsert_image(
+            image_id,
+            camera_id,
+            &d.name,
+            w,
+            h,
+            capture_col,
+            d.camera_id,
+            d.image_index,
+        )?;
         db.store_features(
             image_id,
             &format!("{:?}", args.detector).to_lowercase(),
-            &features,
+            features,
         )?;
+
+        // Every fiducial corner gets the identity the spec calls for:
+        // capture_camera_image_aruco_corner.
+        for i in 0..features.len() {
+            if let Some((capture, marker, corner)) = features.descriptors.marker_corner(i) {
+                let kp = features.keypoints[i];
+                corner_rows.push(format!(
+                    "{}_{}_{}_{}_{},{},{},{:.3},{:.3}",
+                    capture, d.camera_id, d.image_index, marker, corner,
+                    image_id, d.name, kp.x, kp.y
+                ));
+            }
+        }
 
         total_features += features.len();
         per_image.push(serde_json::json!({
             "image_id": image_id,
-            "name": name,
+            "name": d.name,
+            "capture_id": capture_col,
+            "camera_id": d.camera_id,
+            "image_index": d.image_index,
             "num_features": features.len(),
         }));
     }
 
+    if !corner_rows.is_empty() {
+        let path = stage_dir.join("corners.csv");
+        let mut out =
+            String::from("feature_id,image_id,image_name,x,y\n");
+        out.push_str(&corner_rows.join("\n"));
+        out.push('\n');
+        std::fs::write(&path, out)
+            .with_context(|| format!("writing {}", path.display()))?;
+        println!("Wrote {} fiducial corner ids to {}", corner_rows.len(), path.display());
+    }
+
     let payload = serde_json::json!({
-        "stage": "extract",
+        "stage": "feature",
         "status": "ok",
         "detector": format!("{:?}", args.detector).to_lowercase(),
+        "layout": format!("{layout:?}"),
+        "num_captures": num_captures,
+        "num_cameras": num_phys_cameras,
+        "merge_multicaps": args.merge_multicaps,
         "num_images": per_image.len(),
         "total_features": total_features,
         "per_image": per_image,
         "elapsed_ms": started.elapsed().as_millis(),
     });
-    let log_path = project.record_log("extract", &payload)?;
+    std::fs::write(
+        stage_dir.join("report.json"),
+        serde_json::to_string_pretty(&payload)?,
+    )?;
+    let log_path = project.record_log("feature", &payload)?;
     println!(
-        "Extracted {total_features} features across {} images ({:?}). Logged to {}.",
+        "Detected {total_features} features across {} images ({:?}). Report: {}",
         per_image.len(),
         args.detector,
-        log_path.display()
+        stage_dir.join("report.json").display()
     );
+    let _ = log_path;
     Ok(())
+}
+
+/// Concatenates each camera's feature sets across captures into one feature
+/// set per `(camera, image slot)`.
+///
+/// This is the fixed-rig case: the cameras never moved, only the scene did, so
+/// every capture's observations are valid from the *same* viewpoint and belong
+/// to the same pose. Merging turns N captures into N times the observations of
+/// one image rather than N images that share no features - which is what makes
+/// the rig reconstructable when each individual capture shows too few markers
+/// to constrain anything. Corner descriptors keep their `capture_id`, so
+/// markers that moved between captures stay distinct 3D points inside the
+/// merged set.
+fn merge_across_captures(
+    records: Vec<(dataset::DiscoveredImage, u32, u32, sfm_core::FeatureSet)>,
+    num_captures: usize,
+) -> Result<Vec<(dataset::DiscoveredImage, u32, u32, sfm_core::FeatureSet)>> {
+    if num_captures < 2 {
+        println!("--merge-multicaps: only one capture present, nothing to merge");
+        return Ok(records);
+    }
+    // Grouped by (camera, slot) so a camera holding several shots per capture
+    // merges shot-for-shot rather than pooling them.
+    let mut groups: std::collections::BTreeMap<(u32, u32), Vec<usize>> = Default::default();
+    for (i, (d, ..)) in records.iter().enumerate() {
+        groups.entry((d.camera_id, d.image_index)).or_default().push(i);
+    }
+
+    let mut out = Vec::with_capacity(groups.len());
+    for ((camera_id, image_index), members) in groups {
+        let (w, h) = (records[members[0]].1, records[members[0]].2);
+        for &m in &members {
+            if (records[m].1, records[m].2) != (w, h) {
+                bail!(
+                    "--merge-multicaps: camera {camera_id} slot {image_index} mixes image sizes \
+                     ({}x{} vs {}x{}); merged images must come from the same unmoved camera",
+                    w, h, records[m].1, records[m].2
+                );
+            }
+        }
+        let mut keypoints = Vec::new();
+        let mut marker_data: Vec<u8> = Vec::new();
+        let mut float_data: Vec<f32> = Vec::new();
+        let mut float_dim = 0u32;
+        let mut binary_data: Vec<u8> = Vec::new();
+        let mut binary_stride = 0u32;
+        for &m in &members {
+            let fs = &records[m].3;
+            keypoints.extend_from_slice(&fs.keypoints);
+            match &fs.descriptors {
+                sfm_core::Descriptors::MarkerCorner { data } => marker_data.extend_from_slice(data),
+                sfm_core::Descriptors::Float32 { dim, data } => {
+                    float_dim = *dim;
+                    float_data.extend_from_slice(data);
+                }
+                sfm_core::Descriptors::Binary { bytes_per_descriptor, data } => {
+                    binary_stride = *bytes_per_descriptor;
+                    binary_data.extend_from_slice(data);
+                }
+            }
+        }
+        let descriptors = if !marker_data.is_empty() {
+            sfm_core::Descriptors::MarkerCorner { data: marker_data }
+        } else if !float_data.is_empty() {
+            sfm_core::Descriptors::Float32 { dim: float_dim, data: float_data }
+        } else {
+            sfm_core::Descriptors::Binary {
+                bytes_per_descriptor: binary_stride,
+                data: binary_data,
+            }
+        };
+        let first = &records[members[0]].0;
+        // Name the merged row for the camera and slot it represents, since it
+        // no longer corresponds to any single file on disk.
+        let name = format!("cam{camera_id:03}/slot{image_index:03}");
+        out.push((
+            dataset::DiscoveredImage {
+                path: first.path.clone(),
+                capture_id: first.capture_id,
+                camera_id,
+                image_index,
+                name,
+            },
+            w,
+            h,
+            sfm_core::FeatureSet { keypoints, descriptors },
+        ));
+    }
+    println!(
+        "--merge-multicaps: merged {num_captures} captures into {} per-camera feature set(s)",
+        out.len()
+    );
+    Ok(out)
 }
 
 fn cmd_match(args: MatchArgs) -> Result<()> {
     let started = Instant::now();
     let project = Project::open(&args.project)?;
+    let stage_dir = project.prepare_stage("match")?;
 
     if args.matcher != MatcherArg::MnnRatio {
         bail!(
@@ -412,10 +664,10 @@ fn cmd_match(args: MatchArgs) -> Result<()> {
     }
     if !matches!(
         args.pairing,
-        PairingArg::Exhaustive | PairingArg::Sequential
+        PairingArg::Exhaustive | PairingArg::Sequential | PairingArg::VocabTree
     ) {
         bail!(
-            "pairing {:?} is not implemented yet (see PLAN.md); available now: exhaustive, sequential",
+            "pairing {:?} is not implemented yet (see PLAN.md); available now: exhaustive, sequential, vocab-tree",
             args.pairing
         );
     }
@@ -443,6 +695,34 @@ fn cmd_match(args: MatchArgs) -> Result<()> {
     let pairs = match args.pairing {
         PairingArg::Exhaustive => sfm_match::exhaustive_pairs(n),
         PairingArg::Sequential => sfm_match::sequential_pairs(n, args.window as usize),
+        PairingArg::VocabTree => {
+            // `--window` doubles as "how many retrieval candidates per image"
+            // here, so the one knob that controls pair count keeps meaning
+            // the same thing across pairing strategies.
+            let vparams = sfm_match::VocabParams {
+                num_neighbors: args.window as usize,
+                ..Default::default()
+            };
+            match sfm_match::vocab_tree_pairs(&features, &vparams) {
+                Some(p) => {
+                    eprintln!(
+                        "vocab-tree retrieval: {} candidate pairs from {n} images ({:.1}% of exhaustive)",
+                        p.len(),
+                        100.0 * p.len() as f64 / (n * (n - 1) / 2).max(1) as f64
+                    );
+                    p
+                }
+                None => {
+                    // Marker/fiducial descriptors have no metric for
+                    // retrieval to work with - fall back rather than
+                    // silently returning no pairs.
+                    eprintln!(
+                        "note: vocab-tree retrieval does not apply to these descriptors (fiducial markers); falling back to exhaustive pairing"
+                    );
+                    sfm_match::exhaustive_pairs(n)
+                }
+            }
+        }
         _ => unreachable!("checked above"),
     };
 
@@ -484,6 +764,10 @@ fn cmd_match(args: MatchArgs) -> Result<()> {
         "pairs": per_pair,
         "elapsed_ms": started.elapsed().as_millis(),
     });
+    std::fs::write(
+        stage_dir.join("report.json"),
+        serde_json::to_string_pretty(&payload)?,
+    )?;
     let log_path = project.record_log("match", &payload)?;
     println!(
         "Verified {num_verified}/{} pairs, {total_inliers} inlier matches total. Logged to {}.",
@@ -496,6 +780,7 @@ fn cmd_match(args: MatchArgs) -> Result<()> {
 fn cmd_map(args: MapArgs) -> Result<()> {
     let started = Instant::now();
     let project = Project::open(&args.project)?;
+    let stage_dir = project.prepare_stage("map")?;
 
     let db = Database::open(&project.database_path())?;
     let images = db.list_images()?;
@@ -513,14 +798,46 @@ fn cmd_map(args: MapArgs) -> Result<()> {
         .into_iter()
         .map(|c| (c.camera_id, c))
         .collect();
+    // Known extrinsics from the project config, keyed by image file name.
+    let mut known_poses: HashMap<&str, (sfm_core::Pose, bool)> = HashMap::new();
+    for pc in &project.config.poses {
+        let q = nalgebra::Quaternion::new(
+            pc.quaternion[0],
+            pc.quaternion[1],
+            pc.quaternion[2],
+            pc.quaternion[3],
+        );
+        let pose = sfm_core::Pose {
+            rotation: nalgebra::UnitQuaternion::from_quaternion(q),
+            translation: Vector3::new(pc.translation[0], pc.translation[1], pc.translation[2]),
+        };
+        known_poses.insert(pc.image.as_str(), (pose, pc.fixed.unwrap_or(false)));
+    }
+    let known_names: std::collections::HashSet<&str> =
+        project.config.poses.iter().map(|p| p.image.as_str()).collect();
+    let seen_names: std::collections::HashSet<&str> =
+        images.iter().map(|(_, _, n, ..)| n.as_str()).collect();
+    for missing in known_names.difference(&seen_names) {
+        bail!(
+            "[[poses]] entry names image {missing:?}, which is not in this project \
+             (check the file name matches exactly)"
+        );
+    }
+
     let image_inputs: Vec<sfm_reconstruction::ImageInput> = images
         .iter()
         .map(|(id, camera_id, name, ..)| {
+            let (initial_pose, pose_fixed) = match known_poses.get(name.as_str()) {
+                Some(&(pose, fixed)) => (Some(pose), fixed),
+                None => (None, false),
+            };
             Ok(sfm_reconstruction::ImageInput {
                 image_id: *id,
                 camera_id: *camera_id,
                 name: name.clone(),
                 features: db.load_features(*id)?,
+                initial_pose,
+                pose_fixed,
             })
         })
         .collect::<Result<_>>()
@@ -542,10 +859,35 @@ fn cmd_map(args: MapArgs) -> Result<()> {
         })
         .collect::<Result<_>>()?;
 
+    // Cameras whose intrinsics the config pins. Resolved from the declared
+    // camera globs back to the ids `sfm extract` assigned, by matching the
+    // same glob against the same file names.
+    let mut fixed_cameras: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for cfg in &project.config.cameras {
+        if cfg.refine == Some(false) {
+            for (_, camera_id, name, ..) in &images {
+                if project::glob_match(&cfg.images, name) {
+                    fixed_cameras.insert(*camera_id);
+                }
+            }
+        }
+    }
+    if !fixed_cameras.is_empty() {
+        eprintln!(
+            "holding intrinsics fixed for camera(s) {:?} (refine = false)",
+            {
+                let mut v: Vec<u32> = fixed_cameras.iter().copied().collect();
+                v.sort_unstable();
+                v
+            }
+        );
+    }
+
     let input = sfm_reconstruction::ReconstructionInput {
         images: image_inputs,
         cameras,
         pairs,
+        fixed_cameras,
     };
     let pipeline_name = match args.pipeline {
         PipelineArg::Incremental => "incremental",
@@ -578,6 +920,10 @@ fn cmd_map(args: MapArgs) -> Result<()> {
         "mean_reprojection_error_px": recon.mean_reprojection_error(),
         "elapsed_ms": started.elapsed().as_millis(),
     });
+    std::fs::write(
+        stage_dir.join("report.json"),
+        serde_json::to_string_pretty(&payload)?,
+    )?;
     let log_path = project.record_log("map", &payload)?;
     println!(
         "Registered {}/{} images, {} points3d, mean reprojection error {:.3}px. Wrote {}. Logged to {}.",
@@ -603,7 +949,7 @@ fn cmd_refine(args: RefineArgs) -> Result<()> {
     let sparse_dir = project.sparse_dir();
     let mut recon = sfm_io::read_colmap_model(&sparse_dir).map_err(|e| {
         anyhow::anyhow!(
-            "failed to read sparse model from {} (run `sfm map` first): {e}",
+            "failed to read sparse model from {} (run `sfmtory map` first): {e}",
             sparse_dir.display()
         )
     })?;
@@ -928,12 +1274,14 @@ fn cmd_debug_pair(args: DebugPairArgs) -> Result<()> {
 }
 
 fn cmd_run(args: RunArgs) -> Result<()> {
-    println!("`sfm run` chains extract -> match -> map -> export; running each stage now.");
-    cmd_extract(ExtractArgs {
+    println!("`sfmtory run` chains feature -> match -> map -> export; running each stage now.");
+    cmd_feature(FeatureArgs {
         project: args.project.clone(),
         detector: args.detector,
         aruco_dict: None,
         max_features: None,
+        find_params: false,
+        merge_multicaps: false,
         gpu: false,
     })?;
     cmd_match(MatchArgs {

@@ -10,5 +10,6 @@ sfm-geometry = { path = "../sfm-geometry" }
 sfm-ba = { path = "../sfm-ba" }
 nalgebra.workspace = true
 tracing.workspace = true
+rayon.workspace = true
 
 [dev-dependencies]

@@ -1,4 +1,5 @@
 pub mod aruco;
+pub mod disk;
 pub mod geom2d;
 pub mod gray;
 pub mod homography;
@@ -12,6 +13,7 @@ pub enum DetectorKind {
     Sift,
     Orb,
     Aruco,
+    Disk,
 }
 
 impl DetectorKind {
@@ -20,6 +22,7 @@ impl DetectorKind {
             "sift" => Some(DetectorKind::Sift),
             "orb" => Some(DetectorKind::Orb),
             "aruco" => Some(DetectorKind::Aruco),
+            "disk" => Some(DetectorKind::Disk),
             _ => None,
         }
     }
@@ -32,6 +35,7 @@ pub struct DetectorConfig {
     pub sift: sift::SiftParams,
     pub orb: orb::OrbParams,
     pub aruco: aruco::ArucoParams,
+    pub disk: disk::DiskParams,
 }
 
 impl DetectorConfig {
@@ -54,26 +58,31 @@ impl DetectorConfig {
             sift: sift::SiftParams::default(),
             orb: orb::OrbParams::default(),
             aruco: aruco::ArucoParams::default(),
+            disk: disk::DiskParams::default(),
         }
     }
 
-    /// Overrides both detectors' `max_features` cap. Pass `None` to
+    /// Overrides every detector's `max_features` cap. Pass `None` to
     /// explicitly request *uncapped* extraction (not the default - see
     /// `new`'s doc comment for why unbounded isn't the baseline behavior).
     pub fn with_max_features(mut self, max: Option<usize>) -> Self {
         self.max_features = max;
         self.sift.max_features = max;
         self.orb.max_features = max;
+        self.disk.max_features = max;
         self
     }
 }
 
-/// Run the configured detector on one already-loaded image.
-pub fn detect(img: &image::DynamicImage, config: &DetectorConfig) -> FeatureSet {
+/// Run the configured detector on one already-loaded image. Fallible only
+/// for `Disk` (model download/inference can fail); the classical detectors
+/// can't fail on a well-formed in-memory image, so they're wrapped in `Ok`.
+pub fn detect(img: &image::DynamicImage, config: &DetectorConfig) -> sfm_core::Result<FeatureSet> {
     match config.kind {
-        DetectorKind::Sift => sift::detect(img, &config.sift),
-        DetectorKind::Orb => orb::detect(img, &config.orb),
-        DetectorKind::Aruco => aruco::detect(img, &config.aruco),
+        DetectorKind::Sift => Ok(sift::detect(img, &config.sift)),
+        DetectorKind::Orb => Ok(orb::detect(img, &config.orb)),
+        DetectorKind::Aruco => Ok(aruco::detect(img, &config.aruco)),
+        DetectorKind::Disk => disk::detect(img, &config.disk),
     }
 }
 
@@ -85,5 +94,5 @@ pub fn detect_file(
     let img = image::open(path).map_err(|e| {
         sfm_core::SfmError::Other(format!("failed to load image {}: {e}", path.display()))
     })?;
-    Ok(detect(&img, config))
+    detect(&img, config)
 }

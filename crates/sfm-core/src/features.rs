@@ -3,6 +3,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Bytes per fiducial corner descriptor: `capture_id`, `marker_id`,
+/// `corner_index`, each a little-endian `u32`.
+pub const MARKER_CORNER_BYTES: usize = 12;
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Keypoint {
     pub x: f32,
@@ -29,10 +33,18 @@ pub enum Descriptors {
         bytes_per_descriptor: u32,
         data: Vec<u8>,
     },
-    /// ArUco/fiducial marker corners: 8 bytes per keypoint, `marker_id: u32`
-    /// (LE) followed by `corner_index: u32` (LE, 0..3, corners ordered
-    /// clockwise starting top-left). Matched by exact (marker_id, corner)
-    /// equality rather than nearest-neighbor search - see `sfm-match`.
+    /// ArUco/fiducial marker corners: 12 bytes per keypoint, three LE `u32`s -
+    /// `capture_id`, `marker_id`, `corner_index` (0..3, clockwise from
+    /// top-left). Matched by exact equality of the whole triple rather than
+    /// nearest-neighbour search (see `sfm-match`).
+    ///
+    /// `capture_id` is part of the identity, not decoration: a fiducial that
+    /// is physically moved between captures is a *different 3D point* in each
+    /// one, and matching marker 5 in capture 0 to marker 5 in capture 1 would
+    /// silently fabricate a correspondence between two unrelated locations.
+    /// Including the capture in the key makes that impossible. Datasets with
+    /// no captures use `capture_id = 0` throughout, so the behaviour is
+    /// unchanged for them.
     MarkerCorner { data: Vec<u8> },
 }
 
@@ -56,7 +68,7 @@ impl Descriptors {
                     data.len() / *bytes_per_descriptor as usize
                 }
             }
-            Descriptors::MarkerCorner { data } => data.len() / 8,
+            Descriptors::MarkerCorner { data } => data.len() / MARKER_CORNER_BYTES,
         }
     }
 
@@ -83,13 +95,15 @@ impl Descriptors {
         }
     }
 
-    pub fn marker_corner(&self, i: usize) -> Option<(u32, u32)> {
+    /// `(capture_id, marker_id, corner_index)` - the full match key.
+    pub fn marker_corner(&self, i: usize) -> Option<(u32, u32, u32)> {
         match self {
             Descriptors::MarkerCorner { data } => {
-                let row = &data[i * 8..(i + 1) * 8];
-                let marker_id = u32::from_le_bytes(row[0..4].try_into().unwrap());
-                let corner_index = u32::from_le_bytes(row[4..8].try_into().unwrap());
-                Some((marker_id, corner_index))
+                let row = &data[i * MARKER_CORNER_BYTES..(i + 1) * MARKER_CORNER_BYTES];
+                let capture_id = u32::from_le_bytes(row[0..4].try_into().unwrap());
+                let marker_id = u32::from_le_bytes(row[4..8].try_into().unwrap());
+                let corner_index = u32::from_le_bytes(row[8..12].try_into().unwrap());
+                Some((capture_id, marker_id, corner_index))
             }
             _ => None,
         }
@@ -155,9 +169,11 @@ impl FeatureSet {
                 }
             }
             Descriptors::MarkerCorner { data } => {
-                let mut new_data = Vec::with_capacity(order.len() * 8);
+                let mut new_data = Vec::with_capacity(order.len() * MARKER_CORNER_BYTES);
                 for &i in &order {
-                    new_data.extend_from_slice(&data[i * 8..(i + 1) * 8]);
+                    new_data.extend_from_slice(
+                        &data[i * MARKER_CORNER_BYTES..(i + 1) * MARKER_CORNER_BYTES],
+                    );
                 }
                 Descriptors::MarkerCorner { data: new_data }
             }

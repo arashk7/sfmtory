@@ -41,6 +41,13 @@ pub struct ImageInput {
     pub camera_id: u32,
     pub name: String,
     pub features: FeatureSet,
+    /// Known world-to-camera pose, if one was supplied (see the project
+    /// config's `[[poses]]`). When at least two images carry one, the
+    /// reconstruction starts from those instead of searching for a seed pair.
+    pub initial_pose: Option<Pose>,
+    /// Whether bundle adjustment may move `initial_pose`. Ignored when
+    /// `initial_pose` is `None`.
+    pub pose_fixed: bool,
 }
 
 pub struct PairInput {
@@ -53,6 +60,9 @@ pub struct ReconstructionInput {
     pub images: Vec<ImageInput>,
     pub cameras: HashMap<u32, Camera>,
     pub pairs: Vec<PairInput>,
+    /// Camera ids whose intrinsics must not be refined (see the project
+    /// config's `refine = false`).
+    pub fixed_cameras: std::collections::HashSet<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -250,6 +260,51 @@ pub fn run_incremental(input: &ReconstructionInput, params: &IncrementalParams) 
     });
     const MAX_SEED_TRIALS: usize = 8;
 
+    // Seed selection, COLMAP-style: grow from the best-ranked candidate and
+    // stop as soon as one registers every image in the component - no other
+    // seed can beat that, so the remaining candidates are pure waste. Only a
+    // seed that leaves images behind causes the next one to be tried, and the
+    // best result so far is kept throughout.
+    //
+    // This replaced growing all `MAX_SEED_TRIALS` candidates and picking the
+    // winner. That was ~8x the work in the common case, and parallelizing it
+    // across candidates (the previous attempt at fixing the cost) only hid
+    // that on an idle 8-core machine while *blocking* the parallelism inside
+    // each growth - the Jacobian and Schur passes are themselves rayon-
+    // parallel and were being squeezed into one core each. Running a single
+    // growth that has the whole pool to itself is both less total work and
+    // better wall-clock than eight growths fighting over the pool.
+    // Supplied extrinsics make seed selection moot: the initial
+    // reconstruction is whatever the caller pinned down, not something to be
+    // searched for. Run exactly one growth, anchored on the first known-pose
+    // image so bundle adjustment's gauge-fixing image is one whose pose is
+    // meaningful in the caller's frame.
+    let known_pose_images: Vec<usize> = (0..n)
+        .filter(|&i| input.images[i].initial_pose.is_some())
+        .collect();
+    if known_pose_images.len() >= 2 {
+        let anchor = known_pose_images[0];
+        eprintln!(
+            "using {} supplied camera pose(s) as the initial reconstruction (anchor: {})",
+            known_pose_images.len(),
+            input.images[anchor].name
+        );
+        let seed = ranked.first().copied();
+        let result = grow_from_seed(
+            input,
+            params,
+            &pair_of,
+            &neighbors,
+            cameras.clone(),
+            anchor,
+            seed.map(|p| p.j).unwrap_or(anchor),
+            &seed.map(|p| p.geometry.pose).unwrap_or_else(Pose::identity),
+            seed.map(|p| p.geometry.inlier_matches.as_slice()).unwrap_or(&[]),
+        );
+        return finish_growth(input, params, result);
+    }
+
+    let target_registered = component_sizes[largest_component];
     let mut best: Option<GrowthResult> = None;
     for seed in ranked.iter().take(MAX_SEED_TRIALS) {
         let result = grow_from_seed(
@@ -271,14 +326,30 @@ pub fn run_incremental(input: &ReconstructionInput, params: &IncrementalParams) 
         if better {
             best = Some(result);
         }
+        if count >= target_registered {
+            break;
+        }
     }
+
+    let result = best.unwrap();
+    finish_growth(input, params, result)
+}
+
+/// The post-growth passes shared by every way of starting a reconstruction:
+/// one fixed-intrinsics global bundle to settle the model, then the single
+/// authoritative intrinsics-refining pass, then assembly.
+fn finish_growth(
+    input: &ReconstructionInput,
+    params: &IncrementalParams,
+    result: GrowthResult,
+) -> Reconstruction {
     let GrowthResult {
         seed_i,
         registered,
         mut poses,
         mut points,
         mut cameras,
-    } = best.unwrap();
+    } = result;
 
     // One more fixed-intrinsics pass before the intrinsics-refining one:
     // growth can end on a bootstrap registration (see the bridge-image
@@ -297,7 +368,8 @@ pub fn run_incremental(input: &ReconstructionInput, params: &IncrementalParams) 
         &registered,
         &mut poses,
         &mut points,
-        false,
+        IntrinsicsMode::Fixed,
+        BaScope::Global,
     );
 
     // Only this final bundle adjustment is allowed to touch intrinsics.
@@ -319,7 +391,8 @@ pub fn run_incremental(input: &ReconstructionInput, params: &IncrementalParams) 
         &registered,
         &mut poses,
         &mut points,
-        params.refine_intrinsics,
+        if params.refine_intrinsics { IntrinsicsMode::FreeGuarded } else { IntrinsicsMode::Fixed },
+        BaScope::Global,
     );
 
     assemble_reconstruction(input, &cameras, &registered, &poses, &points)
@@ -384,24 +457,63 @@ fn grow_from_seed(
     // while helping on datasets with few or no bootstrap registrations.
     let mut bootstrap_registered = vec![false; n];
 
-    poses[seed_i] = Some(Pose::identity());
-    poses[seed_j] = Some(*seed_pose);
-    registered[seed_i] = true;
-    registered[seed_j] = true;
+    // Two ways to start. Either the caller supplied known extrinsics for at
+    // least two images - in which case those *are* the initial reconstruction,
+    // already in a common world frame, and every pair among them can be
+    // triangulated directly - or we bootstrap from a single seed pair whose
+    // relative pose came from its essential matrix, with the first image
+    // defining the world frame.
+    let known: Vec<usize> = (0..n)
+        .filter(|&i| input.images[i].initial_pose.is_some())
+        .collect();
+    if known.len() >= 2 {
+        for &i in &known {
+            poses[i] = input.images[i].initial_pose;
+            registered[i] = true;
+        }
+        // Triangulate across every verified pair among the known-pose images.
+        // Unlike the seed-pair case there is no scale ambiguity to resolve:
+        // the supplied poses already share a metric world frame, so these
+        // points come out at true scale and everything registered later
+        // inherits it.
+        for pair in &input.pairs {
+            if registered[pair.i] && registered[pair.j] {
+                triangulate_pair_matches(
+                    input,
+                    &cameras,
+                    params,
+                    pair.i,
+                    pair.j,
+                    &pair.geometry.inlier_matches,
+                    &poses,
+                    &mut points,
+                    &mut obs_to_point,
+                );
+            }
+        }
+    } else {
+        poses[seed_i] = Some(Pose::identity());
+        poses[seed_j] = Some(*seed_pose);
+        registered[seed_i] = true;
+        registered[seed_j] = true;
 
-    triangulate_pair_matches(
-        input,
-        &cameras,
-        params,
-        seed_i,
-        seed_j,
-        seed_matches,
-        &poses,
-        &mut points,
-        &mut obs_to_point,
-    );
+        triangulate_pair_matches(
+            input,
+            &cameras,
+            params,
+            seed_i,
+            seed_j,
+            seed_matches,
+            &poses,
+            &mut points,
+            &mut obs_to_point,
+        );
+    }
 
-    let mut images_registered_since_ba = 2usize;
+    // Model size at the last full/global bundle adjustment - drives the
+    // growth-ratio trigger below (COLMAP's `ba_global_*_ratio`).
+    let mut images_at_last_global_ba = 2usize;
+    let mut points_at_last_global_ba = points.len().max(1);
 
     loop {
         // Next-best-view: the unregistered image with the most 2D-3D
@@ -518,9 +630,20 @@ fn grow_from_seed(
                         &registered,
                         &mut poses,
                         &mut points,
-                        false,
+                        IntrinsicsMode::Fixed,
+                        // Global, not local: a bootstrap pose is the least
+                        // trustworthy kind this pipeline produces, and
+                        // chained bootstraps compound each other's error -
+                        // `temple_sparse_ring` leans heavily on them and has
+                        // a documented history of destabilizing when this
+                        // correction pass was narrowed (see
+                        // `run_bundle_adjustment`'s intrinsics-pass comment).
+                        // Bootstraps are rare enough that the full solve is
+                        // affordable here.
+                        BaScope::Global,
                     );
-                    images_registered_since_ba = 0;
+                    images_at_last_global_ba = registered.iter().filter(|&&b| b).count();
+                    points_at_last_global_ba = points.len().max(1);
                 } else {
                     bootstrap_failed.insert((pair.i, pair.j));
                 }
@@ -574,12 +697,38 @@ fn grow_from_seed(
             triangulate_and_complete_tracks(input, &cameras, params, u, r, &matches, &poses, &mut points, &mut obs_to_point, &bootstrap_registered);
         }
 
-        images_registered_since_ba += 1;
-        if images_registered_since_ba >= params.run_ba_every_n_images {
-            // Intrinsics stay fixed during these in-loop passes (see
-            // `run_incremental`'s final call for why) - just keep
-            // poses/points internally consistent enough to keep registering
-            // more images correctly.
+        // COLMAP's two-tier bundle-adjustment schedule (`IncrementalMapper`):
+        // a *local* bundle after every single registration keeps the newly
+        // added image and its immediate neighbourhood consistent, which is
+        // all that's needed to keep registering further images correctly;
+        // full-model *global* bundles are reserved for when the model has
+        // actually grown enough for the far side of it to have drifted.
+        // Intrinsics stay fixed throughout both (see `run_incremental`'s
+        // final call for why).
+        run_bundle_adjustment(
+            input,
+            &mut cameras,
+            params.ba_robust_loss,
+            params.max_reprojection_error_px,
+            seed_i,
+            &registered,
+            &mut poses,
+            &mut points,
+            IntrinsicsMode::Fixed,
+            BaScope::Local { center: u },
+        );
+
+        // Global-bundle trigger, matching COLMAP's `ba_global_images_ratio` /
+        // `ba_global_points_ratio` (both 1.1): re-optimize everything once
+        // the model has grown ~10% in either images or points since the last
+        // global pass. Growth-proportional rather than every-N-images, so
+        // large models don't pay for a full solve nearly as often - the
+        // schedule that made incremental SfM's cost scale acceptably.
+        let num_reg = registered.iter().filter(|&&b| b).count();
+        let num_pts = points.len();
+        if num_reg as f64 >= images_at_last_global_ba as f64 * 1.1
+            || num_pts as f64 >= points_at_last_global_ba as f64 * 1.1
+        {
             run_bundle_adjustment(
                 input,
                 &mut cameras,
@@ -589,9 +738,35 @@ fn grow_from_seed(
                 &registered,
                 &mut poses,
                 &mut points,
-                false,
+                // Intrinsics are refined here, progressively, as the model
+                // grows - COLMAP's behaviour, and the difference between a
+                // focal length that tracks the reconstruction and one that
+                // has to be dragged into place in a single jump at the very
+                // end. Deferring it entirely to the final pass meant that
+                // pass started from the raw `1.2 * max(w, h)` guess with
+                // every pose and point already converged to fit that wrong
+                // value: measured on `temple_ring`, that one solve took 76
+                // iterations and 8.1 of the stage's 15 seconds, over half
+                // the total runtime. Refined progressively instead, the same
+                // final pass starts from an almost-correct calibration.
+                //
+                // (An older revision of this pipeline did try refining
+                // intrinsics in-loop and reverted it as not reconverging
+                // within a sane iteration budget. That was under the
+                // every-5-images full-model schedule this file used to have,
+                // where "in-loop" meant re-refining constantly against a
+                // still-moving model. Here it happens only at the rare
+                // growth-triggered global passes, which is a different
+                // proposition - and the measurements below back it.)
+                if params.refine_intrinsics {
+                    IntrinsicsMode::Free
+                } else {
+                    IntrinsicsMode::Fixed
+                },
+                BaScope::Global,
             );
-            images_registered_since_ba = 0;
+            images_at_last_global_ba = num_reg;
+            points_at_last_global_ba = num_pts;
         }
     }
 
@@ -1098,6 +1273,52 @@ fn triangulate_pair_matches(
     }
 }
 
+/// Which slice of the reconstruction a `run_bundle_adjustment` call optimizes.
+///
+/// Replicates COLMAP's `IncrementalMapper::AdjustLocalBundle` /
+/// `AdjustGlobalBundle` split, which is the single largest reason its mapping
+/// stage is fast: re-optimizing *every* registered image and *every* point
+/// after each new registration is quadratic work over the course of a
+/// reconstruction, and almost all of it is redundant - registering image 40
+/// barely moves image 3's pose. Measured here before the split existed:
+/// 130 of 171 CPU-seconds on `temple_ring` went into building Schur
+/// complements for repeated full-model solves during growth.
+#[derive(Clone, Copy)]
+enum BaScope {
+    /// Every registered image and every usable point are free variables
+    /// (except the gauge-fixing seed). Used for the periodic full
+    /// re-optimizations and the final refinement passes.
+    Global,
+    /// COLMAP's local bundle: only the just-registered image and its most
+    /// co-visible neighbours are free, only points that image actually
+    /// observes are free, and every *other* image observing those points is
+    /// included but held fixed so it still constrains them. Keeps the solve
+    /// proportional to the newly-added information rather than to the size
+    /// of the whole model.
+    Local { center: usize },
+}
+
+/// How camera intrinsics are treated by a `run_bundle_adjustment` call.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IntrinsicsMode {
+    /// Intrinsics held at their current values.
+    Fixed,
+    /// Intrinsics free, optimized jointly with poses/points in a single plain
+    /// solve - no outlier filtering, no fixed-vs-free safety comparison.
+    /// Used by the growth-triggered global bundles so the focal length tracks
+    /// the model as it grows instead of being corrected in one huge jump at
+    /// the end (see `run_incremental`).
+    Free,
+    /// Intrinsics free, plus outlier filtering and the fixed-vs-free
+    /// reprojection-error comparison that can reject the refined result
+    /// outright. The final, authoritative calibration pass.
+    FreeGuarded,
+}
+
+/// How many co-visible neighbours join the just-registered image as free
+/// variables in a local bundle. COLMAP's own `ba_local_num_images` default.
+const LOCAL_BA_NUM_IMAGES: usize = 6;
+
 #[allow(clippy::too_many_arguments)]
 fn run_bundle_adjustment(
     input: &ReconstructionInput,
@@ -1108,11 +1329,74 @@ fn run_bundle_adjustment(
     registered: &[bool],
     poses: &mut [Option<Pose>],
     points: &mut [PointWork],
-    allow_intrinsics: bool,
+    intrinsics: IntrinsicsMode,
+    scope: BaScope,
 ) {
-    // Compact-index remap: BA only sees registered images and points with a
-    // usable (>=2 observation) track.
-    let image_ids: Vec<usize> = (0..registered.len()).filter(|&i| registered[i]).collect();
+    let allow_intrinsics = intrinsics != IntrinsicsMode::Fixed;
+    // Which points are free variables, and which images are free to move.
+    // `Global` frees everything; `Local` frees only what the newly-registered
+    // image touches (see `BaScope`).
+    let (point_ids, free_images): (Vec<usize>, Option<std::collections::HashSet<usize>>) =
+        match scope {
+            BaScope::Global => (
+                (0..points.len())
+                    .filter(|&p| points[p].track.len() >= 2)
+                    .collect(),
+                None,
+            ),
+            BaScope::Local { center } => {
+                let point_ids: Vec<usize> = (0..points.len())
+                    .filter(|&p| {
+                        points[p].track.len() >= 2
+                            && points[p].track.iter().any(|&(img, _)| img == center)
+                    })
+                    .collect();
+                // Co-visibility = number of `center`'s own points each other
+                // registered image also observes. Ranked descending, so the
+                // window is the neighbourhood that actually shares structure
+                // with the new image rather than an arbitrary index window.
+                let mut covis: HashMap<usize, usize> = HashMap::new();
+                for &p in &point_ids {
+                    for &(img, _) in &points[p].track {
+                        if img != center && registered[img] {
+                            *covis.entry(img).or_insert(0) += 1;
+                        }
+                    }
+                }
+                let mut ranked: Vec<(usize, usize)> = covis.into_iter().collect();
+                // Sort by shared-point count, breaking ties by image index so
+                // the window is deterministic run to run (`HashMap` iteration
+                // order is randomized per process - the same class of bug
+                // already fixed once in this pipeline's PnP sampling).
+                ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                let mut free: std::collections::HashSet<usize> = ranked
+                    .into_iter()
+                    .take(LOCAL_BA_NUM_IMAGES)
+                    .map(|(img, _)| img)
+                    .collect();
+                free.insert(center);
+                (point_ids, Some(free))
+            }
+        };
+
+    // Images in the problem: every registered image observing a free point.
+    // For `Global` that's just "every registered image"; for `Local` the ones
+    // outside `free_images` come along as *fixed* poses - they still pull on
+    // the points they observe, they just don't move.
+    let image_ids: Vec<usize> = match &free_images {
+        None => (0..registered.len()).filter(|&i| registered[i]).collect(),
+        Some(_) => {
+            let mut seen = vec![false; registered.len()];
+            for &p in &point_ids {
+                for &(img, _) in &points[p].track {
+                    if registered[img] {
+                        seen[img] = true;
+                    }
+                }
+            }
+            (0..registered.len()).filter(|&i| seen[i]).collect()
+        }
+    };
     let image_pos: HashMap<usize, usize> = image_ids
         .iter()
         .enumerate()
@@ -1121,10 +1405,6 @@ fn run_bundle_adjustment(
     if image_ids.len() < 2 {
         return;
     }
-
-    let point_ids: Vec<usize> = (0..points.len())
-        .filter(|&p| points[p].track.len() >= 2)
-        .collect();
 
     let mut camera_of_image: Vec<usize> = Vec::new();
     let mut camera_list: Vec<CameraModel> = Vec::new();
@@ -1145,7 +1425,34 @@ fn run_bundle_adjustment(
         .map(|&orig| poses[orig].clone().unwrap())
         .collect();
     let ba_points: Vec<Vector3<f64>> = point_ids.iter().map(|&p| points[p].xyz).collect();
-    let fixed_poses: Vec<bool> = image_ids.iter().map(|&orig| orig == seed_i).collect();
+    // Gauge/fixed-pose selection. `Global` fixes only the seed (6 of the 7
+    // gauge dof; scale comes from the seed pose sitting at the origin - see
+    // the callers). `Local` additionally fixes every image outside the
+    // co-visible window, which both keeps the solve small and pins the
+    // window rigidly to the already-converged surrounding model.
+    let mut fixed_poses: Vec<bool> = match &free_images {
+        None => image_ids.iter().map(|&orig| orig == seed_i).collect(),
+        Some(free) => image_ids
+            .iter()
+            .map(|&orig| orig == seed_i || !free.contains(&orig))
+            .collect(),
+    };
+    // Poses the caller pinned (see `ImageInput::pose_fixed`) are fixed in
+    // every pass regardless of scope - that is the whole point of supplying
+    // measured extrinsics.
+    for (slot, &orig) in fixed_poses.iter_mut().zip(&image_ids) {
+        if input.images[orig].pose_fixed && input.images[orig].initial_pose.is_some() {
+            *slot = true;
+        }
+    }
+    // A local bundle whose window happens to cover *every* image in the
+    // problem (early in growth, when little is registered yet) would have no
+    // fixed pose at all, leaving the solve gauge-free and singular. Fall back
+    // to pinning the lowest-indexed image, matching what the seed does for
+    // the global case.
+    if !fixed_poses.iter().any(|&f| f) {
+        fixed_poses[0] = true;
+    }
 
     let mut observations = Vec::new();
     for (compact_p, &orig_p) in point_ids.iter().enumerate() {
@@ -1184,10 +1491,32 @@ fn run_bundle_adjustment(
     // it can afford a much larger iteration budget to fully reconverge
     // poses/points around the newly-refined intrinsics; periodic pose/point-
     // only passes during growth stay at the default for speed.
-    let max_iterations = if allow_intrinsics {
-        200
-    } else {
-        sfm_ba::BaParams::default().max_iterations
+    let max_iterations = match intrinsics {
+        // The final authoritative calibration pass happens once per
+        // reconstruction, so it can afford to fully reconverge poses/points
+        // around the refined intrinsics.
+        IntrinsicsMode::FreeGuarded => 200,
+        // The growth-time passes only need to *track* the intrinsics as the
+        // model grows, not converge them - the final pass above does that.
+        // Letting these inherit the 200-iteration budget made them chase full
+        // convergence at every growth trigger, which on `sceaux_castle` cost
+        // more than it saved. 50 is COLMAP's own
+        // `ba_global_max_num_iterations` default. It is not a free parameter
+        // to tune: too low is actively harmful, because a half-converged
+        // focal length is worse than an unrefined one - every pose and point
+        // then converges to fit the wrong intermediate value. Measured on
+        // `temple_sparse_ring`, a 25-iteration budget produced 1.16px mean
+        // reprojection error and an 18% focal error, against 0.18px / 0.82%
+        // at 50.
+        IntrinsicsMode::Free => 50,
+        // Local bundles deliberately keep the full default budget rather
+        // than COLMAP's tighter `ba_local_max_num_iterations` of 25. Tried
+        // and reverted: 25 bought 0.5s on `temple_ring` but cost
+        // `temple_sparse_ring` its calibration (focal error 0.82% -> 6.16%,
+        // points 1832 -> 1549). That dataset's self-calibration sits on a
+        // knife edge - small changes in the growth trajectory flip it between
+        // basins - and accuracy there is worth more than the half second.
+        IntrinsicsMode::Fixed => sfm_ba::BaParams::default().max_iterations,
     };
     let ba_params = sfm_ba::BaParams {
         robust_loss: ba_robust_loss,
@@ -1254,16 +1583,42 @@ fn run_bundle_adjustment(
     // already-somewhat-independent pose/point, and periodic in-loop calls
     // during growth favor speed over this extra refinement.
     let run_ba = |fixed_cameras: Vec<bool>| -> sfm_ba::BaOutput {
-        if allow_intrinsics {
-            filter_and_reoptimize(
-                build_input(fixed_cameras, &observations),
-                &ba_params,
-                max_reprojection_error_px,
-            )
+        let input = build_input(fixed_cameras, &observations);
+        if intrinsics == IntrinsicsMode::FreeGuarded {
+            filter_and_reoptimize(input, &ba_params, max_reprojection_error_px)
         } else {
-            sfm_ba::bundle_adjust(build_input(fixed_cameras, &observations), &ba_params)
+            sfm_ba::bundle_adjust(input, &ba_params)
         }
     };
+
+    // `Free` is the lightweight growth-time path: let the intrinsics move
+    // with the model, skip the filtering and the fixed-vs-free comparison
+    // (both belong to the final authoritative pass), and write the result
+    // straight out.
+    if intrinsics == IntrinsicsMode::Free {
+        let free_fixed_cameras: Vec<bool> = {
+            let mut per_cam = vec![0usize; camera_list.len()];
+            for &c in &camera_of_image {
+                per_cam[c] += 1;
+            }
+            per_cam
+                .iter()
+                .enumerate()
+                .map(|(idx, &n)| n < 5 || input.fixed_cameras.contains(&camera_id_list[idx]))
+                .collect()
+        };
+        let out = run_ba(free_fixed_cameras);
+        for (compact, &orig) in image_ids.iter().enumerate() {
+            poses[orig] = Some(out.poses[compact]);
+        }
+        for (compact, &orig) in point_ids.iter().enumerate() {
+            points[orig].xyz = out.points[compact];
+        }
+        for (idx, &cam_id) in camera_id_list.iter().enumerate() {
+            cameras.insert(cam_id, out.cameras[idx]);
+        }
+        return;
+    }
 
     let fixed_output = run_ba(vec![true; camera_list.len()]);
 
@@ -1292,7 +1647,11 @@ fn run_bundle_adjustment(
     let output = if allow_intrinsics && any_camera_eligible {
         let free_fixed_cameras: Vec<bool> = images_per_camera
             .iter()
-            .map(|&n| n < MIN_IMAGES_PER_CAMERA_FOR_INTRINSICS)
+            .enumerate()
+            .map(|(idx, &n)| {
+                n < MIN_IMAGES_PER_CAMERA_FOR_INTRINSICS
+                    || input.fixed_cameras.contains(&camera_id_list[idx])
+            })
             .collect();
         let free_output = run_ba(free_fixed_cameras);
         // Belt-and-suspenders plausibility bound: a real photographic lens's
@@ -1300,10 +1659,35 @@ fn run_bundle_adjustment(
         // this large, so an optimizer output that produces one is treated as
         // a bad optimum outright, regardless of what its own reprojection
         // error says.
-        let distortion_is_plausible = free_output
-            .cameras
-            .iter()
-            .all(|cam| cam.opencv_distortion().iter().all(|&d| d.abs() < 2.0));
+        //
+        // 0.5 is a real bound, not a formality: normal (non-fisheye) lenses
+        // sit well inside |k1| < 0.3, and wide-angle rarely passes -0.4. The
+        // bound was 2.0, which was loose enough that nothing ever tripped it
+        // - `temple_sparse_ring` was observed converging to k1 = -0.575 with
+        // a focal length 9.9% off the known truth, *winning* the reprojection
+        // comparison below because the two errors cancel in the reprojection
+        // but not in the calibration. That is exactly the "self-consistent
+        // but wrong" optimum this bound exists to catch, so it is set where
+        // it can actually catch one.
+        const MAX_PLAUSIBLE_DISTORTION: f64 = 0.5;
+        let distortion_is_plausible = free_output.cameras.iter().all(|cam| {
+            cam.opencv_distortion()
+                .iter()
+                .all(|&d| d.abs() < MAX_PLAUSIBLE_DISTORTION)
+        });
+        // On `temple_sparse_ring` specifically (16 images, ~2.1 observations
+        // per point on average) this comparison reliably rejects free_output:
+        // investigated directly (see decisions.md) by instrumenting this pass
+        // and confirming free_err *starts* above fixed_err and gets *worse*,
+        // not better, with a much larger iteration budget (200 -> 600 moved
+        // focal length further from the true value and raised free_err from
+        // 1.07px to 1.23px) - ruling out slow convergence and confirming a
+        // genuine local-optimum/identifiability problem: too few independent
+        // multi-view constraints on this dataset's short tracks for a shared
+        // focal length to be reliably recoverable from image observations
+        // alone. This is exactly the failure mode the comparison below exists
+        // to catch; falling back to `fixed_output` here is the correct,
+        // working behavior, not a bug to chase further.
         if distortion_is_plausible && eval_error(&free_output) < eval_error(&fixed_output) {
             free_output
         } else {
@@ -1571,7 +1955,9 @@ mod tests {
                 image_id: (idx + 1) as u32,
                 camera_id: 1,
                 name: format!("img{idx}.png"),
-                features: FeatureSet {
+                initial_pose: None,
+            pose_fixed: false,
+            features: FeatureSet {
                     keypoints,
                     descriptors: Descriptors::Float32 {
                         dim: 1,
@@ -1616,6 +2002,7 @@ mod tests {
             images,
             cameras,
             pairs,
+            fixed_cameras: Default::default(),
         };
 
         let recon = run_incremental(&input, &IncrementalParams::default());

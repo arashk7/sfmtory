@@ -28,7 +28,8 @@ use crate::homography::{apply_homography, solve_homography};
 const DATA_BITS: usize = 4;
 const GRID: usize = DATA_BITS + 2; // +1 black border cell on each side
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ArucoParams {
     /// Half-size (pixels) of the local-mean window for adaptive thresholding.
     pub adaptive_radius: i32,
@@ -38,6 +39,14 @@ pub struct ArucoParams {
     pub min_perimeter_px: f64,
     pub max_hamming_distance: u32,
     pub num_dictionary_markers: usize,
+    /// Contrast gain applied to the greyscale image before thresholding,
+    /// about mid-grey. Values above 1 pull a flat, low-contrast capture apart
+    /// so the adaptive threshold has an edge to find; 1.0 is a no-op.
+    pub contrast: f32,
+    /// Gamma applied before thresholding. Below 1 lifts shadows (markers lost
+    /// in a dark frame), above 1 pulls down highlights (markers washed out by
+    /// over-exposure); 1.0 is a no-op.
+    pub gamma: f32,
 }
 
 impl Default for ArucoParams {
@@ -49,6 +58,8 @@ impl Default for ArucoParams {
             min_perimeter_px: 60.0,
             max_hamming_distance: 3,
             num_dictionary_markers: 50,
+            contrast: 1.0,
+            gamma: 1.0,
         }
     }
 }
@@ -238,8 +249,29 @@ fn order_by_angle_around_centroid(mut corners: [(f64, f64); 4]) -> [(f64, f64); 
     corners
 }
 
+/// Applies the exposure-compensating preprocessing (`contrast`, `gamma`)
+/// before thresholding. A no-op at the defaults, so datasets that don't need
+/// it pay nothing.
+fn preprocess(gray: &image::GrayImage, params: &ArucoParams) -> image::GrayImage {
+    if params.contrast == 1.0 && params.gamma == 1.0 {
+        return gray.clone();
+    }
+    let mut out = gray.clone();
+    for p in out.pixels_mut() {
+        let mut v = p[0] as f32 / 255.0;
+        if params.gamma != 1.0 {
+            v = v.powf(params.gamma);
+        }
+        if params.contrast != 1.0 {
+            v = (v - 0.5) * params.contrast + 0.5;
+        }
+        p[0] = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    }
+    out
+}
+
 pub fn detect(img: &image::DynamicImage, params: &ArucoParams) -> FeatureSet {
-    let gray_u8 = img.to_luma8();
+    let gray_u8 = preprocess(&img.to_luma8(), params);
     let gray_f32 = to_gray_f32(img);
     let (w, h) = gray_u8.dimensions();
     let (wu, hu) = (w as usize, h as usize);
@@ -336,6 +368,10 @@ pub fn detect(img: &image::DynamicImage, params: &ArucoParams) -> FeatureSet {
                 angle: 0.0,
                 response: 1.0 / (1.0 + distance as f32),
             });
+            // capture_id is stamped in later by the caller, which is the
+            // only layer that knows the dataset layout - see
+            // `stamp_capture_id`.
+            marker_data.extend_from_slice(&0u32.to_le_bytes());
             marker_data.extend_from_slice(&marker_id.to_le_bytes());
             marker_data.extend_from_slice(&(corner_index as u32).to_le_bytes());
         }
@@ -467,7 +503,7 @@ mod tests {
             "expected exactly 4 corner keypoints for one marker"
         );
         for i in 0..4 {
-            let (id, _corner) = features.descriptors.marker_corner(i).unwrap();
+            let (_capture, id, _corner) = features.descriptors.marker_corner(i).unwrap();
             assert_eq!(id as usize, marker_id);
         }
     }
@@ -486,6 +522,20 @@ mod tests {
             for j in (i + 1)..dict.len() {
                 assert!(min_rotated_hamming(dict[i], dict[j]) >= 4);
             }
+        }
+    }
+}
+
+/// Rewrites every marker-corner descriptor's `capture_id` field in place.
+///
+/// The detector sees one image and has no idea which capture it belongs to;
+/// the dataset layout does. Keeping the stamping separate lets the detector
+/// stay layout-agnostic while still producing descriptors whose identity is
+/// correct across captures (see `sfm_core::Descriptors::MarkerCorner`).
+pub fn stamp_capture_id(features: &mut sfm_core::FeatureSet, capture_id: u32) {
+    if let sfm_core::Descriptors::MarkerCorner { data } = &mut features.descriptors {
+        for row in data.chunks_exact_mut(sfm_core::MARKER_CORNER_BYTES) {
+            row[0..4].copy_from_slice(&capture_id.to_le_bytes());
         }
     }
 }

@@ -12,5 +12,9 @@ nalgebra.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+ort.workspace = true
+ureq.workspace = true
+dirs.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]

@@ -175,7 +175,7 @@ fn match_binary(d1: &Descriptors, d2: &Descriptors, ratio: f32) -> Vec<(u32, u32
 /// skipped rather than guessed at.
 fn match_marker_corners(d1: &Descriptors, d2: &Descriptors) -> Vec<(u32, u32)> {
     use std::collections::HashMap;
-    let mut index2: HashMap<(u32, u32), usize> = HashMap::new();
+    let mut index2: HashMap<(u32, u32, u32), usize> = HashMap::new();
     for j in 0..d2.len() {
         if let Some(key) = d2.marker_corner(j) {
             index2.entry(key).or_insert(j);
@@ -232,25 +232,43 @@ mod tests {
         );
     }
 
+    fn corners(rows: &[(u32, u32, u32)]) -> Descriptors {
+        let mut data = Vec::new();
+        for &(capture, marker, corner) in rows {
+            data.extend_from_slice(&capture.to_le_bytes());
+            data.extend_from_slice(&marker.to_le_bytes());
+            data.extend_from_slice(&corner.to_le_bytes());
+        }
+        Descriptors::MarkerCorner { data }
+    }
+
     #[test]
     fn matches_marker_corners_by_identity() {
-        let mut data1 = Vec::new();
-        data1.extend_from_slice(&3u32.to_le_bytes());
-        data1.extend_from_slice(&0u32.to_le_bytes());
-        data1.extend_from_slice(&3u32.to_le_bytes());
-        data1.extend_from_slice(&1u32.to_le_bytes());
-        let d1 = Descriptors::MarkerCorner { data: data1 };
-
-        let mut data2 = Vec::new();
-        data2.extend_from_slice(&3u32.to_le_bytes());
-        data2.extend_from_slice(&1u32.to_le_bytes());
-        data2.extend_from_slice(&3u32.to_le_bytes());
-        data2.extend_from_slice(&0u32.to_le_bytes());
-        let d2 = Descriptors::MarkerCorner { data: data2 };
-
+        let d1 = corners(&[(0, 3, 0), (0, 3, 1)]);
+        let d2 = corners(&[(0, 3, 1), (0, 3, 0)]);
         let matches = match_descriptors(&d1, &d2, &MatchParams::default());
         assert_eq!(matches.len(), 2);
         assert!(matches.contains(&(0, 1)));
         assert!(matches.contains(&(1, 0)));
+    }
+
+    #[test]
+    fn marker_corners_do_not_match_across_captures() {
+        // The same physical marker, photographed in two captures between
+        // which it was moved: matching these would invent a correspondence
+        // between two unrelated 3D locations.
+        let d1 = corners(&[(0, 3, 0), (0, 3, 1)]);
+        let d2 = corners(&[(1, 3, 0), (1, 3, 1)]);
+        assert!(match_descriptors(&d1, &d2, &MatchParams::default()).is_empty());
+    }
+
+    #[test]
+    fn marker_corners_match_within_a_capture_across_cameras() {
+        // Two cameras seeing the same marker in the same capture must match -
+        // this is what makes a multi-camera rig reconstructable at all.
+        let d1 = corners(&[(2, 7, 0), (2, 7, 2)]);
+        let d2 = corners(&[(2, 7, 2), (2, 7, 0)]);
+        let matches = match_descriptors(&d1, &d2, &MatchParams::default());
+        assert_eq!(matches.len(), 2);
     }
 }
