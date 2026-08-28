@@ -488,7 +488,7 @@ fn grow_from_seed(
                     &poses,
                     &mut points,
                     &mut obs_to_point,
-                );
+                        );
             }
         }
     } else {
@@ -607,7 +607,7 @@ fn grow_from_seed(
                     &mut poses,
                     &mut points,
                     &mut obs_to_point,
-                    &bootstrap_registered,
+                            &bootstrap_registered,
                 ) {
                     registered[u] = true;
                     failed_at_count[u] = None;
@@ -811,7 +811,10 @@ fn well_conditioned_match_count(
             let Some(xyz) = triangulate_normalized(&[(pose_a.clone(), obs_a), (pose_b.clone(), obs_b)]) else {
                 return false;
             };
-            if triangulation_angle(&center_a, &center_b, &xyz) < min_angle {
+            // See `triangulate_pair_matches` for why this is negated: a
+            // degenerate pair yields a NaN angle, which must not score as
+            // well-conditioned.
+            if !(triangulation_angle(&center_a, &center_b, &xyz) >= min_angle) {
                 return false;
             }
             let err_a = reprojection_error_normalized(&pose_a, &xyz, obs_a).map(|e| e * avg_focal_a);
@@ -998,7 +1001,10 @@ fn try_bootstrap_bridge_image(
 
         poses[u] = Some(pose);
         let before = points.len();
-        let (gained, completions) = triangulate_and_complete_tracks(input, cameras, params, u, r, &matches, poses, points, obs_to_point, &bootstrap_registered_with_u);
+        let (gained, completions) = triangulate_and_complete_tracks(
+            input, cameras, params, u, r, &matches, poses, points, obs_to_point,
+            &bootstrap_registered_with_u,
+        );
 
         if gained >= min_gain {
             return true;
@@ -1210,7 +1216,9 @@ fn triangulate_and_complete_tracks(
     }
 
     let before = points.len();
-    triangulate_pair_matches(input, cameras, params, a, b, &fresh, poses, points, obs_to_point);
+    triangulate_pair_matches(
+        input, cameras, params, a, b, &fresh, poses, points, obs_to_point,
+    );
     let new_points = points.len() - before;
 
     (completions.len() + new_points, completions)
@@ -1249,7 +1257,12 @@ fn triangulate_pair_matches(
         };
 
         let angle = triangulation_angle(&center_a, &center_b, &xyz);
-        if angle < min_angle {
+        // `!(angle >= min_angle)` rather than `angle < min_angle`: the angle is
+        // NaN when the two camera centres coincide, which is exactly what a
+        // degenerate two-view estimate produces (a recovered relative pose
+        // with no translation). Written the other way round, NaN compares
+        // false and slips *through* the gate.
+        if !(angle >= min_angle) {
             continue;
         }
         let avg_focal_a = (cam_a.focal_lengths().0 + cam_a.focal_lengths().1) / 2.0;

@@ -87,23 +87,19 @@ pub fn match_and_verify(
         })
         .collect();
 
-    // ArUco marker corners are already unambiguous exact-ID correspondences
-    // with (by construction) very few points per pair - RANSAC's minimal
-    // sample of 8 is usually more points than a couple of markers provide.
-    // Accept them directly (still gated by `min_inliers`) instead of running
-    // essential-matrix RANSAC on a handful of points.
-    if matches!(
-        features1.descriptors,
-        sfm_core::Descriptors::MarkerCorner { .. }
-    ) {
-        if putative.len() < params.min_inliers {
-            return None;
-        }
-        return Some(TwoViewGeometryRecord {
-            pose: sfm_core::Pose::identity(),
-            inlier_matches: putative,
-        });
-    }
+    // Fiducial corners take the same geometric-verification path as everything
+    // else. An earlier version short-circuited here and returned
+    // `Pose::identity()` with all putative matches accepted, on the reasoning
+    // that exact-ID marker correspondences are already outlier-free so RANSAC
+    // has nothing to reject. That reasoning is right about *outliers* and
+    // misses what the step is also for: `estimate_two_view_geometry` is where
+    // the relative **pose** comes from. Returning an identity pose stored a
+    // zero baseline for every fiducial pair, so the reconstruction bootstrapped
+    // with both cameras at the same point and triangulated every corner to the
+    // origin - fiducial-only datasets could not reconstruct at all. The
+    // `min_inliers` gate (15 by default, i.e. at least four markers) already
+    // keeps pairs too thin for a stable eight-point estimate from reaching
+    // here.
 
     let geometry = estimate_two_view_geometry(
         &pts1,

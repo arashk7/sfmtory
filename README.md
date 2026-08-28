@@ -36,6 +36,8 @@ planned as an optional layer on top of this pipeline — see [Roadmap](#roadmap)
 - [Architecture](#architecture)
 - [Status vs. COLMAP and GLOMAP](#status-vs-colmap-and-glomap)
 - [Camera setup](#camera-setup)
+- [Calibrating from ArUco markers](#calibrating-from-aruco-markers)
+- [Evaluating a reconstruction](#evaluating-a-reconstruction)
 - [GPU support](#gpu-support)
 - [Known limitations](#known-limitations)
 - [Roadmap](#roadmap)
@@ -278,6 +280,85 @@ true intrinsics yields **17256 points at 0.130px**, against 10599 at 0.283px whe
 solving for everything from scratch. Partial priors work too (4 of 47 poses still
 registers 47/47). Details and measurements: [`decisions.md`](decisions.md).
 
+## Calibrating from ArUco markers
+
+A complete run on a fiducial-only dataset — no natural features, just markers.
+Works at scale: validated on **200 viewpoints of 150 markers**.
+
+```bash
+cd my_dataset                 # contains images/
+
+# 1. Detect markers. Add --find-params once if detection looks thin.
+sfmtory feature --detector aruco
+
+# 2. Match. Fiducial correspondences are exact-ID, so pair them exhaustively.
+sfmtory match --pairing exhaustive
+
+# 3. Reconstruct.
+sfmtory map --pipeline incremental
+
+# 4. Check the result against a known focal length.
+sfmtory eval --gt-focal 1150
+```
+
+Measured on the 200-view synthetic scene (`cargo run --release -p sfm-cli
+--example gen_aruco_scene3d -- images 200 1150 1280 960 150`):
+
+| Stage | Result |
+|---|---|
+| `feature` | 11808 corners across 200 images |
+| `match` | 4202 verified pairs of 19900, largest connected component 160 images |
+| `map` | **151/200 images registered, 838 points, 0.262px** — 276s, 40MB peak RSS |
+
+The 49 unregistered views are ones where too few markers decoded to form a
+verified pair; they are genuinely disconnected from the match graph, not
+dropped by the mapper.
+
+**Supply your intrinsics if you have them.** Fiducial-only reconstruction
+recovers *poses* well but does not currently refine the shared focal length —
+see [Known limitations](#known-limitations). For calibrated cameras, give it
+the calibration and let it solve the geometry:
+
+```toml
+# sfm.toml
+[[cameras]]
+name   = "cam"
+images = "*"
+model  = "SIMPLE_RADIAL"
+params = [1150.0, 640.0, 480.0, 0.0]
+refine = false                        # trust the values you measured
+```
+
+For a rig of **fixed** cameras where you move the marker board between shots,
+add `--merge-multicaps` to the `feature` step — see
+[Quick start](#quick-start).
+
+## Evaluating a reconstruction
+
+`sfmtory eval` reads a COLMAP-format model and reports reprojection error
+recomputed **from the geometry itself** (not read back from the model's stored
+`error` column, so it also catches a model written out inconsistently, and is
+comparable against another tool's output):
+
+```bash
+sfmtory eval                                    # this project's map output
+sfmtory eval --ours path/to/sparse/0            # any COLMAP model
+sfmtory eval --gt-focal 1523.15                 # focal error vs a known value
+sfmtory eval --gt-focal data/sceaux_castle/K.txt   # ...or a K matrix file
+sfmtory eval --baseline path/to/colmap/sparse/0    # compare against COLMAP
+```
+
+```text
+Reprojection error (recomputed from geometry):
+  ours       images   47  points   10599  obs    40996  mean 0.2831px  median 0.1438px  p95 0.8731px  max 572.070px
+Focal lengths:
+  camera 1    f =   1531.968 px   error vs reference  0.579%
+```
+
+Median and p95 alongside the mean are deliberate: a single mean hides whether
+a model is uniformly decent or mostly excellent with a few broken points — the
+`max` above is one such outlier that the mean alone would not reveal.
+
 ## GPU support
 
 GPU acceleration is optional and auto-detected, added where it actually pays off:
@@ -321,6 +402,15 @@ natural next step, not yet implemented.
   closed; what's left is per-iteration constant factors — Ceres uses a sparse
   Cholesky where this uses a dense one on the reduced camera system. That's also
   what needs to change to scale past a few hundred images.
+- **Fiducial-only datasets do not refine the shared focal length.** ArUco
+  reconstruction recovers poses and structure well (151/200 views at 0.262px on
+  a 200-view test scene), but every marker-corner track ends up with exactly
+  two observations, and a two-view track carries no redundancy to constrain a
+  shared intrinsic. The focal therefore stays at its initial estimate. Pass
+  known intrinsics with `refine = false` (see
+  [Calibrating from ArUco markers](#calibrating-from-aruco-markers)) until
+  track completion covers the fiducial path — this is the same track-merging
+  gap noted below, where it happens to bite hardest.
 - **`temple_sparse_ring`'s self-calibration is delicate.** It now beats both real
   systems there (0.82% focal error vs. 3.82%/1.90%), but it's the dataset that flips
   between good and bad optimization basins on small changes to bundle-adjustment

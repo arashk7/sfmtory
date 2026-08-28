@@ -30,11 +30,23 @@ pub fn triangulate_normalized(views: &[(Pose, (f64, f64))]) -> Option<Vector3<f6
     if x_h[3].abs() < 1e-12 {
         return None;
     }
-    Some(Vector3::new(
-        x_h[0] / x_h[3],
-        x_h[1] / x_h[3],
-        x_h[2] / x_h[3],
-    ))
+    let xyz = Vector3::new(x_h[0] / x_h[3], x_h[1] / x_h[3], x_h[2] / x_h[3]);
+    // Reject a non-finite result rather than handing it back as a point.
+    //
+    // A degenerate configuration - a relative pose with (near-)zero baseline,
+    // or a coplanar correspondence set that made the essential matrix
+    // ill-conditioned - can drive the DLT's null-space solve to produce NaN or
+    // infinity. Returning `Some(NaN)` is quietly poisonous: NaN fails every
+    // downstream *rejection* test, because comparisons against NaN are all
+    // false, so such a point sails through the triangulation-angle and
+    // reprojection-error gates that exist precisely to catch bad points, and
+    // lands in the reconstruction. Observed on a fiducial-only dataset where
+    // this produced a seed that triangulated "successfully" into 20 NaN
+    // points and then registered nothing.
+    if !xyz.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    Some(xyz)
 }
 
 /// Reprojection error in normalized-coordinate units (radians-ish for small

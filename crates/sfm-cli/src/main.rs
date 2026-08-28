@@ -197,10 +197,22 @@ enum ExportFormatArg {
 
 #[derive(clap::Args)]
 struct EvalArgs {
+    /// COLMAP-format model directory to evaluate (`cameras.txt`,
+    /// `images.txt`, `points3D.txt`). Defaults to this project's map output.
     #[arg(long)]
-    ours: PathBuf,
+    ours: Option<PathBuf>,
+    /// Project directory, used to locate `--ours` when it isn't given.
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+    /// A second COLMAP model to compare against (e.g. a real COLMAP run).
     #[arg(long)]
     baseline: Option<PathBuf>,
+    /// Ground-truth focal length: either a number in pixels, or a path to a
+    /// file whose first token is the focal length (a 3x3 K matrix works).
+    #[arg(long)]
+    gt_focal: Option<String>,
+    /// Ground-truth model directory, whose camera focal lengths are averaged
+    /// to form the reference instead of `--gt-focal`.
     #[arg(long)]
     gt: Option<PathBuf>,
 }
@@ -817,10 +829,13 @@ fn cmd_map(args: MapArgs) -> Result<()> {
         project.config.poses.iter().map(|p| p.image.as_str()).collect();
     let seen_names: std::collections::HashSet<&str> =
         images.iter().map(|(_, _, n, ..)| n.as_str()).collect();
-    for missing in known_names.difference(&seen_names) {
+    let mut missing: Vec<&&str> = known_names.difference(&seen_names).collect();
+    if !missing.is_empty() {
+        missing.sort();
         bail!(
-            "[[poses]] entry names image {missing:?}, which is not in this project \
-             (check the file name matches exactly)"
+            "{} [[poses]] entr(y/ies) name images that are not in this project: {missing:?} \
+             (check the file names match exactly, including any directory prefix)",
+            missing.len()
         );
     }
 
@@ -1175,33 +1190,201 @@ fn cmd_export(args: ExportArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_eval(args: EvalArgs) -> Result<()> {
-    let recon = sfm_io::read_colmap_model(&args.ours)?;
+/// Reprojection statistics recomputed from geometry, rather than read back
+/// from whatever a previous bundle adjustment happened to store.
+struct ReprojStats {
+    mean: f64,
+    median: f64,
+    p95: f64,
+    max: f64,
+    num_observations: usize,
+    num_points: usize,
+    num_images: usize,
+    /// Observations whose point falls behind the camera, which a stored
+    /// per-point average silently folds away.
+    num_behind_camera: usize,
+}
+
+/// Recomputes reprojection error from poses, intrinsics and 3D points.
+///
+/// Deliberately not `Reconstruction::mean_reprojection_error`, which averages
+/// the `error` field each point carries from the last bundle adjustment that
+/// touched it. That value is fine as a progress signal inside the pipeline but
+/// is the wrong thing for evaluation: it reports what the optimizer believed,
+/// not what the model on disk actually does, so it cannot catch a model that
+/// was written out inconsistently, and it is not comparable against another
+/// tool's model whose `error` column was produced by different code.
+fn recompute_reprojection(recon: &sfm_core::Reconstruction) -> ReprojStats {
+    let mut errors: Vec<f64> = Vec::new();
+    let mut num_behind_camera = 0usize;
+    for point in recon.points3d.values() {
+        for t in &point.track {
+            let Some(image) = recon.images.get(&t.image_id) else {
+                continue;
+            };
+            let Some(camera) = recon.cameras.get(&image.camera_id) else {
+                continue;
+            };
+            let Some(&(u, v)) = image.keypoints.get(t.point2d_idx as usize) else {
+                continue;
+            };
+            let pc = image.pose.transform_point(&point.xyz);
+            if pc.z <= 1e-9 {
+                num_behind_camera += 1;
+                continue;
+            }
+            let (px, py) = camera.model.project(&pc);
+            errors.push(((px - u as f64).powi(2) + (py - v as f64).powi(2)).sqrt());
+        }
+    }
+    errors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pick = |q: f64| -> f64 {
+        if errors.is_empty() {
+            0.0
+        } else {
+            errors[((errors.len() - 1) as f64 * q).round() as usize]
+        }
+    };
+    ReprojStats {
+        mean: if errors.is_empty() {
+            0.0
+        } else {
+            errors.iter().sum::<f64>() / errors.len() as f64
+        },
+        median: pick(0.5),
+        p95: pick(0.95),
+        max: errors.last().copied().unwrap_or(0.0),
+        num_observations: errors.len(),
+        num_points: recon.points3d.len(),
+        num_images: recon.images.len(),
+        num_behind_camera,
+    }
+}
+
+fn print_reproj(label: &str, s: &ReprojStats) {
     println!(
-        "Loaded {} images / {} points from {}",
-        recon.images.len(),
-        recon.points3d.len(),
-        args.ours.display()
+        "  {label:<10} images {:>4}  points {:>7}  obs {:>8}  mean {:.4}px  median {:.4}px  p95 {:.4}px  max {:.3}px",
+        s.num_images, s.num_points, s.num_observations, s.mean, s.median, s.p95, s.max
     );
-    println!(
-        "mean reprojection error: {:.4}px",
-        recon.mean_reprojection_error()
-    );
-    if let Some(baseline) = &args.baseline {
-        let base = sfm_io::read_colmap_model(baseline)?;
+    if s.num_behind_camera > 0 {
         println!(
-            "baseline ({}) : {} images / {} points, mean reprojection error {:.4}px",
-            baseline.display(),
-            base.images.len(),
-            base.points3d.len(),
-            base.mean_reprojection_error()
-        );
-        eprintln!(
-            "note: pose-accuracy alignment (Umeyama) against the baseline is not implemented yet, see PLAN.md §7"
+            "  {:<10} {} observation(s) fall behind the camera and were excluded",
+            "", s.num_behind_camera
         );
     }
-    if args.gt.is_some() {
-        eprintln!("note: ground-truth comparison is not implemented yet, see PLAN.md §7");
+}
+
+/// Parses `--gt-focal`: a bare number, or a file holding either a bare number
+/// or a 3x3 K matrix whose first entry is fx.
+fn parse_gt_focal(spec: &str) -> Result<f64> {
+    if let Ok(v) = spec.trim().parse::<f64>() {
+        return Ok(v);
+    }
+    let text = std::fs::read_to_string(spec)
+        .with_context(|| format!("--gt-focal: {spec} is neither a number nor a readable file"))?;
+    let first = text
+        .split_whitespace()
+        .next()
+        .context("--gt-focal file is empty")?;
+    first
+        .parse::<f64>()
+        .with_context(|| format!("--gt-focal: could not read a focal length from {spec}"))
+}
+
+fn focal_summary(recon: &sfm_core::Reconstruction) -> Vec<(u32, f64)> {
+    let mut v: Vec<(u32, f64)> = recon
+        .cameras
+        .iter()
+        .map(|(id, c)| {
+            let (fx, fy) = c.model.focal_lengths();
+            (*id, (fx + fy) / 2.0)
+        })
+        .collect();
+    v.sort_by_key(|(id, _)| *id);
+    v
+}
+
+fn cmd_eval(args: EvalArgs) -> Result<()> {
+    let ours_dir = match &args.ours {
+        Some(d) => d.clone(),
+        None => Project::open(&args.project)?.sparse_dir(),
+    };
+    let recon = sfm_io::read_colmap_model(&ours_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to read model from {} (run `sfmtory map` first): {e}",
+            ours_dir.display()
+        )
+    })?;
+
+    println!("Model: {}", ours_dir.display());
+    let ours = recompute_reprojection(&recon);
+    println!("Reprojection error (recomputed from geometry):");
+    print_reproj("ours", &ours);
+
+    let baseline_stats = args
+        .baseline
+        .as_ref()
+        .map(|b| -> Result<_> {
+            let m = sfm_io::read_colmap_model(b)
+                .map_err(|e| anyhow::anyhow!("reading baseline {}: {e}", b.display()))?;
+            let st = recompute_reprojection(&m);
+            print_reproj("baseline", &st);
+            Ok((m, st))
+        })
+        .transpose()?;
+
+    // Focal lengths, and the error against whichever reference was given.
+    println!("Focal lengths:");
+    let ours_focals = focal_summary(&recon);
+    let reference: Option<(String, f64)> = if let Some(spec) = &args.gt_focal {
+        Some((format!("--gt-focal {spec}"), parse_gt_focal(spec)?))
+    } else if let Some(gt_dir) = &args.gt {
+        let m = sfm_io::read_colmap_model(gt_dir)
+            .map_err(|e| anyhow::anyhow!("reading ground truth {}: {e}", gt_dir.display()))?;
+        let f = focal_summary(&m);
+        if f.is_empty() {
+            bail!("ground-truth model {} has no cameras", gt_dir.display());
+        }
+        // A single mean is the honest summary when the reference has several
+        // cameras: matching them up to ours by id would assume an ordering
+        // neither model promises.
+        let mean = f.iter().map(|(_, v)| *v).sum::<f64>() / f.len() as f64;
+        Some((format!("{}", gt_dir.display()), mean))
+    } else {
+        None
+    };
+
+    let mut focal_errors = Vec::new();
+    for (id, f) in &ours_focals {
+        match &reference {
+            Some((_, gt)) => {
+                let err = (f - gt).abs() / gt * 100.0;
+                focal_errors.push(err);
+                println!("  camera {id:<4} f = {f:>10.3} px   error vs reference {err:>6.3}%");
+            }
+            None => println!("  camera {id:<4} f = {f:>10.3} px"),
+        }
+    }
+    if let Some((src, gt)) = &reference {
+        println!("  reference focal {gt:.3} px (from {src})");
+        if focal_errors.len() > 1 {
+            let mean = focal_errors.iter().sum::<f64>() / focal_errors.len() as f64;
+            let worst = focal_errors.iter().cloned().fold(0.0f64, f64::max);
+            println!("  mean focal error {mean:.3}%, worst {worst:.3}%");
+        }
+    }
+    if let Some((base, _)) = &baseline_stats {
+        println!("Baseline focal lengths:");
+        for (id, f) in focal_summary(base) {
+            println!("  camera {id:<4} f = {f:>10.3} px");
+        }
+    }
+
+    if args.baseline.is_some() {
+        eprintln!(
+            "note: pose-accuracy comparison (Umeyama-aligned camera centres) is not implemented; \
+             the numbers above compare reprojection and calibration only"
+        );
     }
     Ok(())
 }
