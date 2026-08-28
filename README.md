@@ -314,6 +314,14 @@ The 49 unregistered views are ones where too few markers decoded to form a
 verified pair; they are genuinely disconnected from the match graph, not
 dropped by the mapper.
 
+**Planar targets** (a printed board, a marker sheet, a grid on a screen) are
+handled: both the essential matrix and linear PnP are mathematically
+degenerate for coplanar points, so the pipeline detects that case and switches
+to homography-based two-view initialization and homography-based PnP (Zhang's
+construction). Without it a planar fiducial dataset does not reconstruct at
+all. Note that *calibrating* from a single plane still needs the board tilted
+substantially between shots — see [Known limitations](#known-limitations).
+
 **Supply your intrinsics if you have them.** Fiducial-only reconstruction
 recovers *poses* well but does not currently refine the shared focal length —
 see [Known limitations](#known-limitations). For calibrated cameras, give it
@@ -402,7 +410,15 @@ natural next step, not yet implemented.
   closed; what's left is per-iteration constant factors — Ceres uses a sparse
   Cholesky where this uses a dense one on the reduced camera system. That's also
   what needs to change to scale past a few hundred images.
-- **Fiducial-only datasets do not refine the shared focal length.** ArUco
+- **Self-calibration from a single planar target is unreliable.** Planar
+  scenes now *reconstruct* (homography-based initialization and PnP), but with
+  all structure on one plane the focal length trades off against the plane's
+  pose, and many focals reproject equally well. On a 13-photo ArUco-on-a-screen
+  dataset the recovered grid comes out neither flat nor square, and sweeping a
+  fixed focal from 500 to 1536 px does not discriminate. Tilt the board
+  substantially between shots (as Zhang's method requires), or supply known
+  intrinsics with `refine = false`.
+- **Fiducial-only datasets refine the shared focal length only weakly.** ArUco
   reconstruction recovers poses and structure well (151/200 views at 0.262px on
   a 200-view test scene), but every marker-corner track ends up with exactly
   two observations, and a two-view track carries no redundancy to constrain a

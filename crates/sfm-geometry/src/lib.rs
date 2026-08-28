@@ -1,5 +1,6 @@
 pub mod essential;
 pub mod fundamental;
+pub mod homography;
 pub mod linalg;
 pub mod pnp;
 pub mod ransac;

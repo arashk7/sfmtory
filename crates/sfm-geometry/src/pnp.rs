@@ -208,6 +208,120 @@ pub fn refine_pose_gauss_newton(
 /// RANSAC-wrapped PnP with an inlier-set LO refit, mirroring
 /// `essential::estimate_two_view_geometry`'s structure. `threshold` is in
 /// normalized-coordinate units (see `essential::to_normalized`).
+/// Fits a plane to `points3d` and returns an orthonormal frame
+/// `(centroid, e1, e2, e3)` with `e3` the normal, plus the plane's relative
+/// thickness (smallest extent over largest). A small thickness means the
+/// points really are coplanar.
+fn plane_frame(points3d: &[Vector3<f64>]) -> Option<(Vector3<f64>, Matrix3<f64>, f64)> {
+    let n = points3d.len();
+    if n < 4 {
+        return None;
+    }
+    let centroid = points3d.iter().sum::<Vector3<f64>>() / n as f64;
+    let mut cov = Matrix3::zeros();
+    for p in points3d {
+        let d = p - centroid;
+        cov += d * d.transpose();
+    }
+    let eig = cov.symmetric_eigen();
+    // Ascending order: the smallest eigenvalue's eigenvector is the normal.
+    let mut idx = [0usize, 1, 2];
+    idx.sort_by(|&a, &b| eig.eigenvalues[a].partial_cmp(&eig.eigenvalues[b]).unwrap());
+    let (i_min, i_mid, i_max) = (idx[0], idx[1], idx[2]);
+    let largest = eig.eigenvalues[i_max];
+    if largest <= 1e-18 {
+        return None;
+    }
+    let thickness = (eig.eigenvalues[i_min] / largest).max(0.0).sqrt();
+    let e1 = eig.eigenvectors.column(i_max).normalize();
+    let e2 = eig.eigenvectors.column(i_mid).normalize();
+    let e3 = e1.cross(&e2).normalize();
+    let basis = Matrix3::from_columns(&[e1, e2, e3]);
+    Some((centroid, basis, thickness))
+}
+
+/// Pose from *coplanar* 3D points, via the plane-to-image homography.
+///
+/// Linear PnP-DLT solves for a full 11-DOF projective camera and is rank
+/// deficient when the 3D points share a plane - which is exactly the case for
+/// the most common calibration setup there is (a printed board, a fiducial
+/// grid, a marker sheet on a screen). The pipeline already refused such
+/// samples rather than returning a wrong pose, which is correct but leaves a
+/// fully planar scene with no usable PnP at all: every image then falls back
+/// to the weaker bootstrap path, and observed on real fiducial photos that
+/// left every track at length two.
+///
+/// For a plane the right model is a homography, and it is exactly
+/// determined: writing points in a 2D frame on the plane, the map to
+/// normalized image coordinates is `H ~ [R e1 | R e2 | R c + t]`, from which
+/// the rotation and translation follow directly. This is the same
+/// construction Zhang's calibration method uses.
+pub fn pnp_planar(points3d: &[Vector3<f64>], points2d_norm: &[(f64, f64)]) -> Option<Pose> {
+    let n = points3d.len();
+    if n < 4 || points2d_norm.len() != n {
+        return None;
+    }
+    let (centroid, basis, _) = plane_frame(points3d)?;
+    let (e1, e2) = (basis.column(0).into_owned(), basis.column(1).into_owned());
+
+    // Plane-local 2D coordinates.
+    let local: Vec<(f64, f64)> = points3d
+        .iter()
+        .map(|p| {
+            let d = p - centroid;
+            (d.dot(&e1), d.dot(&e2))
+        })
+        .collect();
+
+    let h = crate::homography::linear_homography(&local, points2d_norm)?;
+    let (h1, h2, h3) = (
+        h.column(0).into_owned(),
+        h.column(1).into_owned(),
+        h.column(2).into_owned(),
+    );
+    // `H` is known only up to scale; both first columns are unit rotation
+    // columns, so their average norm recovers it.
+    let scale = 2.0 / (h1.norm() + h2.norm());
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    // Sign: the plane must sit in front of the camera.
+    let scale = if (h3 * scale).z < 0.0 { -scale } else { scale };
+
+    let r1 = h1 * scale;
+    let r2 = h2 * scale;
+    let t_local = h3 * scale;
+    let r3 = r1.cross(&r2);
+    // Nearest true rotation to the (noisy, not exactly orthonormal) columns.
+    let approx = Matrix3::from_columns(&[r1, r2, r3]);
+    let svd = approx.svd(true, true);
+    let (u, v_t) = (svd.u?, svd.v_t?);
+    let mut r_plane = u * v_t;
+    if r_plane.determinant() < 0.0 {
+        let mut uu = u;
+        uu.column_mut(2).neg_mut();
+        r_plane = uu * v_t;
+    }
+
+    // `r_plane` maps the plane frame into the camera; compose with the plane
+    // frame's own orientation to get the world-to-camera rotation, then undo
+    // the centroid offset the local coordinates were measured from.
+    let r_world = r_plane * basis.transpose();
+    let t_world = t_local - r_world * centroid;
+    if !r_world.iter().all(|v| v.is_finite()) || !t_world.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let rot = nalgebra::Rotation3::from_matrix_unchecked(r_world);
+    Some(Pose::from_rotation_translation(
+        nalgebra::UnitQuaternion::from_rotation_matrix(&rot),
+        t_world,
+    ))
+}
+
+/// Relative plane thickness below which a point set is treated as coplanar and
+/// solved with `pnp_planar` instead of DLT.
+const PLANAR_THICKNESS: f64 = 0.02;
+
 pub fn pnp_ransac(
     points3d: &[Vector3<f64>],
     points2d_norm: &[(f64, f64)],
@@ -215,7 +329,7 @@ pub fn pnp_ransac(
     max_iterations: usize,
 ) -> Option<(Pose, Vec<bool>)> {
     let n = points3d.len();
-    if n < 6 || points2d_norm.len() != n {
+    if n < 4 || points2d_norm.len() != n {
         return None;
     }
     let params = RansacParams {
@@ -223,6 +337,62 @@ pub fn pnp_ransac(
         threshold,
         confidence: 0.999,
     };
+
+    // Planar scenes get the homography-based solver: DLT is rank deficient
+    // there, and refusing every sample (which is what the conditioning check
+    // below does, correctly) would otherwise leave a planar target with no
+    // PnP at all. Four points suffice for a homography, against DLT's six.
+    let planar = plane_frame(points3d)
+        .map(|(_, _, thickness)| thickness < PLANAR_THICKNESS)
+        .unwrap_or(false);
+    if planar {
+        let (model, inliers) = ransac(
+            n,
+            4,
+            &params,
+            0xFACADE,
+            |sample| {
+                let p3: Vec<_> = sample.iter().map(|&i| points3d[i]).collect();
+                let p2: Vec<_> = sample.iter().map(|&i| points2d_norm[i]).collect();
+                pnp_planar(&p3, &p2)
+            },
+            |pose, i| reprojection_residual(pose, &points3d[i], points2d_norm[i]),
+        )?;
+        let count = inliers.iter().filter(|&&b| b).count();
+        if count < 4 {
+            return None;
+        }
+        // Refit on all inliers, then polish - same shape as the DLT path, and
+        // accepted only if it doesn't lose inliers.
+        let idx: Vec<usize> = (0..n).filter(|&i| inliers[i]).collect();
+        let p3: Vec<Vector3<f64>> = idx.iter().map(|&i| points3d[i]).collect();
+        let p2: Vec<(f64, f64)> = idx.iter().map(|&i| points2d_norm[i]).collect();
+        let (mut pose, mut best) = (model, inliers);
+        if let Some(refined) = pnp_planar(&p3, &p2) {
+            let refit: Vec<bool> = (0..n)
+                .map(|i| reprojection_residual(&refined, &points3d[i], points2d_norm[i]) < threshold)
+                .collect();
+            if refit.iter().filter(|&&b| b).count() >= count {
+                pose = refined;
+                best = refit;
+            }
+        }
+        let idx: Vec<usize> = (0..n).filter(|&i| best[i]).collect();
+        let p3: Vec<Vector3<f64>> = idx.iter().map(|&i| points3d[i]).collect();
+        let p2: Vec<(f64, f64)> = idx.iter().map(|&i| points2d_norm[i]).collect();
+        let polished = refine_pose_gauss_newton(&pose, &p3, &p2, 20);
+        let polished_inliers: Vec<bool> = (0..n)
+            .map(|i| reprojection_residual(&polished, &points3d[i], points2d_norm[i]) < threshold)
+            .collect();
+        if polished_inliers.iter().filter(|&&b| b).count() >= best.iter().filter(|&&b| b).count() {
+            return Some((polished, polished_inliers));
+        }
+        return Some((pose, best));
+    }
+
+    if n < 6 {
+        return None;
+    }
     let (model, inliers) = ransac(
         n,
         6,

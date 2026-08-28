@@ -13,6 +13,7 @@ use nalgebra::{Matrix3, Rotation3, UnitQuaternion, Vector3};
 use sfm_core::{CameraModel, Pose};
 
 use crate::fundamental::{linear_eight_point, sampson_distance};
+use crate::homography::{decompose_homography, estimate_homography_ransac};
 use crate::linalg::enforce_essential_constraint;
 use crate::ransac::{ransac, RansacParams};
 use crate::triangulation::triangulate_normalized;
@@ -108,10 +109,37 @@ pub fn estimate_two_view_geometry(
         _ => (model, inliers),
     };
     let final_idx: Vec<usize> = (0..n).filter(|&i| final_inliers[i]).collect();
+
+    // Planar fallback. A coplanar point set makes the essential matrix
+    // unidentifiable - infinitely many epipolar geometries fit it - so the
+    // eight-point RANSAC above settles on a spurious solution, rejects most of
+    // the genuinely correct correspondences as outliers, and returns a wrong
+    // pose. A homography *is* identifiable on that data, so fit one too and
+    // prefer it when it explains materially more of the correspondences.
+    //
+    // The 1.5x margin (rather than simply "more inliers") keeps the essential
+    // matrix in charge whenever the scene has real depth: on a non-planar
+    // scene a homography can still fit a decent subset by chance, and
+    // switching to it there would throw away the very parallax the
+    // reconstruction needs. COLMAP and ORB-SLAM both arbitrate the same way,
+    // on the same reasoning.
+    let homography = estimate_homography_ransac(&norm1, &norm2, threshold, max_iterations);
+    if let Some((h, h_inliers)) = homography {
+        let h_count = h_inliers.iter().filter(|&&b| b).count();
+        if h_count >= 8 && h_count as f64 > final_idx.len() as f64 * 1.5 {
+            if let Some(pose) = decompose_homography(&h, &norm1, &norm2, &h_inliers) {
+                return Some(TwoViewGeometry {
+                    pose,
+                    num_inliers: h_count,
+                    inliers: h_inliers,
+                });
+            }
+        }
+    }
+
     if final_idx.len() < 8 {
         return None;
     }
-
     let pose = recover_pose(&refined, &norm1, &norm2, &final_idx)?;
     let num_inliers = final_idx.len();
     Some(TwoViewGeometry {

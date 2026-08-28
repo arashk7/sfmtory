@@ -1050,6 +1050,29 @@ fn try_bootstrap_bridge_image(
 /// result (3.7% -> 3.86%).
 const COMPLETION_MAX_REPROJECTION_ERROR_PX: f64 = 0.5;
 
+/// The completion bar to apply to one image's features.
+///
+/// The strict `COMPLETION_MAX_REPROJECTION_ERROR_PX` exists to stop a
+/// *mis-corresponded* observation from being welded onto an existing point,
+/// where the reprojection error is the only available evidence that the match
+/// was wrong. Fiducial corners are matched by exact identity, so that failure
+/// mode does not exist for them: `(capture, marker, corner)` either matches or
+/// it does not, and a wrong point can never be proposed. Holding them to a
+/// bar meant for ambiguous correspondences only rejects *correct* completions,
+/// because a marker corner comes from a quad fit and is inherently coarser
+/// than a subpixel-refined SIFT keypoint - measured on real fiducial photos,
+/// this left every single track at length two and, with no multi-view
+/// redundancy anywhere in the model, no way to observe the shared focal
+/// length. They get the pipeline's ordinary observation bar instead, which
+/// still rejects genuinely bad geometry.
+fn completion_threshold_px(features: &FeatureSet, max_reprojection_error_px: f64) -> f64 {
+    if matches!(features.descriptors, sfm_core::Descriptors::MarkerCorner { .. }) {
+        max_reprojection_error_px
+    } else {
+        COMPLETION_MAX_REPROJECTION_ERROR_PX
+    }
+}
+
 /// Recomputes `points[point_idx]`'s 3D position from its *entire* current
 /// track (every current observation, using each observation's current
 /// pose) - not just the two views that originally triangulated it. Closes
@@ -1118,7 +1141,9 @@ fn retriangulate_point(
         let Some(err) = reprojection_error_normalized(&pose, &xyz, obs) else {
             return;
         };
-        if err * avg_focal > COMPLETION_MAX_REPROJECTION_ERROR_PX {
+        if err * avg_focal
+            > completion_threshold_px(&input.images[img_idx].features, params.max_reprojection_error_px)
+        {
             return;
         }
     }
@@ -1187,7 +1212,12 @@ fn triangulate_and_complete_tracks(
             (Some(point_idx), None) if !bootstrap_registered[b] => {
                 let obs_b = to_normalized(keypoint_px(&input.images[b].features, kb), &cam_b);
                 if let Some(err) = reprojection_error_normalized(&pose_b, &points[point_idx].xyz, obs_b) {
-                    if err * avg_focal_b <= COMPLETION_MAX_REPROJECTION_ERROR_PX {
+                    if err * avg_focal_b
+                        <= completion_threshold_px(
+                            &input.images[b].features,
+                            params.max_reprojection_error_px,
+                        )
+                    {
                         points[point_idx].track.push((b, kb));
                         obs_to_point.insert((b, kb), point_idx);
                         completions.push((b, kb, point_idx));
@@ -1198,7 +1228,12 @@ fn triangulate_and_complete_tracks(
             (None, Some(point_idx)) if !bootstrap_registered[a] => {
                 let obs_a = to_normalized(keypoint_px(&input.images[a].features, ka), &cam_a);
                 if let Some(err) = reprojection_error_normalized(&pose_a, &points[point_idx].xyz, obs_a) {
-                    if err * avg_focal_a <= COMPLETION_MAX_REPROJECTION_ERROR_PX {
+                    if err * avg_focal_a
+                        <= completion_threshold_px(
+                            &input.images[a].features,
+                            params.max_reprojection_error_px,
+                        )
+                    {
                         points[point_idx].track.push((a, ka));
                         obs_to_point.insert((a, ka), point_idx);
                         completions.push((a, ka, point_idx));
