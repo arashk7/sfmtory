@@ -35,6 +35,7 @@ planned as an optional layer on top of this pipeline — see [Roadmap](#roadmap)
 - [Quick start](#quick-start)
 - [Architecture](#architecture)
 - [Status vs. COLMAP and GLOMAP](#status-vs-colmap-and-glomap)
+- [Viewer (`sfmtory gui`)](#viewer-sfmtory-gui)
 - [Estimating intrinsics (`init-cam`)](#estimating-intrinsics-init-cam)
 - [Camera setup](#camera-setup)
 - [Calibrating from ArUco markers](#calibrating-from-aruco-markers)
@@ -241,6 +242,42 @@ There's no `BENCHMARKS.md` write-up yet and `sfmtory eval`'s automated compariso
 logic is still a stub — these numbers were produced by hand against real
 COLMAP/GLOMAP output on one machine, so treat them as real, reproducible data
 points rather than a comprehensive benchmark suite.
+
+## Viewer (`sfmtory gui`)
+
+```bash
+cd my_dataset
+sfmtory gui
+```
+
+A viewer and front-end over the same pipeline the CLI runs — every button
+shells out to the subcommand you would otherwise type, against the same
+project directory, so nothing is reachable here that isn't reachable without
+it.
+
+- **3D view** of the sparse points and camera frusta. Drag to orbit,
+  scroll to zoom, right-drag (or shift-drag) to pan.
+- **Click a camera** to select it; the right panel shows its intrinsics
+  (model, focal, principal point, distortion), its extrinsics (quaternion,
+  translation, camera centre), and the other images sharing that camera.
+- **Show/hide** points and cameras, and adjust point size.
+- **Left panel** browses the current directory; double-click a folder to make
+  it the active project.
+- **Top bar** runs `init-cam`, `feature`, `match`, `map`, `export` and `eval`
+  with the main options exposed as dropdowns. Output streams into a log pane,
+  and the model reloads automatically when a stage finishes.
+
+The 3D view is rendered on the CPU rather than through a GPU pipeline: a
+sparse model is a few tens of thousands of points and a handful of frusta,
+comfortably inside what a straightforward rasteriser handles at interactive
+rates, and it keeps the viewer free of shaders and a second rendering path.
+
+The GUI is behind a default-on cargo feature, so headless builds can drop the
+windowing stack entirely:
+
+```bash
+cargo build --release --no-default-features   # CLI only, no GUI dependencies
+```
 
 ## Estimating intrinsics (`init-cam`)
 
@@ -517,10 +554,6 @@ Full detail, with reasoning for each: [PLAN.md](PLAN.md).
 
 ## Roadmap
 
-- **Optional GUI** — a viewer/front-end on top of the existing CLI pipeline, for
-  inspecting reconstructions (camera poses, sparse point cloud) and driving
-  extract/match/map/export without hand-typing commands. The CLI and on-disk project
-  format remain the primary, scriptable interface either way.
 - Closing the global pipeline's accuracy gap vs. incremental (cross-component
   stitching, retriangulation).
 - A GPU-capable LightGlue matcher (`sfmtory match --detector disk --matcher lightglue --gpu`),

@@ -1,4 +1,6 @@
 mod aruco_tuning;
+#[cfg(feature = "gui")]
+mod gui;
 mod initcam;
 mod dataset;
 mod db;
@@ -21,7 +23,7 @@ use project::Project;
 #[command(
     name = "sfmtory",
     version,
-    about = "Advanced sparse structure-from-motion / camera calibration, no GUI."
+    about = "Advanced sparse structure-from-motion / camera calibration."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -35,6 +37,9 @@ enum Commands {
         #[command(subcommand)]
         action: ProjectAction,
     },
+    /// Open the viewer: 3D scene, camera inspection, and the pipeline stages.
+    #[cfg(feature = "gui")]
+    Gui(GuiArgs),
     /// Stage 0: estimate camera intrinsics before reconstruction.
     #[command(name = "init-cam")]
     InitCam(InitCamArgs),
@@ -79,6 +84,14 @@ enum ProjectAction {
         #[arg(long)]
         images: PathBuf,
     },
+}
+
+#[cfg(feature = "gui")]
+#[derive(clap::Args)]
+struct GuiArgs {
+    /// Project directory to open. Defaults to the current directory.
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
 }
 
 #[derive(clap::Args)]
@@ -260,6 +273,8 @@ fn main() -> Result<()> {
         Commands::Project { action } => match action {
             ProjectAction::New { dir, images } => cmd_project_new(&dir, &images),
         },
+        #[cfg(feature = "gui")]
+        Commands::Gui(args) => gui::launch(args.project),
         Commands::InitCam(args) => cmd_init_cam(args),
         Commands::Feature(args) => cmd_feature(args),
         Commands::Match(args) => cmd_match(args),

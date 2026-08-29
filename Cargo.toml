@@ -36,6 +36,8 @@ ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "t
 ureq = "2"
 dirs = "5"
 sha2 = "0.10"
+eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+egui = "0.31"
 
 [profile.release]
 opt-level = 3

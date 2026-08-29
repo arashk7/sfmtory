@@ -8,7 +8,15 @@ license.workspace = true
 name = "sfmtory"
 path = "src/main.rs"
 
+[features]
+default = ["gui"]
+# The viewer pulls in a windowing/GL stack, which is dead weight for headless
+# use (CI, servers). Building with `--no-default-features` gives the plain CLI.
+gui = ["dep:eframe", "dep:egui"]
+
 [dependencies]
+eframe = { workspace = true, optional = true }
+egui = { workspace = true, optional = true }
 sfm-core = { path = "../sfm-core" }
 sfm-io = { path = "../sfm-io" }
 sfm-features = { path = "../sfm-features" }
