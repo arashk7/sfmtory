@@ -248,6 +248,9 @@ points rather than a comprehensive benchmark suite.
 ```bash
 cd my_dataset
 sfmtory gui
+
+# Or open straight onto one view, which is usually why you opened it at all:
+sfmtory gui --view graph        # scene | image | graph | coverage
 ```
 
 A viewer and front-end over the same pipeline the CLI runs — every button
@@ -256,16 +259,43 @@ project directory, so nothing is reachable here that isn't reachable without
 it.
 
 - **3D view** of the sparse points and camera frusta. Drag to orbit,
-  scroll to zoom, right-drag (or shift-drag) to pan.
-- **Click a camera** to select it; the right panel shows its intrinsics
-  (model, focal, principal point, distortion), its extrinsics (quaternion,
-  translation, camera centre), and the other images sharing that camera.
-- **Show/hide** points and cameras, and adjust point size.
+  scroll to zoom, right-drag (or shift-drag) to pan. Colour points by
+  reprojection error, hide everything above a residual cutoff, click a point
+  to list the images observing it, and click a camera to select it.
+- **Image view** shows the selected photo with its detected keypoints, which
+  of them triangulated, and each residual as a vector at adjustable
+  exaggeration — the quickest way to separate "detection is fine, matching
+  isn't" from the reverse.
+- **Match graph** draws images as nodes and verified pairs as edges, colours
+  connected components, and marks unregistered images hollow. An incremental
+  reconstruction grows from one seed and cannot cross a component boundary,
+  so a split graph explains unregistered images that nothing in the logs does.
+- **Coverage** plots where a planar calibration target has been seen from —
+  tilt band against tilt direction — leaving the orientations you still need
+  to shoot visibly empty.
+- **Right panel** carries the properties of whatever is selected plus three
+  diagnostic sections:
+  - *Calibration quality* — per camera, whether self-calibration refined the
+    focal, rejected its own result, never considered the camera eligible, or
+    was pinned by `sfm.toml`; plus the track-length histogram and per-image
+    observation counts that explain the verdict.
+  - *Viewing-angle diversity* — for a planar target, the best-fit plane and
+    the spread of the axis it is tilted about. Rotating a board about one
+    fixed axis is degenerate for single-plane self-calibration however wide
+    the tilt range, and this is where that shows up.
+  - *Reprojection & outliers* — mean/median/p95/max, and the worst
+    observations as a clickable list. A mean hides whether a model is
+    uniformly decent or mostly excellent with a few broken points, so the
+    panel says which.
 - **Left panel** browses the current directory; double-click a folder to make
   it the active project.
 - **Top bar** runs `init-cam`, `feature`, `match`, `map`, `export` and `eval`
   with the main options exposed as dropdowns. Output streams into a log pane,
   and the model reloads automatically when a stage finishes.
+
+Residuals shown here are recomputed from the model's own poses and intrinsics,
+not read from the stored per-point error — the same reason `sfmtory eval`
+recomputes them.
 
 The 3D view is rendered on the CPU rather than through a GPU pipeline: a
 sparse model is a few tens of thousands of points and a handful of frusta,

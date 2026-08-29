@@ -36,6 +36,15 @@ use sfm_geometry::{
     triangulate_normalized, triangulation_angle,
 };
 
+/// Minimum images sharing one camera before its intrinsics may be refined at
+/// all. Self-calibration needs real diversity in camera motion; below this,
+/// a flexible model can lower reprojection error by fitting an unphysical
+/// coefficient that "explains away" a wrong focal length rather than
+/// correcting it (see `run_bundle_adjustment`). Public so a diagnostic
+/// front-end can report *why* a camera was never refined without duplicating
+/// - and drifting from - the pipeline's own threshold.
+pub const MIN_IMAGES_PER_CAMERA_FOR_INTRINSICS: usize = 5;
+
 pub struct ImageInput {
     pub image_id: u32,
     pub camera_id: u32,
@@ -1652,7 +1661,10 @@ fn run_bundle_adjustment(
             per_cam
                 .iter()
                 .enumerate()
-                .map(|(idx, &n)| n < 5 || input.fixed_cameras.contains(&camera_id_list[idx]))
+                .map(|(idx, &n)| {
+                    n < MIN_IMAGES_PER_CAMERA_FOR_INTRINSICS
+                        || input.fixed_cameras.contains(&camera_id_list[idx])
+                })
                 .collect()
         };
         let out = run_ba(free_fixed_cameras);
@@ -1683,7 +1695,6 @@ fn run_bundle_adjustment(
     // (its whole point is to look like a better fit). Require a minimum
     // number of genuinely different views per camera before trusting it with
     // any intrinsics refinement at all, on top of the error comparison.
-    const MIN_IMAGES_PER_CAMERA_FOR_INTRINSICS: usize = 5;
     let mut images_per_camera = vec![0usize; camera_list.len()];
     for &c in &camera_of_image {
         images_per_camera[c] += 1;

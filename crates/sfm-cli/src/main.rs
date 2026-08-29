@@ -1,9 +1,16 @@
 mod aruco_tuning;
+mod dataset;
+mod db;
+// Kept out of `gui` and compiled unconditionally: it is plain geometry over a
+// reconstruction, so it stays testable (and reusable by the CLI) in a headless
+// `--no-default-features` build that has no windowing stack at all. Its only
+// caller today is the viewer, hence the allow - the unit tests still run and
+// still guard the maths in both builds.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+mod diagnostics;
 #[cfg(feature = "gui")]
 mod gui;
 mod initcam;
-mod dataset;
-mod db;
 mod project;
 
 use std::collections::HashMap;
@@ -92,6 +99,24 @@ struct GuiArgs {
     /// Project directory to open. Defaults to the current directory.
     #[arg(long, default_value = ".")]
     project: PathBuf,
+    /// Which view to open on. Handy for going straight to the diagnostic that
+    /// prompted opening the viewer at all - typically the match graph, after a
+    /// run left images unregistered.
+    #[arg(long, value_enum, default_value_t = GuiViewArg::Scene)]
+    view: GuiViewArg,
+}
+
+#[cfg(feature = "gui")]
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum GuiViewArg {
+    /// The 3D point cloud and camera frusta.
+    Scene,
+    /// The selected image with its features and residuals drawn on it.
+    Image,
+    /// Images as nodes, verified pairs as edges, components coloured.
+    Graph,
+    /// Board-orientation coverage for a planar capture.
+    Coverage,
 }
 
 #[derive(clap::Args)]
@@ -274,7 +299,7 @@ fn main() -> Result<()> {
             ProjectAction::New { dir, images } => cmd_project_new(&dir, &images),
         },
         #[cfg(feature = "gui")]
-        Commands::Gui(args) => gui::launch(args.project),
+        Commands::Gui(args) => gui::launch(args.project, args.view.into()),
         Commands::InitCam(args) => cmd_init_cam(args),
         Commands::Feature(args) => cmd_feature(args),
         Commands::Match(args) => cmd_match(args),
