@@ -1861,6 +1861,7 @@ dependencies = [
  "bincode",
  "clap",
  "image",
+ "imageproc",
  "nalgebra 0.33.3",
  "rayon",
  "rusqlite",

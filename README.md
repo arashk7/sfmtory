@@ -35,6 +35,7 @@ planned as an optional layer on top of this pipeline — see [Roadmap](#roadmap)
 - [Quick start](#quick-start)
 - [Architecture](#architecture)
 - [Status vs. COLMAP and GLOMAP](#status-vs-colmap-and-glomap)
+- [Estimating intrinsics (`init-cam`)](#estimating-intrinsics-init-cam)
 - [Camera setup](#camera-setup)
 - [Calibrating from ArUco markers](#calibrating-from-aruco-markers)
 - [Evaluating a reconstruction](#evaluating-a-reconstruction)
@@ -240,6 +241,65 @@ There's no `BENCHMARKS.md` write-up yet and `sfmtory eval`'s automated compariso
 logic is still a stub — these numbers were produced by hand against real
 COLMAP/GLOMAP output on one machine, so treat them as real, reproducible data
 points rather than a comprehensive benchmark suite.
+
+## Estimating intrinsics (`init-cam`)
+
+Every later stage starts from *some* focal length. Without help that is
+`1.2 x max(width, height)` — a ~53° field-of-view rule of thumb that is wrong
+for most cameras. Bundle adjustment can refine it, but only when the scene
+gives it enough multi-view redundancy; when it doesn't, that guess *is* the
+answer you get.
+
+```bash
+sfmtory init-cam            # report estimates
+sfmtory init-cam --apply    # ...and write the winner into sfm.toml
+```
+
+It runs several independent estimators and keeps the best-supported one:
+
+| Estimator | Works when | Confidence |
+|---|---|---|
+| `exif` | the file kept its camera metadata | High |
+| `marker-squares` | fiducial markers are **large in frame** | High/Medium |
+| `vanishing-points` | scene has strong perpendicular structure | Medium/Low |
+| `fov-heuristic` | always (the fallback) | Heuristic |
+
+Two design rules matter more than any individual method:
+
+- **Abstaining is a valid result.** A confidently wrong focal is worse than an
+  obvious heuristic, because it looks like an answer. Each estimator returns
+  nothing rather than a number it can't support.
+- **Independent agreement is evidence.** When two estimators sharing no
+  assumptions land on the same focal, that is reported as corroboration.
+
+Real example (`sceaux_castle`, true focal 2905.88 px):
+
+```text
+  -> exif              f =   2753.33 px  [High]
+       11/11 image(s) carried a 35mm-equivalent focal length; KODAK Z612 @ 35mm
+     fov-heuristic     f =   3398.40 px  [Heuristic]
+       1.2 x longest image side (~53 degree horizontal field of view)
+```
+
+EXIF lands 5.3% from truth against the heuristic's 16.9%, and applying it
+improves the reconstruction: **7696 → 7979 points and 0.409 → 0.378px**. Note
+the self-calibrated focal ended slightly further out (2.18% → 2.89%) — on that
+dataset the focal is weakly constrained regardless of where it starts, so
+treat the structure improvement as the win, not the calibration.
+
+`marker-squares` deserves a note, because it needs no user input: **every ArUco
+marker is a square**, which is known target geometry, so each detection is a
+Zhang calibration constraint. Physical marker size is *not* needed — size only
+fixes overall scale. The catch is that a marker small in the image is nearly
+affine under projection, its perspective terms fall to the level of corner
+noise, and the constraint carries no signal; the estimator detects this (via
+the marker's own vanishing points) and abstains. On a 13-photo set where
+markers covered ~5% of frame width, all 169 detections were in that regime. It
+needs a board that fills a good part of the frame — which is what a deliberate
+calibration capture looks like anyway.
+
+Output lands in `cache/init-cam/` as `intrinsics.json` (all estimates with
+reasoning) and `cameras.toml` (a ready-to-paste `[[cameras]]` block).
 
 ## Camera setup
 

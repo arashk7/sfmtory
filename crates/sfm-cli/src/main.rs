@@ -1,4 +1,5 @@
 mod aruco_tuning;
+mod initcam;
 mod dataset;
 mod db;
 mod project;
@@ -34,6 +35,9 @@ enum Commands {
         #[command(subcommand)]
         action: ProjectAction,
     },
+    /// Stage 0: estimate camera intrinsics before reconstruction.
+    #[command(name = "init-cam")]
+    InitCam(InitCamArgs),
     /// Stage 1: detect keypoints/descriptors for every image into the project cache.
     #[command(alias = "extract")]
     Feature(FeatureArgs),
@@ -75,6 +79,22 @@ enum ProjectAction {
         #[arg(long)]
         images: PathBuf,
     },
+}
+
+#[derive(clap::Args)]
+struct InitCamArgs {
+    /// Project directory. Defaults to the current directory.
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+    /// How many images to sample. Intrinsics are a property of the camera, not
+    /// of any one frame, so a spread across the dataset is as informative as
+    /// all of it and far cheaper.
+    #[arg(long, default_value_t = 12)]
+    samples: u32,
+    /// Also write the chosen camera into the project's `sfm.toml`, so later
+    /// stages pick it up with no further action.
+    #[arg(long)]
+    apply: bool,
 }
 
 #[derive(clap::Args)]
@@ -240,6 +260,7 @@ fn main() -> Result<()> {
         Commands::Project { action } => match action {
             ProjectAction::New { dir, images } => cmd_project_new(&dir, &images),
         },
+        Commands::InitCam(args) => cmd_init_cam(args),
         Commands::Feature(args) => cmd_feature(args),
         Commands::Match(args) => cmd_match(args),
         Commands::Map(args) => cmd_map(args),
@@ -281,6 +302,122 @@ fn default_camera_model(name: &str, w: u32, h: u32) -> Option<CameraModel> {
         _ => return None,
     };
     CameraModel::from_name_and_params(name, &params)
+}
+
+fn cmd_init_cam(args: InitCamArgs) -> Result<()> {
+    let started = Instant::now();
+    let project = Project::open(&args.project)?;
+    let stage_dir = project.prepare_stage("init-cam")?;
+
+    let (discovered, _layout) = dataset::discover(&project.config.images_dir)?;
+    let stride = (discovered.len() / (args.samples as usize).max(1)).max(1);
+    let picked: Vec<&dataset::DiscoveredImage> = discovered
+        .iter()
+        .step_by(stride)
+        .take(args.samples as usize)
+        .collect();
+    println!(
+        "Estimating intrinsics from {} of {} images in {}",
+        picked.len(),
+        discovered.len(),
+        project.config.images_dir.display()
+    );
+
+    let mut samples = Vec::new();
+    for d in &picked {
+        let bytes = std::fs::read(&d.path)
+            .with_context(|| format!("reading {}", d.path.display()))?;
+        let img = image::open(&d.path)
+            .with_context(|| format!("decoding {}", d.path.display()))?;
+        let (w, h) = (img.width(), img.height());
+        samples.push((bytes, img.to_luma8(), w, h));
+    }
+
+    // Reuse fiducial detections if `sfmtory feature --detector aruco` has
+    // already run - that is where the strongest estimator's input comes from.
+    let db_path = project.database_path();
+    let mut owned: Vec<(sfm_core::FeatureSet, u32, u32)> = Vec::new();
+    if db_path.exists() {
+        if let Ok(db) = Database::open(&db_path) {
+            if let Ok(images) = db.list_images() {
+                for (id, _cam, _name, w, h) in images {
+                    if let Ok(fs) = db.load_features(id) {
+                        if matches!(fs.descriptors, sfm_core::Descriptors::MarkerCorner { .. }) {
+                            owned.push((fs, w, h));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let features: Vec<(&sfm_core::FeatureSet, u32, u32)> =
+        owned.iter().map(|(f, w, h)| (f, *w, *h)).collect();
+    if !features.is_empty() {
+        println!("Using fiducial detections from {} image(s)", features.len());
+    }
+
+    let result = initcam::run_cascade(&samples, &features)?;
+
+    println!("\nEstimates (best first):");
+    for e in &result.estimates {
+        let mark = if e.method == result.method { "->" } else { "  " };
+        println!(
+            "  {mark} {:<17} f = {:>9.2} px  [{:?}]\n       {}",
+            e.method, e.focal_px, e.confidence, e.detail
+        );
+    }
+    if let Some(a) = &result.agreement {
+        println!("\n  corroboration: {a}");
+    }
+    println!(
+        "\nSelected: f = {:.2} px via `{}` (confidence {:?})",
+        result.focal_px, result.method, result.confidence
+    );
+    if result.confidence <= initcam::Confidence::Low {
+        println!(
+            "  NOTE: this is a weak estimate. Supply known intrinsics if you have them - see\n\
+             \x20       `sfmtory init-cam --help` and the Camera setup section of the README."
+        );
+    }
+
+    initcam::write_result(&stage_dir, &result)?;
+    println!("\nWrote {} and cameras.toml", stage_dir.join("intrinsics.json").display());
+
+    if args.apply {
+        let cfg_path = Project::config_path(&project.root);
+        let existing = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+        if existing.contains("[[cameras]]") {
+            bail!(
+                "{} already declares [[cameras]]; not overwriting. Merge \n{}\nby hand instead.",
+                cfg_path.display(),
+                stage_dir.join("cameras.toml").display()
+            );
+        }
+        let images_line = if existing.trim().is_empty() {
+            format!("images_dir = {:?}\n\n", project.config.images_dir)
+        } else {
+            String::new()
+        };
+        std::fs::write(
+            &cfg_path,
+            format!("{existing}{images_line}\n{}", result.as_camera_toml()),
+        )?;
+        println!("Applied to {}", cfg_path.display());
+    } else {
+        println!("Re-run with --apply to write this camera into sfm.toml.");
+    }
+
+    let payload = serde_json::json!({
+        "stage": "init-cam",
+        "status": "ok",
+        "focal_px": result.focal_px,
+        "method": result.method,
+        "confidence": format!("{:?}", result.confidence),
+        "num_sampled": picked.len(),
+        "elapsed_ms": started.elapsed().as_millis(),
+    });
+    project.record_log("init-cam", &payload)?;
+    Ok(())
 }
 
 fn cmd_feature(args: FeatureArgs) -> Result<()> {
