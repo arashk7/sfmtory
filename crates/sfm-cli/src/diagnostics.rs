@@ -82,7 +82,10 @@ impl FocalVerdict {
                 "focal NOT refined - self-calibration ran and its result was rejected".into()
             }
             FocalVerdict::Refined { relative_change } => {
-                format!("focal refined ({:+.2}% from the initial guess)", relative_change * 100.0)
+                format!(
+                    "focal refined ({:+.2}% from the initial guess)",
+                    relative_change * 100.0
+                )
             }
             FocalVerdict::Unknown => "focal unknown - no initial guess to compare against".into(),
         }
@@ -401,11 +404,17 @@ fn camera_diags(
 ) -> Vec<CameraDiag> {
     let mut per_camera_images: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     for im in recon.images.values() {
-        per_camera_images.entry(im.camera_id).or_default().push(im.id);
+        per_camera_images
+            .entry(im.camera_id)
+            .or_default()
+            .push(im.id);
     }
     // Which camera each image belongs to, so a point's track can be attributed.
-    let camera_of_image: BTreeMap<u32, u32> =
-        recon.images.values().map(|im| (im.id, im.camera_id)).collect();
+    let camera_of_image: BTreeMap<u32, u32> = recon
+        .images
+        .values()
+        .map(|im| (im.id, im.camera_id))
+        .collect();
     let mut max_track: BTreeMap<u32, usize> = BTreeMap::new();
     for p in recon.points3d.values() {
         for t in &p.track {
@@ -526,7 +535,12 @@ pub fn fit_plane(recon: &Reconstruction) -> Option<PlaneDiag> {
     for im in recon.images.values() {
         // Optical axis in world coordinates: the camera looks along +z in its
         // own frame, and `pose.rotation` is world-to-camera.
-        let r_cw = im.pose.rotation.to_rotation_matrix().into_inner().transpose();
+        let r_cw = im
+            .pose
+            .rotation
+            .to_rotation_matrix()
+            .into_inner()
+            .transpose();
         let dir = r_cw * Vector3::new(0.0, 0.0, 1.0);
         let cos = (dir.dot(&normal)).clamp(-1.0, 1.0).abs();
         let tilt_deg = cos.acos().to_degrees();
@@ -616,8 +630,12 @@ pub fn axis_spread_deg(views: &[ViewAngle]) -> f64 {
         sn += (2.0 * a).sin();
     }
     let n = tilted.len() as f64;
-    let r = ((cs / n).powi(2) + (sn / n).powi(2)).sqrt().clamp(1e-12, 1.0);
-    ((-2.0 * r.ln()).sqrt() * 0.5).to_degrees().min(MAX_SPREAD_DEG)
+    let r = ((cs / n).powi(2) + (sn / n).powi(2))
+        .sqrt()
+        .clamp(1e-12, 1.0);
+    ((-2.0 * r.ln()).sqrt() * 0.5)
+        .to_degrees()
+        .min(MAX_SPREAD_DEG)
 }
 
 /// Counts of meaningfully-tilted views per 45-degree azimuth sector. Also the
@@ -687,9 +705,8 @@ mod tests {
         // this world-to-camera.
         let down = -right.cross(&fwd);
         let r_wc = Matrix3::from_rows(&[right.transpose(), down.transpose(), fwd.transpose()]);
-        let rot = UnitQuaternion::from_rotation_matrix(&nalgebra::Rotation3::from_matrix_unchecked(
-            r_wc,
-        ));
+        let rot =
+            UnitQuaternion::from_rotation_matrix(&nalgebra::Rotation3::from_matrix_unchecked(r_wc));
         Image {
             id,
             camera_id: 1,

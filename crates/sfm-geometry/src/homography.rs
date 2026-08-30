@@ -284,7 +284,10 @@ mod tests {
         }
         let (h, inl) = estimate_homography_ransac(&p1, &p2, 1e-3, 2000).unwrap();
         let n_in = inl.iter().filter(|&&b| b).count();
-        assert!(n_in >= 36, "expected the 36 planar points as inliers, got {n_in}");
+        assert!(
+            n_in >= 36,
+            "expected the 36 planar points as inliers, got {n_in}"
+        );
         assert!(homography_transfer_error(&h, p1[0], p2[0]) < 1e-3);
     }
 
@@ -296,10 +299,17 @@ mod tests {
         let pose = decompose_homography(&h, &p1, &p2, &inliers).unwrap();
 
         // Rotation should match closely.
-        let dr = pose.rotation.rotation_to(&truth.rotation).angle().to_degrees();
+        let dr = pose
+            .rotation
+            .rotation_to(&truth.rotation)
+            .angle()
+            .to_degrees();
         assert!(dr < 1.0, "rotation off by {dr} deg");
         // Translation is only up to scale, so compare directions.
-        let dot = pose.translation.normalize().dot(&truth.translation.normalize());
+        let dot = pose
+            .translation
+            .normalize()
+            .dot(&truth.translation.normalize());
         assert!(dot > 0.99, "translation direction off, cos = {dot}");
     }
 }

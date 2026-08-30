@@ -58,7 +58,11 @@ impl RunState {
         if let Ok(mut s) = self.last_stage.lock() {
             *s = args.first().cloned().unwrap_or_default();
         }
-        self.push(format!("$ sfmtory {} --project {}", args.join(" "), project.display()));
+        self.push(format!(
+            "$ sfmtory {} --project {}",
+            args.join(" "),
+            project.display()
+        ));
 
         let log = self.log.clone();
         let running = self.running.clone();

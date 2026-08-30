@@ -187,7 +187,7 @@ mod tests {
         tiff.extend_from_slice(b"II");
         tiff.extend_from_slice(&42u16.to_le_bytes());
         tiff.extend_from_slice(&8u32.to_le_bytes()); // IFD0 at offset 8
-        // IFD0: one entry (ExifIFDPointer), next-IFD = 0
+                                                     // IFD0: one entry (ExifIFDPointer), next-IFD = 0
         tiff.extend_from_slice(&1u16.to_le_bytes());
         tiff.extend_from_slice(&0x8769u16.to_le_bytes());
         tiff.extend_from_slice(&4u16.to_le_bytes()); // LONG

@@ -197,24 +197,24 @@ pub fn run_cascade(
         devs.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let spread = devs[devs.len() / 2] / median;
         if spread <= VP_MAX_SPREAD {
-        estimates.push(Estimate {
-            method: "vanishing-points".into(),
-            focal_px: median,
-            // Agreement *across images* is what makes this trustworthy: one
-            // image's orthogonality assumption can be wrong, several images
-            // being wrong the same way is far less likely.
-            confidence: if vp_focals.len() >= 4 && spread < 0.15 {
-                Confidence::Medium
-            } else {
-                Confidence::Low
-            },
-            detail: format!(
+            estimates.push(Estimate {
+                method: "vanishing-points".into(),
+                focal_px: median,
+                // Agreement *across images* is what makes this trustworthy: one
+                // image's orthogonality assumption can be wrong, several images
+                // being wrong the same way is far less likely.
+                confidence: if vp_focals.len() >= 4 && spread < 0.15 {
+                    Confidence::Medium
+                } else {
+                    Confidence::Low
+                },
+                detail: format!(
                 "{} image(s) yielded orthogonal vanishing-point pairs ({vp_pairs} pairs total), \
                  spread {:.1}%",
                 vp_focals.len(),
                 spread * 100.0
             ),
-        });
+            });
         }
     }
 

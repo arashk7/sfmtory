@@ -1,10 +1,12 @@
 name: CI
 
 on:
+  # Every branch, not just main: the work happens on version branches
+  # (0.4.0, 0.5.0, ...), and CI that only runs on main first reports a
+  # problem at merge time, long after it was introduced.
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -29,6 +31,12 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev \
+            libxcursor-dev libxrandr-dev libxi-dev libx11-dev
       # Not -D warnings yet: the workspace has a backlog of pre-existing lint
       # warnings (tracked in PLAN.md) that haven't been triaged. This still
       # surfaces new/existing warnings in the log without blocking merges.
@@ -41,5 +49,29 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The `gui` feature is on by default, so an ordinary workspace build
+      # links a windowing stack and needs its headers present. Without these
+      # the build fails on the runner while succeeding on any desktop that
+      # already has them - which is exactly the kind of failure that looks
+      # like "CI is broken" rather than "a dependency is missing".
+      - name: Install GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev \
+            libxcursor-dev libxrandr-dev libxi-dev libx11-dev
       - run: cargo build --workspace --verbose
       - run: cargo test --workspace --verbose
+
+  headless:
+    name: headless (no GUI feature)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Deliberately installs nothing. The point of `--no-default-features` is
+      # that the CLI builds with no windowing stack at all, and the only way to
+      # keep that true is to build it somewhere that has none.
+      - run: cargo build --workspace --no-default-features --verbose
+      - run: cargo test --workspace --no-default-features --verbose

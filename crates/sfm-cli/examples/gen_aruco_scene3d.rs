@@ -31,12 +31,36 @@ fn main() {
     // outward normal. Markers are laid out in a grid on each face.
     let half = 1.0f64;
     let faces: [(Vector3<f64>, Vector3<f64>, Vector3<f64>); 6] = [
-        (Vector3::new(-half, -half, half), Vector3::new(1.0, 0.0, 0.0), Vector3::new(0.0, 1.0, 0.0)), // +z
-        (Vector3::new(half, -half, -half), Vector3::new(-1.0, 0.0, 0.0), Vector3::new(0.0, 1.0, 0.0)), // -z
-        (Vector3::new(half, -half, half), Vector3::new(0.0, 0.0, -1.0), Vector3::new(0.0, 1.0, 0.0)), // +x
-        (Vector3::new(-half, -half, -half), Vector3::new(0.0, 0.0, 1.0), Vector3::new(0.0, 1.0, 0.0)), // -x
-        (Vector3::new(-half, half, half), Vector3::new(1.0, 0.0, 0.0), Vector3::new(0.0, 0.0, -1.0)), // +y
-        (Vector3::new(-half, -half, -half), Vector3::new(1.0, 0.0, 0.0), Vector3::new(0.0, 0.0, 1.0)), // -y
+        (
+            Vector3::new(-half, -half, half),
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+        ), // +z
+        (
+            Vector3::new(half, -half, -half),
+            Vector3::new(-1.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+        ), // -z
+        (
+            Vector3::new(half, -half, half),
+            Vector3::new(0.0, 0.0, -1.0),
+            Vector3::new(0.0, 1.0, 0.0),
+        ), // +x
+        (
+            Vector3::new(-half, -half, -half),
+            Vector3::new(0.0, 0.0, 1.0),
+            Vector3::new(0.0, 1.0, 0.0),
+        ), // -x
+        (
+            Vector3::new(-half, half, half),
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, -1.0),
+        ), // +y
+        (
+            Vector3::new(-half, -half, -half),
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        ), // -y
     ];
 
     // (marker_id, 4 corners in 3D, outward normal). Corner order matches the
@@ -95,7 +119,11 @@ fn main() {
         );
         // Look-at the origin; world-to-camera rotation rows are the camera axes.
         let fwd = (-eye).normalize();
-        let world_up = if fwd.y.abs() > 0.95 { Vector3::new(1.0, 0.0, 0.0) } else { Vector3::new(0.0, 1.0, 0.0) };
+        let world_up = if fwd.y.abs() > 0.95 {
+            Vector3::new(1.0, 0.0, 0.0)
+        } else {
+            Vector3::new(0.0, 1.0, 0.0)
+        };
         let right = fwd.cross(&world_up).normalize();
         let up = right.cross(&fwd);
         let r = Matrix3::from_rows(&[right.transpose(), (-up).transpose(), fwd.transpose()]);
@@ -124,7 +152,10 @@ fn main() {
             }
             // Require the whole marker on-screen with a margin, so partial
             // markers never become half-detections.
-            if uv.iter().any(|p| p[0] < 4.0 || p[1] < 4.0 || p[0] > w as f64 - 5.0 || p[1] > h as f64 - 5.0) {
+            if uv
+                .iter()
+                .any(|p| p[0] < 4.0 || p[1] < 4.0 || p[0] > w as f64 - 5.0 || p[1] > h as f64 - 5.0)
+            {
                 continue;
             }
             // Too small to decode reliably - skip rather than emit noise.
@@ -183,10 +214,22 @@ fn polygon_area(uv: &[[f64; 2]; 4]) -> f64 {
 }
 
 fn bounds(uv: &[[f64; 2]; 4], w: u32, h: u32) -> (u32, u32, u32, u32) {
-    let minx = uv.iter().map(|p| p[0]).fold(f64::MAX, f64::min).floor().max(0.0) as u32;
-    let maxx = (uv.iter().map(|p| p[0]).fold(f64::MIN, f64::max).ceil() as i64).clamp(0, w as i64 - 1) as u32;
-    let miny = uv.iter().map(|p| p[1]).fold(f64::MAX, f64::min).floor().max(0.0) as u32;
-    let maxy = (uv.iter().map(|p| p[1]).fold(f64::MIN, f64::max).ceil() as i64).clamp(0, h as i64 - 1) as u32;
+    let minx = uv
+        .iter()
+        .map(|p| p[0])
+        .fold(f64::MAX, f64::min)
+        .floor()
+        .max(0.0) as u32;
+    let maxx = (uv.iter().map(|p| p[0]).fold(f64::MIN, f64::max).ceil() as i64)
+        .clamp(0, w as i64 - 1) as u32;
+    let miny = uv
+        .iter()
+        .map(|p| p[1])
+        .fold(f64::MAX, f64::min)
+        .floor()
+        .max(0.0) as u32;
+    let maxy = (uv.iter().map(|p| p[1]).fold(f64::MIN, f64::max).ceil() as i64)
+        .clamp(0, h as i64 - 1) as u32;
     (minx, maxx, miny, maxy)
 }
 
@@ -199,11 +242,17 @@ fn homography_unit_square_to(uv: &[[f64; 2]; 4]) -> Matrix3<f64> {
     for i in 0..4 {
         let (x, y) = (src[i][0], src[i][1]);
         let (u, v) = (uv[i][0], uv[i][1]);
-        a[(2 * i, 0)] = x; a[(2 * i, 1)] = y; a[(2 * i, 2)] = 1.0;
-        a[(2 * i, 6)] = -x * u; a[(2 * i, 7)] = -y * u;
+        a[(2 * i, 0)] = x;
+        a[(2 * i, 1)] = y;
+        a[(2 * i, 2)] = 1.0;
+        a[(2 * i, 6)] = -x * u;
+        a[(2 * i, 7)] = -y * u;
         b[2 * i] = u;
-        a[(2 * i + 1, 3)] = x; a[(2 * i + 1, 4)] = y; a[(2 * i + 1, 5)] = 1.0;
-        a[(2 * i + 1, 6)] = -x * v; a[(2 * i + 1, 7)] = -y * v;
+        a[(2 * i + 1, 3)] = x;
+        a[(2 * i + 1, 4)] = y;
+        a[(2 * i + 1, 5)] = 1.0;
+        a[(2 * i + 1, 6)] = -x * v;
+        a[(2 * i + 1, 7)] = -y * v;
         b[2 * i + 1] = v;
     }
     let s = a.lu().solve(&b).unwrap();

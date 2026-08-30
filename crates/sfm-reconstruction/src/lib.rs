@@ -308,7 +308,8 @@ pub fn run_incremental(input: &ReconstructionInput, params: &IncrementalParams) 
             anchor,
             seed.map(|p| p.j).unwrap_or(anchor),
             &seed.map(|p| p.geometry.pose).unwrap_or_else(Pose::identity),
-            seed.map(|p| p.geometry.inlier_matches.as_slice()).unwrap_or(&[]),
+            seed.map(|p| p.geometry.inlier_matches.as_slice())
+                .unwrap_or(&[]),
         );
         return finish_growth(input, params, result);
     }
@@ -400,7 +401,11 @@ fn finish_growth(
         &registered,
         &mut poses,
         &mut points,
-        if params.refine_intrinsics { IntrinsicsMode::FreeGuarded } else { IntrinsicsMode::Fixed },
+        if params.refine_intrinsics {
+            IntrinsicsMode::FreeGuarded
+        } else {
+            IntrinsicsMode::Fixed
+        },
         BaScope::Global,
     );
 
@@ -497,7 +502,7 @@ fn grow_from_seed(
                     &poses,
                     &mut points,
                     &mut obs_to_point,
-                        );
+                );
             }
         }
     } else {
@@ -616,7 +621,7 @@ fn grow_from_seed(
                     &mut poses,
                     &mut points,
                     &mut obs_to_point,
-                            &bootstrap_registered,
+                    &bootstrap_registered,
                 ) {
                     registered[u] = true;
                     failed_at_count[u] = None;
@@ -703,7 +708,18 @@ fn grow_from_seed(
             let Some(matches) = oriented_matches(pair, u) else {
                 continue;
             };
-            triangulate_and_complete_tracks(input, &cameras, params, u, r, &matches, &poses, &mut points, &mut obs_to_point, &bootstrap_registered);
+            triangulate_and_complete_tracks(
+                input,
+                &cameras,
+                params,
+                u,
+                r,
+                &matches,
+                &poses,
+                &mut points,
+                &mut obs_to_point,
+                &bootstrap_registered,
+            );
         }
 
         // COLMAP's two-tier bundle-adjustment schedule (`IncrementalMapper`):
@@ -1011,7 +1027,15 @@ fn try_bootstrap_bridge_image(
         poses[u] = Some(pose);
         let before = points.len();
         let (gained, completions) = triangulate_and_complete_tracks(
-            input, cameras, params, u, r, &matches, poses, points, obs_to_point,
+            input,
+            cameras,
+            params,
+            u,
+            r,
+            &matches,
+            poses,
+            points,
+            obs_to_point,
             &bootstrap_registered_with_u,
         );
 
@@ -1019,7 +1043,9 @@ fn try_bootstrap_bridge_image(
             return true;
         }
         for (img, kp, point_idx) in completions {
-            points[point_idx].track.retain(|&(i, k)| !(i == img && k == kp));
+            points[point_idx]
+                .track
+                .retain(|&(i, k)| !(i == img && k == kp));
             obs_to_point.remove(&(img, kp));
             // The completion's own position update (if any) was computed
             // including the observation just removed above - recompute
@@ -1075,7 +1101,10 @@ const COMPLETION_MAX_REPROJECTION_ERROR_PX: f64 = 0.5;
 /// length. They get the pipeline's ordinary observation bar instead, which
 /// still rejects genuinely bad geometry.
 fn completion_threshold_px(features: &FeatureSet, max_reprojection_error_px: f64) -> f64 {
-    if matches!(features.descriptors, sfm_core::Descriptors::MarkerCorner { .. }) {
+    if matches!(
+        features.descriptors,
+        sfm_core::Descriptors::MarkerCorner { .. }
+    ) {
         max_reprojection_error_px
     } else {
         COMPLETION_MAX_REPROJECTION_ERROR_PX
@@ -1151,7 +1180,10 @@ fn retriangulate_point(
             return;
         };
         if err * avg_focal
-            > completion_threshold_px(&input.images[img_idx].features, params.max_reprojection_error_px)
+            > completion_threshold_px(
+                &input.images[img_idx].features,
+                params.max_reprojection_error_px,
+            )
         {
             return;
         }
@@ -1220,7 +1252,9 @@ fn triangulate_and_complete_tracks(
             (None, None) => fresh.push((ka, kb)),
             (Some(point_idx), None) if !bootstrap_registered[b] => {
                 let obs_b = to_normalized(keypoint_px(&input.images[b].features, kb), &cam_b);
-                if let Some(err) = reprojection_error_normalized(&pose_b, &points[point_idx].xyz, obs_b) {
+                if let Some(err) =
+                    reprojection_error_normalized(&pose_b, &points[point_idx].xyz, obs_b)
+                {
                     if err * avg_focal_b
                         <= completion_threshold_px(
                             &input.images[b].features,
@@ -1236,7 +1270,9 @@ fn triangulate_and_complete_tracks(
             }
             (None, Some(point_idx)) if !bootstrap_registered[a] => {
                 let obs_a = to_normalized(keypoint_px(&input.images[a].features, ka), &cam_a);
-                if let Some(err) = reprojection_error_normalized(&pose_a, &points[point_idx].xyz, obs_a) {
+                if let Some(err) =
+                    reprojection_error_normalized(&pose_a, &points[point_idx].xyz, obs_a)
+                {
                     if err * avg_focal_a
                         <= completion_threshold_px(
                             &input.images[a].features,
@@ -1261,7 +1297,15 @@ fn triangulate_and_complete_tracks(
 
     let before = points.len();
     triangulate_pair_matches(
-        input, cameras, params, a, b, &fresh, poses, points, obs_to_point,
+        input,
+        cameras,
+        params,
+        a,
+        b,
+        &fresh,
+        poses,
+        points,
+        obs_to_point,
     );
     let new_points = points.len() - before;
 
@@ -2015,8 +2059,8 @@ mod tests {
                 camera_id: 1,
                 name: format!("img{idx}.png"),
                 initial_pose: None,
-            pose_fixed: false,
-            features: FeatureSet {
+                pose_fixed: false,
+                features: FeatureSet {
                     keypoints,
                     descriptors: Descriptors::Float32 {
                         dim: 1,

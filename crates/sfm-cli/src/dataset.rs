@@ -161,7 +161,10 @@ pub fn discover(images_root: &Path) -> Result<(Vec<DiscoveredImage>, Layout)> {
     let nested = !top_dirs.is_empty()
         && top_dirs.iter().any(|d| {
             sorted_dirs(d)
-                .map(|sub| sub.iter().any(|s| sorted_images(s).map(|i| !i.is_empty()).unwrap_or(false)))
+                .map(|sub| {
+                    sub.iter()
+                        .any(|s| sorted_images(s).map(|i| !i.is_empty()).unwrap_or(false))
+                })
                 .unwrap_or(false)
         });
 
@@ -211,7 +214,8 @@ pub fn discover(images_root: &Path) -> Result<(Vec<DiscoveredImage>, Layout)> {
     // Flat: a `cam<N>` prefix names the camera if present, otherwise every
     // image is treated as coming from one camera - the ordinary
     // single-camera case.
-    let mut per_camera_count: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut per_camera_count: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::new();
     for img in &top_images {
         let stem = img
             .file_stem()
@@ -260,7 +264,10 @@ mod tests {
         let (imgs, layout) = discover(&root).unwrap();
         assert_eq!(layout, Layout::CapturesAndCameras);
         assert_eq!(imgs.len(), 6);
-        let c1 = imgs.iter().find(|i| i.name.contains("capture_001/cam001")).unwrap();
+        let c1 = imgs
+            .iter()
+            .find(|i| i.name.contains("capture_001/cam001"))
+            .unwrap();
         assert_eq!((c1.capture_id, c1.camera_id, c1.image_index), (1, 1, 0));
         std::fs::remove_dir_all(&root).ok();
     }
@@ -276,7 +283,10 @@ mod tests {
         assert_eq!(imgs.len(), 3);
         assert!(imgs.iter().all(|i| i.capture_id == 0));
         // Second image in cam000 gets index 1, so merging pairs shot-for-shot.
-        let b = imgs.iter().find(|i| i.name.ends_with("cam000/b.png")).unwrap();
+        let b = imgs
+            .iter()
+            .find(|i| i.name.ends_with("cam000/b.png"))
+            .unwrap();
         assert_eq!((b.camera_id, b.image_index), (0, 1));
         // Camera id follows the directory name, not discovery order.
         assert!(imgs.iter().any(|i| i.camera_id == 7));

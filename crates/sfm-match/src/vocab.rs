@@ -228,30 +228,27 @@ fn kmeans(
 
     let mut assign = vec![0usize; n];
     for _ in 0..iterations {
-        assign
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(i, a)| {
-                let r = &sample[rows[i] * dim..(rows[i] + 1) * dim];
-                let mut best = 0usize;
-                let mut best_d = f32::MAX;
-                for c in 0..k {
-                    let cen = &centroids[c * dim..(c + 1) * dim];
-                    let mut d = 0.0f32;
-                    for t in 0..dim {
-                        let diff = r[t] - cen[t];
-                        d += diff * diff;
-                        if d >= best_d {
-                            break;
-                        }
-                    }
-                    if d < best_d {
-                        best_d = d;
-                        best = c;
+        assign.par_iter_mut().enumerate().for_each(|(i, a)| {
+            let r = &sample[rows[i] * dim..(rows[i] + 1) * dim];
+            let mut best = 0usize;
+            let mut best_d = f32::MAX;
+            for c in 0..k {
+                let cen = &centroids[c * dim..(c + 1) * dim];
+                let mut d = 0.0f32;
+                for t in 0..dim {
+                    let diff = r[t] - cen[t];
+                    d += diff * diff;
+                    if d >= best_d {
+                        break;
                     }
                 }
-                *a = best;
-            });
+                if d < best_d {
+                    best_d = d;
+                    best = c;
+                }
+            }
+            *a = best;
+        });
         let mut sums = vec![0f32; k * dim];
         let mut counts = vec![0usize; k];
         for (i, &a) in assign.iter().enumerate() {
@@ -383,7 +380,10 @@ fn as_float_rows(fs: &FeatureSet) -> Option<(usize, Vec<f32>)> {
 ///
 /// Returns `None` when retrieval doesn't apply to these descriptors (marker
 /// corners), so the caller can fall back rather than silently pairing nothing.
-pub fn vocab_tree_pairs(features: &[FeatureSet], params: &VocabParams) -> Option<Vec<(usize, usize)>> {
+pub fn vocab_tree_pairs(
+    features: &[FeatureSet],
+    params: &VocabParams,
+) -> Option<Vec<(usize, usize)>> {
     let n = features.len();
     if n < 2 {
         return Some(Vec::new());
@@ -575,10 +575,7 @@ mod tests {
         };
         let pairs = vocab_tree_pairs(&feats, &params).expect("float descriptors are supported");
         assert!(!pairs.is_empty());
-        let cross = pairs
-            .iter()
-            .filter(|(i, j)| (*i < 4) != (*j < 4))
-            .count();
+        let cross = pairs.iter().filter(|(i, j)| (*i < 4) != (*j < 4)).count();
         assert!(
             cross * 2 < pairs.len(),
             "expected mostly within-group pairs, got {cross} cross-group of {}",
@@ -612,9 +609,7 @@ mod tests {
                 angle: 0.0,
                 response: 1.0,
             }],
-            descriptors: Descriptors::MarkerCorner {
-                data: vec![0u8; 8],
-            },
+            descriptors: Descriptors::MarkerCorner { data: vec![0u8; 8] },
         };
         assert!(vocab_tree_pairs(&[fs.clone(), fs], &VocabParams::default()).is_none());
     }

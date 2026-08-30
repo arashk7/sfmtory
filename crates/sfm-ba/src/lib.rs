@@ -52,7 +52,6 @@ use nalgebra::{DMatrix, DVector, Matrix3, Matrix6, SMatrix, SVector, Vector3, Ve
 use rayon::prelude::*;
 use sfm_core::{CameraModel, Pose};
 
-
 #[derive(Debug, Clone, Copy)]
 pub struct Observation {
     pub image_idx: usize,
@@ -874,8 +873,7 @@ pub fn bundle_adjust(mut input: BaInput, params: &BaParams) -> BaOutput {
         // (many images, typically one shared camera that's usually held fixed
         // during growth), so keeping it off the heap is what makes the Schur
         // build fast - this loop runs once per point *per damping retry*.
-        let mut points_to_obs: Vec<Vec<EBlock>> =
-            (0..num_points).map(|_| Vec::new()).collect();
+        let mut points_to_obs: Vec<Vec<EBlock>> = (0..num_points).map(|_| Vec::new()).collect();
 
         for p in &prepared {
             let w = p.weight;
@@ -907,7 +905,6 @@ pub fn bundle_adjust(mut input: BaInput, params: &BaParams) -> BaOutput {
                 pose_cam_cross[p.image_idx] += w * jp_d.transpose() * &p.jc;
             }
         }
-
 
         // Try increasing damping until we find an accepted (cost-reducing) step.
         let mut accepted = false;
@@ -1104,8 +1101,9 @@ pub fn bundle_adjust(mut input: BaInput, params: &BaParams) -> BaOutput {
                 for block in &points_to_obs[p] {
                     match block {
                         EBlock::Pose(i, e_i) => {
-                            let dc: Vector6<f64> =
-                                Vector6::from_iterator(delta.rows(pose_slot[*i], 6).iter().copied());
+                            let dc: Vector6<f64> = Vector6::from_iterator(
+                                delta.rows(pose_slot[*i], 6).iter().copied(),
+                            );
                             acc += e_i.transpose() * dc;
                         }
                         EBlock::Camera(c, e_i) => {
@@ -1121,16 +1119,13 @@ pub fn bundle_adjust(mut input: BaInput, params: &BaParams) -> BaOutput {
 
             let mut trial_poses = input.poses.clone();
             for i in 0..num_images {
-                let d: SVector<f64, 6> =
-                    if pose_slot[i] == FIXED {
-                        // Held fixed: absent from the reduced system, so its
-                        // increment is exactly zero by construction.
-                        SVector::<f64, 6>::zeros()
-                    } else {
-                        SVector::<f64, 6>::from_iterator(
-                            delta.rows(pose_slot[i], 6).iter().copied(),
-                        )
-                    };
+                let d: SVector<f64, 6> = if pose_slot[i] == FIXED {
+                    // Held fixed: absent from the reduced system, so its
+                    // increment is exactly zero by construction.
+                    SVector::<f64, 6>::zeros()
+                } else {
+                    SVector::<f64, 6>::from_iterator(delta.rows(pose_slot[i], 6).iter().copied())
+                };
                 trial_poses[i] = perturb_pose(&input.poses[i], &d);
             }
             let mut trial_points = input.points.clone();

@@ -207,6 +207,23 @@ The **Dataset layout** section in the left panel of `sfmtory gui` probes the
 tree's actual depth, offers one role dropdown per level, writes the `[layout]`
 block and runs the link for you.
 
+### Trying the ArUco detector on one image
+
+```bash
+sfmtory gui --view aruco
+```
+
+Picks any frame from the dataset, runs detection with live parameter sliders
+(adaptive radius and threshold, minimum component size and perimeter, Hamming
+bound, contrast, gamma) and draws what it found: each marker's quad in a
+per-id colour with corner 0 marked and the id at the centre, plus decode and
+detect timings. Use it to see *why* a frame finds nothing before committing to
+a sweep; `sfmtory feature --detector aruco --find-params` then searches the
+same parameters across the dataset headlessly.
+
+Detection costs about **0.29 s** on a 3840x3104 frame (roughly 5.7 frames/s
+across four worker threads).
+
 ### Progress on long stages
 
 `feature` and `match` both report progress to stderr as they go — item count,

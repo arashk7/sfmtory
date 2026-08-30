@@ -367,7 +367,9 @@ fn refine_rotations_irls(
             if weight_sum > 1e-12 {
                 next.insert(
                     u,
-                    UnitQuaternion::new_normalize(Quaternion { coords: sum / weight_sum }),
+                    UnitQuaternion::new_normalize(Quaternion {
+                        coords: sum / weight_sum,
+                    }),
                 );
             }
         }
@@ -388,7 +390,11 @@ fn edge_direction(edge: &Edge, rotations: &HashMap<usize, UnitQuaternion<f64>>) 
 /// Direction from `edge`'s `from` endpoint to its other endpoint (either
 /// orientation), derived from [`edge_direction`] (which is always stated
 /// `edge.i -> edge.j`).
-fn direction_from(edge: &Edge, from: usize, rotations: &HashMap<usize, UnitQuaternion<f64>>) -> Vector3<f64> {
+fn direction_from(
+    edge: &Edge,
+    from: usize,
+    rotations: &HashMap<usize, UnitQuaternion<f64>>,
+) -> Vector3<f64> {
     let d = edge_direction(edge, rotations);
     if edge.i == from {
         d
@@ -515,7 +521,11 @@ fn average_translations(
             let mut weight_sum = 0.0_f64;
             for vote in &votes {
                 let residual = (vote - cur_u).norm();
-                let weight = if residual <= median { 1.0 } else { median / residual };
+                let weight = if residual <= median {
+                    1.0
+                } else {
+                    median / residual
+                };
                 sum += weight * vote;
                 weight_sum += weight;
             }
@@ -627,7 +637,11 @@ fn build_tracks(
         if ra == rb {
             continue;
         }
-        if images_in[&ra].intersection(&images_in[&rb]).next().is_some() {
+        if images_in[&ra]
+            .intersection(&images_in[&rb])
+            .next()
+            .is_some()
+        {
             continue;
         }
         let merged: HashSet<usize> = images_in[&ra].union(&images_in[&rb]).copied().collect();
@@ -656,7 +670,10 @@ fn build_tracks(
             .map(|&(img, kp)| {
                 let pose = poses[img].expect("member image must have an averaged pose");
                 let cam = &cameras[&input.images[img].camera_id];
-                (pose, to_normalized(keypoint_px(&input.images[img].features, kp), cam))
+                (
+                    pose,
+                    to_normalized(keypoint_px(&input.images[img].features, kp), cam),
+                )
             })
             .collect();
 
@@ -722,7 +739,10 @@ pub fn run_global(input: &super::ReconstructionInput, params: &GlobalParams) -> 
     let member_set: HashSet<usize> = largest.iter().copied().collect();
 
     let mut degree: HashMap<usize, usize> = HashMap::new();
-    for e in edges.iter().filter(|e| e.valid && member_set.contains(&e.i)) {
+    for e in edges
+        .iter()
+        .filter(|e| e.valid && member_set.contains(&e.i))
+    {
         *degree.entry(e.i).or_insert(0) += 1;
         *degree.entry(e.j).or_insert(0) += 1;
     }
@@ -811,7 +831,11 @@ pub fn run_global(input: &super::ReconstructionInput, params: &GlobalParams) -> 
         &registered,
         &mut poses,
         &mut points,
-        if params.refine_intrinsics { crate::IntrinsicsMode::FreeGuarded } else { crate::IntrinsicsMode::Fixed },
+        if params.refine_intrinsics {
+            crate::IntrinsicsMode::FreeGuarded
+        } else {
+            crate::IntrinsicsMode::Fixed
+        },
         crate::BaScope::Global,
     );
 
@@ -860,7 +884,11 @@ mod tests {
         (0..40)
             .map(|i| {
                 let t = i as f64;
-                Vector3::new(0.5 * (t * 0.37).sin(), 0.4 * (t * 0.53).cos(), 4.0 + 0.08 * t)
+                Vector3::new(
+                    0.5 * (t * 0.37).sin(),
+                    0.4 * (t * 0.53).cos(),
+                    4.0 + 0.08 * t,
+                )
             })
             .collect()
     }

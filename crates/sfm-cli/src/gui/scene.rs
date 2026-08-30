@@ -45,7 +45,12 @@ impl Scene {
         let points: Vec<(Vector3<f32>, [u8; 3])> = recon
             .points3d
             .values()
-            .map(|p| (Vector3::new(p.xyz.x as f32, p.xyz.y as f32, p.xyz.z as f32), p.color))
+            .map(|p| {
+                (
+                    Vector3::new(p.xyz.x as f32, p.xyz.y as f32, p.xyz.z as f32),
+                    p.color,
+                )
+            })
             .collect();
         let point_ids: Vec<u64> = recon.points3d.values().map(|p| p.id).collect();
 
@@ -348,7 +353,13 @@ pub fn render(
 }
 
 /// Index into `Scene::points` of whatever is visible at `(x, y)`.
-pub fn pick_point(projected: &Projected, width: usize, height: usize, x: f32, y: f32) -> Option<usize> {
+pub fn pick_point(
+    projected: &Projected,
+    width: usize,
+    height: usize,
+    x: f32,
+    y: f32,
+) -> Option<usize> {
     if projected.point_at.is_empty() {
         return None;
     }

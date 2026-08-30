@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use image::DynamicImage;
-use ort::ep::{ExecutionProvider, CPU, CUDA, TensorRT};
+use ort::ep::{ExecutionProvider, TensorRT, CPU, CUDA};
 use ort::session::Session;
 use ort::value::Tensor;
 
@@ -180,10 +180,7 @@ fn sha256_file(path: &Path) -> Result<String> {
 /// acquire the lock ever builds anything.
 static SESSION: OnceLock<Mutex<Option<Session>>> = OnceLock::new();
 
-fn with_session<T>(
-    params: &DiskParams,
-    f: impl FnOnce(&mut Session) -> Result<T>,
-) -> Result<T> {
+fn with_session<T>(params: &DiskParams, f: impl FnOnce(&mut Session) -> Result<T>) -> Result<T> {
     let cell = SESSION.get_or_init(|| Mutex::new(None));
     let mut guard = cell
         .lock()
@@ -340,7 +337,11 @@ mod tests {
             let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
             let r = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt();
             let ring = ((r / 6.0).sin() * 0.5 + 0.5) * 255.0;
-            let grid = if (x / 8) % 2 == (y / 8) % 2 { 40.0 } else { 0.0 };
+            let grid = if (x / 8) % 2 == (y / 8) % 2 {
+                40.0
+            } else {
+                0.0
+            };
             let v = (ring + grid).clamp(0.0, 255.0) as u8;
             Rgb([v, v, v])
         });

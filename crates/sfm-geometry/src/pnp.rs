@@ -370,7 +370,9 @@ pub fn pnp_ransac(
         let (mut pose, mut best) = (model, inliers);
         if let Some(refined) = pnp_planar(&p3, &p2) {
             let refit: Vec<bool> = (0..n)
-                .map(|i| reprojection_residual(&refined, &points3d[i], points2d_norm[i]) < threshold)
+                .map(|i| {
+                    reprojection_residual(&refined, &points3d[i], points2d_norm[i]) < threshold
+                })
                 .collect();
             if refit.iter().filter(|&&b| b).count() >= count {
                 pose = refined;

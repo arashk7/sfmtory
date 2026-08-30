@@ -73,7 +73,11 @@ impl Progress {
 
         let elapsed = elapsed_ms as f64 / 1000.0;
         let frac = done as f64 / self.total.max(1) as f64;
-        let rate = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
+        let rate = if elapsed > 0.0 {
+            done as f64 / elapsed
+        } else {
+            0.0
+        };
         let eta = if rate > 0.0 && done < self.total {
             format!("  eta {}", human_secs((self.total - done) as f64 / rate))
         } else {

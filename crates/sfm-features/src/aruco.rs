@@ -22,7 +22,6 @@ use std::sync::OnceLock;
 use sfm_core::{Descriptors, FeatureSet, Keypoint};
 
 use crate::geom2d::{convex_hull, min_area_rect, polygon_area};
-use crate::gray::{sample_bilinear, to_gray_f32};
 use crate::homography::{apply_homography, solve_homography};
 
 const DATA_BITS: usize = 4;
@@ -133,12 +132,20 @@ impl IntegralImage {
     fn build(gray: &image::GrayImage) -> Self {
         let (w, h) = gray.dimensions();
         let (w, h) = (w as usize, h as usize);
-        let mut sums = vec![0u64; (w + 1) * (h + 1)];
+        // Straight off the raw buffer: `get_pixel` is a bounds-checked call per
+        // pixel, and at 12 megapixels that overhead is the whole cost of an
+        // otherwise trivial prefix sum.
+        let src = gray.as_raw();
+        let stride = w + 1;
+        let mut sums = vec![0u64; stride * (h + 1)];
         for y in 0..h {
+            let row = &src[y * w..y * w + w];
+            let (prev, cur) = sums.split_at_mut((y + 1) * stride);
+            let prev = &prev[y * stride..];
             let mut row_sum = 0u64;
             for x in 0..w {
-                row_sum += gray.get_pixel(x as u32, y as u32).0[0] as u64;
-                sums[(y + 1) * (w + 1) + (x + 1)] = sums[y * (w + 1) + (x + 1)] + row_sum;
+                row_sum += row[x] as u64;
+                cur[x + 1] = prev[x + 1] + row_sum;
             }
         }
         IntegralImage { sums, w, h }
@@ -166,17 +173,26 @@ impl IntegralImage {
 }
 
 fn adaptive_ink_mask(gray: &image::GrayImage, params: &ArucoParams) -> Vec<bool> {
+    use rayon::prelude::*;
     let (w, h) = gray.dimensions();
+    let (wu, hu) = (w as usize, h as usize);
     let integral = IntegralImage::build(gray);
     let r = params.adaptive_radius;
-    let mut mask = vec![false; (w * h) as usize];
-    for y in 0..h as i32 {
-        for x in 0..w as i32 {
-            let mean = integral.mean(x - r, y - r, x + r + 1, y + r + 1);
-            let v = gray.get_pixel(x as u32, y as u32).0[0] as f32;
-            mask[(y as usize) * w as usize + x as usize] = v + params.adaptive_c < mean;
+    let c = params.adaptive_c;
+    let src = gray.as_raw();
+    let mut mask = vec![false; wu * hu];
+    // Rows are independent given the integral image, and this is pure
+    // arithmetic over 12M pixels - the one stage in the detector that
+    // parallelises for free.
+    mask.par_chunks_mut(wu).enumerate().for_each(|(y, row)| {
+        let yi = y as i32;
+        let vals = &src[y * wu..y * wu + wu];
+        for (x, m) in row.iter_mut().enumerate() {
+            let xi = x as i32;
+            let mean = integral.mean(xi - r, yi - r, xi + r + 1, yi + r + 1);
+            *m = vals[x] as f32 + c < mean;
         }
-    }
+    });
     mask
 }
 
@@ -215,27 +231,78 @@ fn label_components(mask: &[bool], w: usize, h: usize) -> Vec<i32> {
     labels
 }
 
-fn border_points_for_label(labels: &[i32], w: usize, h: usize, label: i32) -> Vec<(f64, f64)> {
-    let mut pts = Vec::new();
-    for y in 0..h {
-        for x in 0..w {
-            if labels[y * w + x] != label {
-                continue;
-            }
-            let is_border = x == 0
-                || y == 0
-                || x == w - 1
-                || y == h - 1
-                || labels[y * w + x - 1] != label
-                || labels[y * w + x + 1] != label
-                || labels[(y - 1) * w + x] != label
-                || labels[(y + 1) * w + x] != label;
-            if is_border {
-                pts.push((x as f64, y as f64));
+/// Border pixels of every kept component, grouped by label.
+///
+/// Stored CSR-style - one flat point array plus per-label offsets - rather
+/// than a `Vec<Vec<_>>`, so a 12MP image with 11k components does not perform
+/// 11k separate allocations to hold half a million points.
+struct ComponentBorders {
+    points: Vec<(f64, f64)>,
+    /// Label `l` owns `points[offsets[l]..offsets[l + 1]]`.
+    offsets: Vec<u32>,
+}
+
+impl ComponentBorders {
+    fn get(&self, label: usize) -> &[(f64, f64)] {
+        &self.points[self.offsets[label] as usize..self.offsets[label + 1] as usize]
+    }
+}
+
+/// Collects every component's border pixels in two passes over the image.
+///
+/// This replaces a per-label full-image scan, which made border extraction
+/// O(width x height x labels) and completely dominated detection: on a real
+/// 3840x3104 frame with 1275 components above the size floor, it was 10.63s of
+/// a 12.28s detect() - 15 billion pixel visits to collect 498k points. Two
+/// passes over the image cost O(width x height) regardless of how many
+/// components there are.
+fn extract_borders(labels: &[i32], w: usize, h: usize, keep: &[bool]) -> ComponentBorders {
+    let num_labels = keep.len();
+    // Pass 1: how many border pixels each kept component has.
+    let mut offsets = vec![0u32; num_labels + 1];
+    let visit = |f: &mut dyn FnMut(usize, usize, usize)| {
+        for y in 0..h {
+            let row = y * w;
+            for x in 0..w {
+                let l = labels[row + x];
+                if l < 0 {
+                    continue;
+                }
+                let l = l as usize;
+                if !keep[l] {
+                    continue;
+                }
+                let is_border = x == 0
+                    || y == 0
+                    || x == w - 1
+                    || y == h - 1
+                    || labels[row + x - 1] != l as i32
+                    || labels[row + x + 1] != l as i32
+                    || labels[row - w + x] != l as i32
+                    || labels[row + w + x] != l as i32;
+                if is_border {
+                    f(l, x, y);
+                }
             }
         }
+    };
+    visit(&mut |l, _, _| offsets[l + 1] += 1);
+
+    // Prefix sum turns the counts into start offsets.
+    for i in 0..num_labels {
+        offsets[i + 1] += offsets[i];
     }
-    pts
+
+    // Pass 2: place each point, using a moving cursor per label.
+    let total = offsets[num_labels] as usize;
+    let mut points = vec![(0.0, 0.0); total];
+    let mut cursor = offsets.clone();
+    visit(&mut |l, x, y| {
+        points[cursor[l] as usize] = (x as f64, y as f64);
+        cursor[l] += 1;
+    });
+
+    ComponentBorders { points, offsets }
 }
 
 fn order_by_angle_around_centroid(mut corners: [(f64, f64); 4]) -> [(f64, f64); 4] {
@@ -253,9 +320,6 @@ fn order_by_angle_around_centroid(mut corners: [(f64, f64); 4]) -> [(f64, f64); 
 /// before thresholding. A no-op at the defaults, so datasets that don't need
 /// it pay nothing.
 fn preprocess(gray: &image::GrayImage, params: &ArucoParams) -> image::GrayImage {
-    if params.contrast == 1.0 && params.gamma == 1.0 {
-        return gray.clone();
-    }
     let mut out = gray.clone();
     for p in out.pixels_mut() {
         let mut v = p[0] as f32 / 255.0;
@@ -271,8 +335,16 @@ fn preprocess(gray: &image::GrayImage, params: &ArucoParams) -> image::GrayImage
 }
 
 pub fn detect(img: &image::DynamicImage, params: &ArucoParams) -> FeatureSet {
-    let gray_u8 = preprocess(&img.to_luma8(), params);
-    let gray_f32 = to_gray_f32(img);
+    let luma = crate::gray::to_luma8_par(img);
+    // Thresholding sees the exposure-corrected image; grid sampling deliberately
+    // still sees the original, so `contrast`/`gamma` only ever help find the
+    // quads and never alter the bits read out of one. At the defaults both are
+    // the same buffer and nothing is copied.
+    let gray_u8 = if params.contrast == 1.0 && params.gamma == 1.0 {
+        std::borrow::Cow::Borrowed(&luma)
+    } else {
+        std::borrow::Cow::Owned(preprocess(&luma, params))
+    };
     let (w, h) = gray_u8.dimensions();
     let (wu, hu) = (w as usize, h as usize);
 
@@ -291,15 +363,21 @@ pub fn detect(img: &image::DynamicImage, params: &ArucoParams) -> FeatureSet {
     let mut keypoints = Vec::new();
     let mut marker_data = Vec::new();
 
+    let keep: Vec<bool> = counts
+        .iter()
+        .map(|c| *c >= params.min_component_pixels)
+        .collect();
+    let borders = extract_borders(&labels, wu, hu, &keep);
+
     for label in 0..num_labels {
-        if counts[label as usize] < params.min_component_pixels {
+        if !keep[label as usize] {
             continue;
         }
-        let border = border_points_for_label(&labels, wu, hu, label);
+        let border = borders.get(label as usize);
         if border.len() < 8 {
             continue;
         }
-        let hull = convex_hull(&border);
+        let hull = convex_hull(border);
         let rect = match min_area_rect(&hull) {
             Some(r) => r,
             None => continue,
@@ -334,7 +412,7 @@ pub fn detect(img: &image::DynamicImage, params: &ArucoParams) -> FeatureSet {
             None => continue,
         };
 
-        let sampled = sample_grid_bits(&gray_f32, &h_matrix);
+        let sampled = sample_grid_bits(&luma, &h_matrix);
         let border_ok = check_border_cells(sampled);
         if !border_ok {
             continue;
@@ -395,7 +473,33 @@ fn shoelace_signed(pts: &[(f64, f64); 4]) -> f64 {
 
 /// Sample every cell of the `GRID x GRID` canonical marker as a boolean
 /// (`true` = ink/black), averaging a small window per cell for robustness.
-fn sample_grid_bits(gray: &crate::gray::GrayF32, h: &[f64; 8]) -> [[bool; GRID]; GRID] {
+/// Bilinear sample from the 8-bit grey image, normalised to `[0, 1]`.
+///
+/// Exists so the detector never materialises an `f32` copy of the frame. Grid
+/// sampling touches a few tens of thousands of points across a whole image;
+/// converting 12 million pixels to `f32` to serve them cost 123ms and 47MB per
+/// frame, for arithmetic identical to reading the `u8` and dividing.
+fn sample_bilinear_u8(gray: &image::GrayImage, x: f32, y: f32) -> f32 {
+    let (w, h) = gray.dimensions();
+    if w == 0 || h == 0 {
+        return 0.0;
+    }
+    let x = x.clamp(0.0, (w - 1) as f32);
+    let y = y.clamp(0.0, (h - 1) as f32);
+    let x0 = x.floor() as u32;
+    let y0 = y.floor() as u32;
+    let x1 = (x0 + 1).min(w - 1);
+    let y1 = (y0 + 1).min(h - 1);
+    let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+    let src = gray.as_raw();
+    let (w, y0, y1) = (w as usize, y0 as usize, y1 as usize);
+    let at = |yy: usize, xx: u32| src[yy * w + xx as usize] as f32;
+    let v0 = at(y0, x0) * (1.0 - fx) + at(y0, x1) * fx;
+    let v1 = at(y1, x0) * (1.0 - fx) + at(y1, x1) * fx;
+    (v0 * (1.0 - fy) + v1 * fy) / 255.0
+}
+
+fn sample_grid_bits(gray: &image::GrayImage, h: &[f64; 8]) -> [[bool; GRID]; GRID] {
     let mut cell_mean = [[0f32; GRID]; GRID];
     for r in 0..GRID {
         for c in 0..GRID {
@@ -406,7 +510,7 @@ fn sample_grid_bits(gray: &crate::gray::GrayF32, h: &[f64; 8]) -> [[bool; GRID];
                     let cx = (c as f64 + (sx as f64 + 1.0) / 4.0) / GRID as f64;
                     let cy = (r as f64 + (sy as f64 + 1.0) / 4.0) / GRID as f64;
                     let (ix, iy) = apply_homography(h, cx, cy);
-                    sum += sample_bilinear(gray, ix as f32, iy as f32);
+                    sum += sample_bilinear_u8(gray, ix as f32, iy as f32);
                     n += 1;
                 }
             }

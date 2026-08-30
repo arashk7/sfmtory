@@ -212,7 +212,13 @@ mod tests {
 
     /// Projects a unit square placed in 3D at a given pose through a pinhole
     /// with focal `f`, returning its four image corners.
-    fn project_square(f: f64, cx: f64, cy: f64, r: Matrix3<f64>, t: Vector3<f64>) -> [(f64, f64); 4] {
+    fn project_square(
+        f: f64,
+        cx: f64,
+        cy: f64,
+        r: Matrix3<f64>,
+        t: Vector3<f64>,
+    ) -> [(f64, f64); 4] {
         let sq = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
         let mut out = [(0.0, 0.0); 4];
         for (k, &(u, v)) in sq.iter().enumerate() {
@@ -228,7 +234,13 @@ mod tests {
         let mut samples = Vec::new();
         // A spread of orientations - the constraints carry no information from
         // a square that is exactly fronto-parallel.
-        for (a, b) in [(0.5, 0.2), (-0.4, 0.35), (0.3, -0.45), (0.6, 0.1), (-0.25, -0.5)] {
+        for (a, b) in [
+            (0.5, 0.2),
+            (-0.4, 0.35),
+            (0.3, -0.45),
+            (0.6, 0.1),
+            (-0.25, -0.5),
+        ] {
             let r = nalgebra::Rotation3::from_euler_angles(a, b, 0.15).into_inner();
             let t = Vector3::new(-0.5, -0.5, 4.0);
             let corners = project_square(f, cx, cy, r, t);

@@ -11,6 +11,7 @@
 //! images that failed to register did so because they were never connected to
 //! the rest of the match graph at all.
 
+mod aruco;
 mod graph;
 mod imageview;
 mod pipeline;
@@ -52,6 +53,7 @@ pub enum View {
     Image,
     Graph,
     Coverage,
+    Aruco,
 }
 
 impl From<crate::GuiViewArg> for View {
@@ -61,6 +63,7 @@ impl From<crate::GuiViewArg> for View {
             crate::GuiViewArg::Image => View::Image,
             crate::GuiViewArg::Graph => View::Graph,
             crate::GuiViewArg::Coverage => View::Coverage,
+            crate::GuiViewArg::Aruco => View::Aruco,
         }
     }
 }
@@ -124,6 +127,7 @@ struct App {
     /// directories themselves.
     layout_layers: Vec<usize>,
     layout_note: Option<String>,
+    aruco: aruco::Tester,
     /// Stage options mirrored from the CLI's own defaults.
     detector: usize,
     pairing: usize,
@@ -196,6 +200,7 @@ impl App {
             image_pan: egui::Vec2::ZERO,
             layout_layers: Vec::new(),
             layout_note: None,
+            aruco: aruco::Tester::default(),
             detector: 0,
             pairing: 0,
             pipeline_kind: 0,
@@ -440,12 +445,10 @@ impl App {
                 ui.separator();
                 self.layout_section(ui);
                 ui.separator();
-                egui::ScrollArea::vertical()
-                    .id_salt("tree")
-                    .show(ui, |ui| {
-                        let root = self.project.clone();
-                        self.dir_tree(ui, &root, 0);
-                    });
+                egui::ScrollArea::vertical().id_salt("tree").show(ui, |ui| {
+                    let root = self.project.clone();
+                    self.dir_tree(ui, &root, 0);
+                });
             });
     }
 
@@ -826,7 +829,10 @@ impl App {
                 self.selected_point = None;
             }
         });
-        ui.label(format!("xyz  [{:.4}, {:.4}, {:.4}]", xyz[0], xyz[1], xyz[2]));
+        ui.label(format!(
+            "xyz  [{:.4}, {:.4}, {:.4}]",
+            xyz[0], xyz[1], xyz[2]
+        ));
         ui.label(format!(
             "track length {track_len}   ·   mean residual {mean:.3}px"
         ));
@@ -918,11 +924,7 @@ impl App {
                 let recon = self.recon.as_ref();
                 let mut rows: Vec<_> = diag.images.values().collect();
                 rows.sort_by_key(|d| d.num_observations);
-                let max = rows
-                    .last()
-                    .map(|d| d.num_observations)
-                    .unwrap_or(1)
-                    .max(1) as f32;
+                let max = rows.last().map(|d| d.num_observations).unwrap_or(1).max(1) as f32;
                 egui::ScrollArea::vertical()
                     .id_salt("obscounts")
                     .max_height(150.0)
@@ -1141,6 +1143,7 @@ impl App {
                 ui.selectable_value(&mut self.view, View::Image, "Image");
                 ui.selectable_value(&mut self.view, View::Graph, "Match graph");
                 ui.selectable_value(&mut self.view, View::Coverage, "Coverage");
+                ui.selectable_value(&mut self.view, View::Aruco, "ArUco test");
                 ui.separator();
                 ui.checkbox(&mut self.show_log, "Log");
             });
@@ -1158,6 +1161,7 @@ impl App {
                 View::Image => self.view_image(ctx, ui, h),
                 View::Graph => self.view_graph(ctx, ui, h),
                 View::Coverage => self.view_coverage(ui, h),
+                View::Aruco => self.view_aruco(ctx, ui, h),
             }
 
             if self.show_log {
@@ -1539,8 +1543,9 @@ impl App {
         // Clip the overlay to the viewport, so a panned-away image does not
         // scribble its keypoints over the rest of the UI.
         let painter = painter.with_clip_rect(resp.rect);
-        let to_screen =
-            |x: f64, y: f64| egui::pos2(rect.min.x + x as f32 * scale, rect.min.y + y as f32 * scale);
+        let to_screen = |x: f64, y: f64| {
+            egui::pos2(rect.min.x + x as f32 * scale, rect.min.y + y as f32 * scale)
+        };
 
         let recon = self.recon.as_ref().unwrap();
         let diag = self.diag.as_ref().unwrap();
@@ -1720,7 +1725,11 @@ impl App {
                         n.name,
                         n.degree,
                         n.component,
-                        if n.registered { "" } else { "  ·  UNREGISTERED" }
+                        if n.registered {
+                            ""
+                        } else {
+                            "  ·  UNREGISTERED"
+                        }
                     ),
                     egui::FontId::monospace(11.0),
                     ui.visuals().strong_text_color(),
@@ -1758,6 +1767,243 @@ impl App {
                 self.view = View::Image;
             }
         }
+    }
+
+    /// Try the ArUco detector on one real frame and see what it found.
+    fn view_aruco(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, height: f32) {
+        // Populate the image list from the project the first time in. Uses the
+        // effective tree, so a `[layout]` project offers the same images the
+        // pipeline would actually read.
+        if self.aruco.candidates.is_empty() {
+            if let Ok(p) = Project::open(&self.project) {
+                if let Ok((imgs, _)) = crate::dataset::discover(&p.effective_images_dir()) {
+                    self.aruco.candidates = imgs.into_iter().map(|d| d.path).collect();
+                }
+            }
+        }
+        if self.aruco.candidates.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label("No images found in this project. Open a dataset directory first.")
+            });
+            return;
+        }
+
+        let mut rerun = false;
+        ui.horizontal_wrapped(|ui| {
+            let n = self.aruco.candidates.len();
+            let name = self.aruco.candidates[self.aruco.selected]
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            egui::ComboBox::from_id_salt("arucoimg")
+                .selected_text(format!("{name}  ({}/{n})", self.aruco.selected + 1))
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    // A long list of full paths is unreadable and slow to
+                    // scroll; the tail is the part that identifies the frame.
+                    for (i, p) in self.aruco.candidates.iter().enumerate().take(500) {
+                        let label = p
+                            .iter()
+                            .rev()
+                            .take(3)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<PathBuf>()
+                            .display()
+                            .to_string();
+                        ui.selectable_value(&mut self.aruco.selected, i, label);
+                    }
+                });
+            if ui.button("◀").clicked() && self.aruco.selected > 0 {
+                self.aruco.selected -= 1;
+                rerun = true;
+            }
+            if ui.button("▶").clicked() && self.aruco.selected + 1 < n {
+                self.aruco.selected += 1;
+                rerun = true;
+            }
+            ui.separator();
+            if ui.button("Detect").clicked() {
+                rerun = true;
+            }
+            if ui.button("Reset params").clicked() {
+                self.aruco.params = sfm_features::aruco::ArucoParams::default();
+                rerun = true;
+            }
+            ui.checkbox(&mut self.aruco.show_ids, "ids");
+            if ui.button("fit").clicked() {
+                self.aruco.zoom = 1.0;
+                self.aruco.pan = egui::Vec2::ZERO;
+            }
+        });
+
+        let p = &mut self.aruco.params;
+        ui.horizontal_wrapped(|ui| {
+            let mut changed = false;
+            changed |= ui
+                .add(egui::Slider::new(&mut p.adaptive_radius, 1..=41).text("radius"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut p.adaptive_c, 0.0..=60.0).text("threshold C"))
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut p.min_component_pixels, 4..=2000)
+                        .logarithmic(true)
+                        .text("min px"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut p.min_perimeter_px, 8.0..=400.0)
+                        .logarithmic(true)
+                        .text("min perimeter"),
+                )
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut p.max_hamming_distance, 0..=6).text("max hamming"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut p.contrast, 0.5..=3.0).text("contrast"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut p.gamma, 0.3..=3.0).text("gamma"))
+                .changed();
+            // Re-detect on release rather than per-frame: a 12MP detection is
+            // ~0.3s, so tracking every intermediate slider value would queue up
+            // work the user never asked to see.
+            if changed && ui.ctx().input(|i| i.pointer.any_released()) {
+                rerun = true;
+            }
+        });
+        ui.separator();
+
+        if rerun {
+            self.aruco.spawn(ctx);
+        }
+
+        let size = egui::vec2(ui.available_width(), (height - 90.0).max(120.0));
+        let (resp, painter) = ui.allocate_painter(size, egui::Sense::click_and_drag());
+
+        // Show the source frame under the overlay.
+        let path = self.aruco.candidates[self.aruco.selected].clone();
+        if self.aruco.texture.as_ref().map(|(p, ..)| p) != Some(&path) {
+            if let Ok(img) = image::open(&path) {
+                let rgba = img.to_rgba8();
+                let src = [rgba.width() as f32, rgba.height() as f32];
+                let scale = (2000.0 / rgba.width().max(rgba.height()) as f32).min(1.0);
+                let rgba = if scale < 1.0 {
+                    image::imageops::resize(
+                        &rgba,
+                        (rgba.width() as f32 * scale) as u32,
+                        (rgba.height() as f32 * scale) as u32,
+                        image::imageops::FilterType::Triangle,
+                    )
+                } else {
+                    rgba
+                };
+                let color = egui::ColorImage::from_rgba_unmultiplied(
+                    [rgba.width() as usize, rgba.height() as usize],
+                    rgba.as_raw(),
+                );
+                let tex = ctx.load_texture("aruco-src", color, egui::TextureOptions::LINEAR);
+                self.aruco.texture = Some((path.clone(), tex, src));
+            }
+        }
+
+        if resp.dragged() {
+            self.aruco.pan += resp.drag_delta();
+        }
+        if resp.hovered() {
+            let scroll = ui.input(|i| i.raw_scroll_delta.y);
+            if scroll != 0.0 {
+                let old = self.aruco.zoom;
+                self.aruco.zoom = (self.aruco.zoom * (1.0 + scroll * 0.0015)).clamp(0.2, 40.0);
+                if let Some(pos) = resp.hover_pos() {
+                    let c = resp.rect.center() + self.aruco.pan;
+                    self.aruco.pan += (c - pos) * (self.aruco.zoom / old - 1.0);
+                }
+            }
+        }
+
+        let Some((_, tex, src)) = &self.aruco.texture else {
+            painter.text(
+                resp.rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "could not read that image",
+                egui::FontId::proportional(13.0),
+                ui.visuals().warn_fg_color,
+            );
+            return;
+        };
+        let fit = (resp.rect.width() / src[0]).min(resp.rect.height() / src[1]);
+        let scale = fit * self.aruco.zoom;
+        let rect = egui::Rect::from_center_size(
+            resp.rect.center() + self.aruco.pan,
+            egui::vec2(src[0] * scale, src[1] * scale),
+        );
+        painter.image(
+            tex.id(),
+            rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+        let painter = painter.with_clip_rect(resp.rect);
+        let to_screen = |x: f32, y: f32| egui::pos2(rect.min.x + x * scale, rect.min.y + y * scale);
+
+        let Ok(state) = self.aruco.state.lock() else {
+            return;
+        };
+        let caption = match &*state {
+            aruco::State::Idle => "press Detect".to_string(),
+            aruco::State::Running => "detecting...".to_string(),
+            aruco::State::Failed(e) => e.clone(),
+            aruco::State::Done(d) => {
+                for m in &d.markers {
+                    let col = aruco::marker_color(m.id);
+                    for k in 0..4 {
+                        let a = m.corners[k];
+                        let b = m.corners[(k + 1) % 4];
+                        painter.line_segment(
+                            [to_screen(a[0], a[1]), to_screen(b[0], b[1])],
+                            egui::Stroke::new(1.5_f32, col),
+                        );
+                    }
+                    // Mark corner 0 so the detected orientation is visible -
+                    // a marker found with the wrong rotation still draws a
+                    // perfectly good quad.
+                    painter.circle_filled(to_screen(m.corners[0][0], m.corners[0][1]), 3.0, col);
+                    if self.aruco.show_ids {
+                        let cx = m.corners.iter().map(|c| c[0]).sum::<f32>() / 4.0;
+                        let cy = m.corners.iter().map(|c| c[1]).sum::<f32>() / 4.0;
+                        painter.text(
+                            to_screen(cx, cy),
+                            egui::Align2::CENTER_CENTER,
+                            m.id.to_string(),
+                            egui::FontId::monospace(12.0),
+                            col,
+                        );
+                    }
+                }
+                format!(
+                    "{} marker(s), {} corners   ·   decode {}  detect {}   ·   {:.0}x{:.0}",
+                    d.markers.len(),
+                    d.num_corners,
+                    crate::progress::human_secs(d.decode.as_secs_f64()),
+                    crate::progress::human_secs(d.detect.as_secs_f64()),
+                    d.source_size[0],
+                    d.source_size[1],
+                )
+            }
+        };
+        painter.text(
+            resp.rect.left_top() + egui::vec2(6.0, 4.0),
+            egui::Align2::LEFT_TOP,
+            caption,
+            egui::FontId::monospace(12.0),
+            ui.visuals().strong_text_color(),
+        );
     }
 
     fn view_coverage(&mut self, ui: &mut egui::Ui, height: f32) {
@@ -1945,7 +2191,10 @@ fn coverage_plot(
             // visibly empty and outlined in the warning colour rather than
             // merely drawn dimmer than the rest.
             let (fill, stroke_color) = if count == 0 {
-                (egui::Color32::TRANSPARENT, warn_color().gamma_multiply(0.55))
+                (
+                    egui::Color32::TRANSPARENT,
+                    warn_color().gamma_multiply(0.55),
+                )
             } else {
                 let t = count as f32 / max_count;
                 (
@@ -2018,7 +2267,10 @@ fn color_legend(painter: &egui::Painter, rect: egui::Rect, max: f64) {
         let c = scene::error_color(t * max, max);
         painter.rect_filled(
             egui::Rect::from_min_size(
-                egui::pos2(bar.left() + bar.width() * i as f32 / STEPS as f32, bar.top()),
+                egui::pos2(
+                    bar.left() + bar.width() * i as f32 / STEPS as f32,
+                    bar.top(),
+                ),
                 egui::vec2(bar.width() / STEPS as f32 + 1.0, bar.height()),
             ),
             0.0,

@@ -72,7 +72,11 @@ pub fn find_params(images: &[DiscoveredImage]) -> Result<ArucoParams> {
     // Evenly spread rather than the first N, so a dataset whose first capture
     // is unrepresentative doesn't drive the whole choice.
     let stride = (images.len() / MAX_SAMPLE_IMAGES).max(1);
-    let sample: Vec<&DiscoveredImage> = images.iter().step_by(stride).take(MAX_SAMPLE_IMAGES).collect();
+    let sample: Vec<&DiscoveredImage> = images
+        .iter()
+        .step_by(stride)
+        .take(MAX_SAMPLE_IMAGES)
+        .collect();
     println!(
         "Tuning ArUco parameters on {} of {} images...",
         sample.len(),
@@ -93,7 +97,9 @@ pub fn find_params(images: &[DiscoveredImage]) -> Result<ArucoParams> {
     let mut best_score = score_params(&sample, &base);
     println!(
         "  baseline: {} markers across {}/{} images",
-        best_score.total_markers, best_score.images_with_markers, sample.len()
+        best_score.total_markers,
+        best_score.images_with_markers,
+        sample.len()
     );
 
     let mut evaluated = 1usize;

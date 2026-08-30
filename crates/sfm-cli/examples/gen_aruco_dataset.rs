@@ -69,5 +69,8 @@ fn main() {
             img.save(dir.join("image.png")).unwrap();
         }
     }
-    println!("wrote {captures} captures x {cameras} cameras to {}", out.display());
+    println!(
+        "wrote {captures} captures x {cameras} cameras to {}",
+        out.display()
+    );
 }

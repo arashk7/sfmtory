@@ -172,9 +172,7 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
                 // Try consuming zero or more characters against `*`.
                 (0..=n.len()).any(|k| go(&p[1..], &n[k..]))
             }
-            Some(&c) => {
-                !n.is_empty() && (c == b'?' || c == n[0]) && go(&p[1..], &n[1..])
-            }
+            Some(&c) => !n.is_empty() && (c == b'?' || c == n[0]) && go(&p[1..], &n[1..]),
         }
     }
     go(pattern.as_bytes(), name.as_bytes())
@@ -256,8 +254,7 @@ impl Project {
     /// Ensures the cache layout exists for one stage and returns its directory.
     pub fn prepare_stage(&self, stage: &str) -> Result<PathBuf> {
         let dir = self.stage_dir(stage);
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
+        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         Ok(dir)
     }
 
@@ -326,9 +323,7 @@ impl Project {
                 poses: Vec::new(),
                 layout: None,
             },
-            Err(e) => {
-                return Err(e).with_context(|| format!("reading {}", config_path.display()))
-            }
+            Err(e) => return Err(e).with_context(|| format!("reading {}", config_path.display())),
         };
         Ok(Project {
             root: root.to_path_buf(),

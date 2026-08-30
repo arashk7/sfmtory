@@ -120,7 +120,10 @@ fn segments_from_edges(edges: &GrayImage, lines: &[PolarLine], min_len: f64) -> 
         for dy in -1..=1i64 {
             for dx in -1..=1i64 {
                 let (px, py) = (xi + dx, yi + dy);
-                if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h
+                if px >= 0
+                    && py >= 0
+                    && (px as u32) < w
+                    && (py as u32) < h
                     && edges.get_pixel(px as u32, py as u32)[0] > 0
                 {
                     return true;
@@ -218,7 +221,11 @@ fn find_vanishing_points(
                 .copied()
                 .filter(|&k| segs[k].supports(vp, inlier_px))
                 .collect();
-            if best.as_ref().map(|(_, s)| support.len() > s.len()).unwrap_or(true) {
+            if best
+                .as_ref()
+                .map(|(_, s)| support.len() > s.len())
+                .unwrap_or(true)
+            {
                 best = Some((vp, support));
             }
         }
@@ -325,7 +332,10 @@ mod tests {
         let (v1, v3) = (vp(d1), vp(d3));
         let dot = (v1.0 - cx) * (v3.0 - cx) + (v1.1 - cy) * (v3.1 - cy);
         let recovered = (-dot).sqrt();
-        assert!((recovered - f).abs() < 1e-6, "recovered {recovered}, want {f}");
+        assert!(
+            (recovered - f).abs() < 1e-6,
+            "recovered {recovered}, want {f}"
+        );
     }
 
     #[test]

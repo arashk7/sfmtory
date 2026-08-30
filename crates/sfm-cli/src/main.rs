@@ -144,6 +144,8 @@ enum GuiViewArg {
     Graph,
     /// Board-orientation coverage for a planar capture.
     Coverage,
+    /// Try the ArUco detector and its parameters on one frame.
+    Aruco,
 }
 
 #[derive(clap::Args)]
@@ -475,10 +477,9 @@ fn cmd_init_cam(args: InitCamArgs) -> Result<()> {
 
     let mut samples = Vec::new();
     for d in &picked {
-        let bytes = std::fs::read(&d.path)
-            .with_context(|| format!("reading {}", d.path.display()))?;
-        let img = image::open(&d.path)
-            .with_context(|| format!("decoding {}", d.path.display()))?;
+        let bytes =
+            std::fs::read(&d.path).with_context(|| format!("reading {}", d.path.display()))?;
+        let img = image::open(&d.path).with_context(|| format!("decoding {}", d.path.display()))?;
         let (w, h) = (img.width(), img.height());
         samples.push((bytes, img.to_luma8(), w, h));
     }
@@ -510,7 +511,11 @@ fn cmd_init_cam(args: InitCamArgs) -> Result<()> {
 
     println!("\nEstimates (best first):");
     for e in &result.estimates {
-        let mark = if e.method == result.method { "->" } else { "  " };
+        let mark = if e.method == result.method {
+            "->"
+        } else {
+            "  "
+        };
         println!(
             "  {mark} {:<17} f = {:>9.2} px  [{:?}]\n       {}",
             e.method, e.focal_px, e.confidence, e.detail
@@ -531,7 +536,10 @@ fn cmd_init_cam(args: InitCamArgs) -> Result<()> {
     }
 
     initcam::write_result(&stage_dir, &result)?;
-    println!("\nWrote {} and cameras.toml", stage_dir.join("intrinsics.json").display());
+    println!(
+        "\nWrote {} and cameras.toml",
+        stage_dir.join("intrinsics.json").display()
+    );
 
     if args.apply {
         let cfg_path = Project::config_path(&project.root);
@@ -726,12 +734,25 @@ fn cmd_feature(args: FeatureArgs) -> Result<()> {
                         format!("camera \"{}\": unknown model {model_name}", cfg.name)
                     })?,
                 };
-                db.upsert_camera(&Camera { camera_id: id, model, width: w, height: h })?;
+                db.upsert_camera(&Camera {
+                    camera_id: id,
+                    model,
+                    width: w,
+                    height: h,
+                })?;
                 eprintln!(
                     "camera {id} \"{}\" ({model_name}{}){}",
                     cfg.name,
-                    if cfg.params.is_some() { ", known intrinsics" } else { "" },
-                    if cfg.refine == Some(false) { ", held fixed" } else { "" }
+                    if cfg.params.is_some() {
+                        ", known intrinsics"
+                    } else {
+                        ""
+                    },
+                    if cfg.refine == Some(false) {
+                        ", held fixed"
+                    } else {
+                        ""
+                    }
                 );
                 declared_ids.insert(which, id);
                 id
@@ -807,8 +828,15 @@ fn cmd_feature(args: FeatureArgs) -> Result<()> {
                 let kp = features.keypoints[i];
                 corner_rows.push(format!(
                     "{}_{}_{}_{}_{},{},{},{:.3},{:.3}",
-                    capture, d.camera_id, d.image_index, marker, corner,
-                    image_id, d.name, kp.x, kp.y
+                    capture,
+                    d.camera_id,
+                    d.image_index,
+                    marker,
+                    corner,
+                    image_id,
+                    d.name,
+                    kp.x,
+                    kp.y
                 ));
             }
         }
@@ -826,13 +854,15 @@ fn cmd_feature(args: FeatureArgs) -> Result<()> {
 
     if !corner_rows.is_empty() {
         let path = stage_dir.join("corners.csv");
-        let mut out =
-            String::from("feature_id,image_id,image_name,x,y\n");
+        let mut out = String::from("feature_id,image_id,image_name,x,y\n");
         out.push_str(&corner_rows.join("\n"));
         out.push('\n');
-        std::fs::write(&path, out)
-            .with_context(|| format!("writing {}", path.display()))?;
-        println!("Wrote {} fiducial corner ids to {}", corner_rows.len(), path.display());
+        std::fs::write(&path, out).with_context(|| format!("writing {}", path.display()))?;
+        println!(
+            "Wrote {} fiducial corner ids to {}",
+            corner_rows.len(),
+            path.display()
+        );
     }
 
     let payload = serde_json::json!({
@@ -886,7 +916,10 @@ fn merge_across_captures(
     // merges shot-for-shot rather than pooling them.
     let mut groups: std::collections::BTreeMap<(u32, u32), Vec<usize>> = Default::default();
     for (i, (d, ..)) in records.iter().enumerate() {
-        groups.entry((d.camera_id, d.image_index)).or_default().push(i);
+        groups
+            .entry((d.camera_id, d.image_index))
+            .or_default()
+            .push(i);
     }
 
     let mut out = Vec::with_capacity(groups.len());
@@ -897,7 +930,10 @@ fn merge_across_captures(
                 bail!(
                     "--merge-multicaps: camera {camera_id} slot {image_index} mixes image sizes \
                      ({}x{} vs {}x{}); merged images must come from the same unmoved camera",
-                    w, h, records[m].1, records[m].2
+                    w,
+                    h,
+                    records[m].1,
+                    records[m].2
                 );
             }
         }
@@ -916,7 +952,10 @@ fn merge_across_captures(
                     float_dim = *dim;
                     float_data.extend_from_slice(data);
                 }
-                sfm_core::Descriptors::Binary { bytes_per_descriptor, data } => {
+                sfm_core::Descriptors::Binary {
+                    bytes_per_descriptor,
+                    data,
+                } => {
                     binary_stride = *bytes_per_descriptor;
                     binary_data.extend_from_slice(data);
                 }
@@ -925,7 +964,10 @@ fn merge_across_captures(
         let descriptors = if !marker_data.is_empty() {
             sfm_core::Descriptors::MarkerCorner { data: marker_data }
         } else if !float_data.is_empty() {
-            sfm_core::Descriptors::Float32 { dim: float_dim, data: float_data }
+            sfm_core::Descriptors::Float32 {
+                dim: float_dim,
+                data: float_data,
+            }
         } else {
             sfm_core::Descriptors::Binary {
                 bytes_per_descriptor: binary_stride,
@@ -946,7 +988,10 @@ fn merge_across_captures(
             },
             w,
             h,
-            sfm_core::FeatureSet { keypoints, descriptors },
+            sfm_core::FeatureSet {
+                keypoints,
+                descriptors,
+            },
         ));
     }
     println!(
@@ -1040,8 +1085,9 @@ fn cmd_match(args: MatchArgs) -> Result<()> {
         .map(|&(i, j)| {
             let cam_i = &cameras[&images[i].1].model;
             let cam_j = &cameras[&images[j].1].model;
-            let out = sfm_match::match_and_verify(&features[i], &features[j], cam_i, cam_j, &params)
-                .map(|rec| (i, j, rec));
+            let out =
+                sfm_match::match_and_verify(&features[i], &features[j], cam_i, cam_j, &params)
+                    .map(|rec| (i, j, rec));
             reporter.tick();
             out
         })
@@ -1127,8 +1173,12 @@ fn cmd_map(args: MapArgs) -> Result<()> {
         };
         known_poses.insert(pc.image.as_str(), (pose, pc.fixed.unwrap_or(false)));
     }
-    let known_names: std::collections::HashSet<&str> =
-        project.config.poses.iter().map(|p| p.image.as_str()).collect();
+    let known_names: std::collections::HashSet<&str> = project
+        .config
+        .poses
+        .iter()
+        .map(|p| p.image.as_str())
+        .collect();
     let seen_names: std::collections::HashSet<&str> =
         images.iter().map(|(_, _, n, ..)| n.as_str()).collect();
     let mut missing: Vec<&&str> = known_names.difference(&seen_names).collect();

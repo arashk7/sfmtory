@@ -66,7 +66,10 @@ pub struct Plan {
 /// Reads `source` and works out where every image belongs. Creates nothing.
 pub fn plan(source: &Path, cfg: &LayoutConfig) -> Result<Plan> {
     if !source.is_dir() {
-        bail!("layout source directory does not exist: {}", source.display());
+        bail!(
+            "layout source directory does not exist: {}",
+            source.display()
+        );
     }
     if cfg.layers.is_empty() {
         bail!("[layout] layers is empty; it needs one entry per path level, e.g. layers = [\"capture\", \"camera\"]");
@@ -97,9 +100,18 @@ pub fn plan(source: &Path, cfg: &LayoutConfig) -> Result<Plan> {
     // misalign the moment a camera is missing from one capture, and silently:
     // the ids would still be dense and unique, just attached to the wrong
     // cameras.
-    let capture_keys: Vec<String> = files.iter().map(|f| key(f, &cfg.layers, Layer::Capture)).collect();
-    let camera_keys: Vec<String> = files.iter().map(|f| key(f, &cfg.layers, Layer::Camera)).collect();
-    let image_keys: Vec<String> = files.iter().map(|f| key(f, &cfg.layers, Layer::Image)).collect();
+    let capture_keys: Vec<String> = files
+        .iter()
+        .map(|f| key(f, &cfg.layers, Layer::Capture))
+        .collect();
+    let camera_keys: Vec<String> = files
+        .iter()
+        .map(|f| key(f, &cfg.layers, Layer::Camera))
+        .collect();
+    let image_keys: Vec<String> = files
+        .iter()
+        .map(|f| key(f, &cfg.layers, Layer::Image))
+        .collect();
     let capture_ids = assign_ids(&capture_keys);
     let camera_ids = assign_ids(&camera_keys);
 
@@ -174,8 +186,7 @@ pub fn plan(source: &Path, cfg: &LayoutConfig) -> Result<Plan> {
 
     let captures: BTreeSet<u32> = placed.iter().map(|p| p.capture_id).collect();
     let cameras: BTreeSet<u32> = placed.iter().map(|p| p.camera_id).collect();
-    let filled: BTreeSet<(u32, u32)> =
-        placed.iter().map(|p| (p.capture_id, p.camera_id)).collect();
+    let filled: BTreeSet<(u32, u32)> = placed.iter().map(|p| (p.capture_id, p.camera_id)).collect();
     let mut gaps: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     for cam in &cameras {
         let missing: Vec<u32> = captures
@@ -210,8 +221,7 @@ pub fn apply(plan: &Plan, target: &Path, force: bool) -> Result<usize> {
         std::fs::remove_dir_all(target)
             .with_context(|| format!("removing {}", target.display()))?;
     }
-    std::fs::create_dir_all(target)
-        .with_context(|| format!("creating {}", target.display()))?;
+    std::fs::create_dir_all(target).with_context(|| format!("creating {}", target.display()))?;
     // Canonical, so the relative paths below are computed against real
     // directories rather than whatever mixture of `.` and symlinks the caller
     // happened to pass in.
@@ -239,9 +249,8 @@ pub fn apply(plan: &Plan, target: &Path, force: bool) -> Result<usize> {
         // feature run with it. A relative link survives that, because the link
         // and its target move together.
         let link_target = relative_link(parent, &source).unwrap_or_else(|| source.clone());
-        symlink(&link_target, &dest).with_context(|| {
-            format!("linking {} -> {}", dest.display(), link_target.display())
-        })?;
+        symlink(&link_target, &dest)
+            .with_context(|| format!("linking {} -> {}", dest.display(), link_target.display()))?;
     }
     Ok(plan.placed.len())
 }
@@ -605,11 +614,7 @@ mod tests {
                 }
             }
         }
-        let p = plan(
-            &root,
-            &cfg(&[Layer::Capture, Layer::Camera, Layer::Image]),
-        )
-        .unwrap();
+        let p = plan(&root, &cfg(&[Layer::Capture, Layer::Camera, Layer::Image])).unwrap();
         assert_eq!(p.placed.len(), 12);
         assert_eq!(p.captures.len(), 2);
         assert_eq!(p.cameras.len(), 2);
@@ -641,11 +646,7 @@ mod tests {
         for cap in ["9", "16"] {
             touch(&root.join("session_a").join(cap).join("101.jpg"));
         }
-        let p = plan(
-            &root,
-            &cfg(&[Layer::Ignore, Layer::Capture, Layer::Camera]),
-        )
-        .unwrap();
+        let p = plan(&root, &cfg(&[Layer::Ignore, Layer::Capture, Layer::Camera])).unwrap();
         assert_eq!(p.captures, [9, 16].into_iter().collect());
         assert_eq!(p.cameras, [101].into_iter().collect());
         std::fs::remove_dir_all(&root).unwrap();
@@ -657,11 +658,7 @@ mod tests {
     fn a_depth_mismatch_is_reported_against_the_actual_file() {
         let root = tmp("depth");
         touch(&root.join("9").join("101.jpg"));
-        let err = plan(
-            &root,
-            &cfg(&[Layer::Capture, Layer::Camera, Layer::Image]),
-        )
-        .unwrap_err();
+        let err = plan(&root, &cfg(&[Layer::Capture, Layer::Camera, Layer::Image])).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("declares 3 level(s)"), "{msg}");
         assert!(msg.contains("is 2 level(s) deep"), "{msg}");
