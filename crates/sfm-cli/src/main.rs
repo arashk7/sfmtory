@@ -11,6 +11,7 @@ mod diagnostics;
 #[cfg(feature = "gui")]
 mod gui;
 mod initcam;
+mod layout;
 mod project;
 
 use std::collections::HashMap;
@@ -43,6 +44,11 @@ enum Commands {
     Project {
         #[command(subcommand)]
         action: ProjectAction,
+    },
+    /// Inspect and normalise the input image tree declared by `[layout]`.
+    Dataset {
+        #[command(subcommand)]
+        action: DatasetAction,
     },
     /// Open the viewer: 3D scene, camera inspection, and the pipeline stages.
     #[cfg(feature = "gui")]
@@ -91,6 +97,26 @@ enum ProjectAction {
         #[arg(long)]
         images: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum DatasetAction {
+    /// Build the normalised `capture_<n>/cam<n>/` symlink tree that the
+    /// pipeline reads, from the raw tree and the `[layout]` in sfm.toml.
+    Link(DatasetLinkArgs),
+}
+
+#[derive(clap::Args)]
+struct DatasetLinkArgs {
+    /// Project directory. Defaults to the current directory.
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+    /// Report the mapping without creating anything.
+    #[arg(long)]
+    dry_run: bool,
+    /// Replace an existing link tree.
+    #[arg(long)]
+    force: bool,
 }
 
 #[cfg(feature = "gui")]
@@ -298,6 +324,9 @@ fn main() -> Result<()> {
         Commands::Project { action } => match action {
             ProjectAction::New { dir, images } => cmd_project_new(&dir, &images),
         },
+        Commands::Dataset { action } => match action {
+            DatasetAction::Link(args) => cmd_dataset_link(args),
+        },
         #[cfg(feature = "gui")]
         Commands::Gui(args) => gui::launch(args.project, args.view.into()),
         Commands::InitCam(args) => cmd_init_cam(args),
@@ -344,12 +373,87 @@ fn default_camera_model(name: &str, w: u32, h: u32) -> Option<CameraModel> {
     CameraModel::from_name_and_params(name, &params)
 }
 
+fn cmd_dataset_link(args: DatasetLinkArgs) -> Result<()> {
+    let started = Instant::now();
+    let project = Project::open(&args.project)?;
+    let Some(cfg) = project.config.layout.clone() else {
+        bail!(
+            "{} declares no [layout], so there is nothing to normalise.\n\
+             Add one when the dataset's directory shape cannot be inferred - for a rig \
+             dumping one directory per capture and one file per camera:\n\n\
+             [layout]\n\
+             capture = \"dir\"\n\
+             camera = \"stem\"\n",
+            Project::config_path(&project.root).display()
+        );
+    };
+    let source = cfg.source_dir(&project.root, &project.config.images_dir);
+    let plan = layout::plan(&source, &cfg)?;
+
+    println!("Source {}", source.display());
+    println!(
+        "  {} captures x {} cameras -> {} images",
+        plan.captures.len(),
+        plan.cameras.len(),
+        plan.placed.len()
+    );
+    let full = plan.captures.len() * plan.cameras.len();
+    if plan.placed.len() != full {
+        println!(
+            "  {} of {} (capture, camera) slots are filled",
+            plan.placed.len(),
+            full
+        );
+    }
+    // A camera missing from some captures is worth naming: it is exactly the
+    // multi-capture redundancy the layout exists to provide, quietly reduced.
+    if !plan.gaps.is_empty() {
+        println!(
+            "  {} camera(s) are absent from at least one capture:",
+            plan.gaps.len()
+        );
+        for (cam, missing) in plan.gaps.iter().take(10) {
+            println!("    camera {cam} missing from capture(s) {missing:?}");
+        }
+        if plan.gaps.len() > 10 {
+            println!("    ... and {} more", plan.gaps.len() - 10);
+        }
+    }
+    for p in plan.placed.iter().take(3) {
+        println!("  e.g. {} -> {}", p.source.display(), p.link.display());
+    }
+
+    if args.dry_run {
+        println!("\nDry run: nothing written. Re-run without --dry-run to build the tree.");
+        return Ok(());
+    }
+
+    let target = project.linked_images_dir();
+    let n = layout::apply(&plan, &target, args.force)?;
+    println!("\nLinked {n} image(s) into {}", target.display());
+    println!("Stages will now read that tree; re-run this after the raw dataset changes.");
+
+    let payload = serde_json::json!({
+        "stage": "dataset-link",
+        "status": "ok",
+        "source": source.display().to_string(),
+        "target": target.display().to_string(),
+        "num_captures": plan.captures.len(),
+        "num_cameras": plan.cameras.len(),
+        "num_images": plan.placed.len(),
+        "num_cameras_with_gaps": plan.gaps.len(),
+        "elapsed_ms": started.elapsed().as_millis(),
+    });
+    project.record_log("dataset-link", &payload)?;
+    Ok(())
+}
+
 fn cmd_init_cam(args: InitCamArgs) -> Result<()> {
     let started = Instant::now();
     let project = Project::open(&args.project)?;
     let stage_dir = project.prepare_stage("init-cam")?;
 
-    let (discovered, _layout) = dataset::discover(&project.config.images_dir)?;
+    let (discovered, _layout) = dataset::discover(&project.require_images_dir()?)?;
     let stride = (discovered.len() / (args.samples as usize).max(1)).max(1);
     let picked: Vec<&dataset::DiscoveredImage> = discovered
         .iter()
@@ -360,7 +464,7 @@ fn cmd_init_cam(args: InitCamArgs) -> Result<()> {
         "Estimating intrinsics from {} of {} images in {}",
         picked.len(),
         discovered.len(),
-        project.config.images_dir.display()
+        project.effective_images_dir().display()
     );
 
     let mut samples = Vec::new();
@@ -479,7 +583,7 @@ fn cmd_feature(args: FeatureArgs) -> Result<()> {
         eprintln!("note: --gpu has no effect for {:?} (classical CPU detector); GPU is used for the learned `disk` detector", args.detector);
     }
 
-    let (discovered, layout) = dataset::discover(&project.config.images_dir)?;
+    let (discovered, layout) = dataset::discover(&project.require_images_dir()?)?;
     let num_captures = discovered
         .iter()
         .map(|d| d.capture_id)
@@ -494,7 +598,7 @@ fn cmd_feature(args: FeatureArgs) -> Result<()> {
         "Found {} images ({:?} layout: {num_captures} capture(s), {num_phys_cameras} camera(s)) in {}",
         discovered.len(),
         layout,
-        project.config.images_dir.display()
+        project.effective_images_dir().display()
     );
 
     let mut config = match args.max_features {

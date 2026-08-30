@@ -6,6 +6,7 @@
 //!   images/             # default input location
 //!   cache/
 //!     project.sqlite    # shared working store (features, matches)
+//!     dataset/images/   # `sfmtory dataset link` symlink tree, when [layout] is set
 //!     feature/          # `sfmtory feature` output + learned ArUco params
 //!     match/            # `sfmtory match` output
 //!     map/sparse/0/     # `sfmtory map` output (COLMAP text model)
@@ -46,6 +47,64 @@ pub struct ProjectConfig {
     /// Known camera poses, used to initialize (and optionally pin) extrinsics.
     #[serde(default)]
     pub poses: Vec<PoseConfig>,
+    /// How to read a dataset whose directory shape `dataset::discover` cannot
+    /// infer. Absent for the three layouts it recognises on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<LayoutConfig>,
+}
+
+/// Declares where capture and camera identity live in a dataset's own naming,
+/// for layouts `dataset::discover` cannot tell apart by shape alone.
+///
+/// The ambiguous case that motivates this: `images/A/*.jpg` is equally
+/// consistent with "A is one camera that took many shots" and "A is one
+/// capture in which each file is a different camera". Discovery assumes the
+/// former, because it has to assume something; a rig dumping one file per
+/// camera per shot needs the latter, and no amount of inspecting the tree can
+/// settle which was meant. So it is declared rather than guessed.
+///
+/// `sfmtory dataset link` reads this and materialises the canonical
+/// `capture_<n>/cam<n>/` tree that discovery already understands, so the
+/// declaration affects one command rather than threading a special case
+/// through every stage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayoutConfig {
+    /// Raw image tree, relative to the project root (or absolute). Defaults to
+    /// `images_dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<PathBuf>,
+    /// Where each image's capture identity comes from.
+    pub capture: IdSource,
+    /// Where each image's camera identity comes from.
+    pub camera: IdSource,
+}
+
+/// Which part of a file's path carries an id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IdSource {
+    /// The name of the directory immediately containing the image.
+    Dir,
+    /// The image's file name without its extension.
+    Stem,
+    /// Not distinguished: every image shares a single id.
+    None,
+}
+
+impl LayoutConfig {
+    /// The raw tree this layout reads from.
+    ///
+    /// Relative paths resolve against the project root rather than the working
+    /// directory, so `--project <elsewhere>` behaves the same as running from
+    /// inside the project.
+    pub fn source_dir(&self, root: &Path, images_dir: &Path) -> PathBuf {
+        let p = self.source.as_deref().unwrap_or(images_dir);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            root.join(p)
+        }
+    }
 }
 
 /// One declared physical camera: which images belong to it, and optionally
@@ -138,6 +197,42 @@ impl Project {
         self.stage_dir("map").join("sparse").join("0")
     }
 
+    /// Where `sfmtory dataset link` writes its normalised symlink tree.
+    ///
+    /// Under `cache/` because it is derived data that can be regenerated from
+    /// the raw tree and the `[layout]` declaration at any time - the same
+    /// reason the feature database lives there.
+    pub fn linked_images_dir(&self) -> PathBuf {
+        self.cache_dir().join("dataset").join("images")
+    }
+
+    /// The image tree the pipeline stages should actually read.
+    ///
+    /// With a `[layout]` declared this is the linked tree, not the raw one:
+    /// the raw tree is by definition in a shape discovery would misread, which
+    /// is why the declaration exists.
+    pub fn effective_images_dir(&self) -> PathBuf {
+        if self.config.layout.is_some() {
+            self.linked_images_dir()
+        } else {
+            self.config.images_dir.clone()
+        }
+    }
+
+    /// Explains that the linked tree has not been built yet, rather than
+    /// letting discovery fail with a bare "directory does not exist".
+    pub fn require_images_dir(&self) -> Result<PathBuf> {
+        let dir = self.effective_images_dir();
+        if self.config.layout.is_some() && !dir.is_dir() {
+            anyhow::bail!(
+                "sfm.toml declares a [layout], but its linked image tree is missing at {}.\n\
+                 Run `sfmtory dataset link` to build it.",
+                dir.display()
+            );
+        }
+        Ok(dir)
+    }
+
     /// Default input location when `sfm.toml` doesn't say otherwise.
     pub fn default_images_dir(root: &Path) -> PathBuf {
         root.join("images")
@@ -180,6 +275,7 @@ impl Project {
             pipeline: None,
             cameras: Vec::new(),
             poses: Vec::new(),
+            layout: None,
         };
         let toml_str = toml::to_string_pretty(&config)?;
         fs::write(Self::config_path(root), toml_str)?;
@@ -213,6 +309,7 @@ impl Project {
                 pipeline: None,
                 cameras: Vec::new(),
                 poses: Vec::new(),
+                layout: None,
             },
             Err(e) => {
                 return Err(e).with_context(|| format!("reading {}", config_path.display()))

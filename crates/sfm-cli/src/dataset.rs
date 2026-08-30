@@ -10,6 +10,14 @@
 //! images/cam000_image.jpg               # flat files
 //! ```
 //!
+//! A fourth shape exists and is deliberately *not* inferred here: one
+//! directory per capture holding one file per camera. It is indistinguishable
+//! by shape from the cameras-only case above - `images/A/*.jpg` is equally
+//! consistent with "A is a camera with many shots" and "A is a capture with
+//! one shot per camera" - so guessing would silently reinterpret existing
+//! datasets. It is declared in `sfm.toml`'s `[layout]` instead and normalised
+//! into the first shape by `sfmtory dataset link`; see `crate::layout`.
+//!
 //! The distinction matters well beyond bookkeeping. `capture_id` is what keeps
 //! a fiducial marker that was *physically moved between captures* from being
 //! matched to itself across them (see `sfm-features::aruco`), and

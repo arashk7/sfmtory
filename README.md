@@ -139,6 +139,57 @@ images/cam000_image.jpg                # flat, optional camNNN_ prefix
 Camera ids follow the numbers in your directory names (`cam007` → camera 7)
 and fall back to sorted order for non-numeric names like `left/`, `right/`.
 
+#### Declaring a layout that can't be inferred
+
+One shape is deliberately *not* guessed: a rig that dumps **one directory per
+capture, with one file per camera inside it**.
+
+```text
+images/9/101.jpg      capture 9,  camera 101
+images/9/102.jpg      capture 9,  camera 102
+images/16/101.jpg     capture 16, camera 101
+```
+
+This is byte-for-byte the same directory shape as `images/<camera>/<shot>.jpg`
+above, which is read the other way round. Nothing in the tree can settle which
+was meant, so guessing would silently reinterpret existing datasets. Declare it
+instead:
+
+```toml
+# sfm.toml
+[layout]
+capture = "dir"     # capture id from the directory name
+camera  = "stem"    # camera id from the file name
+# source = "images" # optional; defaults to images_dir
+```
+
+`dir`, `stem` and `none` are the available sources for each, so the transpose
+(`capture = "stem"`, `camera = "dir"`) works too. Then build the normalised
+tree once:
+
+```bash
+sfmtory dataset link --dry-run   # report the mapping, write nothing
+sfmtory dataset link             # build cache/dataset/images/
+```
+
+That materialises `cache/dataset/images/capture_<n>/cam<n>/` as **symlinks** —
+no image is copied — and every stage reads it from then on. Re-run it after the
+raw dataset changes. Ids keep your own numbering (`9/101.jpg` → capture 9,
+camera 101), and camera ids are assigned across the whole dataset rather than
+per directory, so one camera keeps one id even when it is missing from some
+captures. Cameras with such gaps are reported, since they quietly weaken the
+multi-capture redundancy the layout exists to provide.
+
+This is the shape `--merge-multicaps` was written for — a fixed rig
+photographing a target that moves between captures:
+
+```bash
+sfmtory feature --detector aruco --merge-multicaps
+```
+
+The **Dataset layout** section in the left panel of `sfmtory gui` writes the
+`[layout]` block and runs the link for you.
+
 ### Fiducial markers
 
 ```bash
@@ -287,8 +338,9 @@ it.
     observations as a clickable list. A mean hides whether a model is
     uniformly decent or mostly excellent with a few broken points, so the
     panel says which.
-- **Left panel** browses the current directory; double-click a folder to make
-  it the active project.
+- **Left panel** browses the current directory (double-click a folder to make
+  it the active project) and carries a **Dataset layout** section for declaring
+  and building the `[layout]` symlink tree — see *Input layouts*.
 - **Top bar** runs `init-cam`, `feature`, `match`, `map`, `export` and `eval`
   with the main options exposed as dropdowns. Output streams into a log pane,
   and the model reloads automatically when a stage finishes.

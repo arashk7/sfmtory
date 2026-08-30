@@ -118,6 +118,10 @@ struct App {
     show_residual_vectors: bool,
     image_zoom: f32,
     image_pan: egui::Vec2,
+    /// `[layout]` editor state: index into `ID_SOURCES` for capture and camera.
+    layout_capture: usize,
+    layout_camera: usize,
+    layout_note: Option<String>,
     /// Stage options mirrored from the CLI's own defaults.
     detector: usize,
     pairing: usize,
@@ -129,6 +133,8 @@ const DETECTORS: [&str; 4] = ["sift", "aruco", "orb", "disk"];
 const PAIRINGS: [&str; 3] = ["exhaustive", "sequential", "vocab-tree"];
 const PIPELINES: [&str; 2] = ["incremental", "global"];
 const EXPORTS: [&str; 2] = ["colmap-text", "nerf-transforms"];
+/// The `project::IdSource` variants as `sfm.toml` spells them.
+const ID_SOURCES: [&str; 3] = ["dir", "stem", "none"];
 
 /// Distinct hues for connected components in the match graph.
 const COMPONENT_COLORS: [egui::Color32; 8] = [
@@ -186,6 +192,11 @@ impl App {
             show_residual_vectors: true,
             image_zoom: 1.0,
             image_pan: egui::Vec2::ZERO,
+            // Defaults to the rig case the declaration exists for: one
+            // directory per capture, one file per camera.
+            layout_capture: 0,
+            layout_camera: 1,
+            layout_note: None,
             detector: 0,
             pairing: 0,
             pipeline_kind: 0,
@@ -428,6 +439,8 @@ impl App {
                     }
                 }
                 ui.separator();
+                self.layout_section(ui);
+                ui.separator();
                 egui::ScrollArea::vertical()
                     .id_salt("tree")
                     .show(ui, |ui| {
@@ -435,6 +448,127 @@ impl App {
                         self.dir_tree(ui, &root, 0);
                     });
             });
+    }
+
+    /// Declare and build the `[layout]` symlink tree without leaving the
+    /// viewer.
+    ///
+    /// Writing `sfm.toml` from here follows the precedent `init-cam --apply`
+    /// set, including its refusal to overwrite a section that already exists -
+    /// a config file is the user's, and silently rewriting one is worse than
+    /// asking them to edit it.
+    fn layout_section(&mut self, ui: &mut egui::Ui) {
+        let project = Project::open(&self.project).ok();
+        let declared = project
+            .as_ref()
+            .and_then(|p| p.config.layout.as_ref())
+            .is_some();
+        let linked = project
+            .as_ref()
+            .map(|p| p.linked_images_dir().is_dir())
+            .unwrap_or(false);
+
+        egui::CollapsingHeader::new("Dataset layout")
+            .default_open(declared && !linked)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "For a dataset whose folder shape cannot be inferred - a rig                          dumping one folder per capture and one file per camera, say.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                match (declared, linked) {
+                    (false, _) => {
+                        ui.label("no [layout] declared - the usual case");
+                    }
+                    (true, true) => {
+                        ui.label(
+                            egui::RichText::new("[layout] declared, link tree built")
+                                .color(ok_color()),
+                        );
+                    }
+                    (true, false) => {
+                        ui.label(
+                            egui::RichText::new(
+                                "[layout] declared but not linked yet - run Link",
+                            )
+                            .color(warn_color()),
+                        );
+                    }
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("capture from");
+                    egui::ComboBox::from_id_salt("laycap")
+                        .selected_text(ID_SOURCES[self.layout_capture])
+                        .width(70.0)
+                        .show_ui(ui, |ui| {
+                            for (i, name) in ID_SOURCES.iter().enumerate() {
+                                ui.selectable_value(&mut self.layout_capture, i, *name);
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("camera from ");
+                    egui::ComboBox::from_id_salt("laycam")
+                        .selected_text(ID_SOURCES[self.layout_camera])
+                        .width(70.0)
+                        .show_ui(ui, |ui| {
+                            for (i, name) in ID_SOURCES.iter().enumerate() {
+                                ui.selectable_value(&mut self.layout_camera, i, *name);
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Write to sfm.toml").clicked() {
+                        self.layout_note = Some(match self.write_layout() {
+                            Ok(path) => format!("wrote [layout] to {}", path.display()),
+                            Err(e) => format!("{e}"),
+                        });
+                    }
+                    let busy = self.run.is_running();
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Link"))
+                        .on_hover_text("runs `sfmtory dataset link --force`")
+                        .clicked()
+                    {
+                        self.run.spawn(
+                            &self.project,
+                            vec!["dataset".into(), "link".into(), "--force".into()],
+                        );
+                    }
+                });
+                if let Some(note) = &self.layout_note {
+                    ui.label(egui::RichText::new(note).small());
+                }
+            });
+    }
+
+    /// Appends a `[layout]` block to the project's `sfm.toml`.
+    fn write_layout(&self) -> Result<PathBuf> {
+        let path = Project::config_path(&self.project);
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        if existing.contains("[layout]") {
+            anyhow::bail!(
+                "{} already declares [layout]; edit it by hand instead",
+                path.display()
+            );
+        }
+        let images_line = if existing.trim().is_empty() {
+            "images_dir = \"images\"\n\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "{existing}{images_line}\n[layout]\ncapture = \"{}\"\ncamera = \"{}\"\n",
+                ID_SOURCES[self.layout_capture],
+                ID_SOURCES[self.layout_camera],
+            ),
+        )?;
+        Ok(path)
     }
 
     fn dir_tree(&mut self, ui: &mut egui::Ui, dir: &Path, depth: usize) {
@@ -1311,7 +1445,7 @@ impl App {
                 Ok(p) => match imageview::load(
                     ctx,
                     &self.project,
-                    &p.config.images_dir,
+                    &p.effective_images_dir(),
                     image_id,
                     &name,
                 ) {
