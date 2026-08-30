@@ -138,22 +138,66 @@ pub fn apply(plan: &Plan, target: &Path, force: bool) -> Result<usize> {
         std::fs::remove_dir_all(target)
             .with_context(|| format!("removing {}", target.display()))?;
     }
+    std::fs::create_dir_all(target)
+        .with_context(|| format!("creating {}", target.display()))?;
+    // Canonical, so the relative paths below are computed against real
+    // directories rather than whatever mixture of `.` and symlinks the caller
+    // happened to pass in.
+    let root = target
+        .canonicalize()
+        .with_context(|| format!("resolving {}", target.display()))?;
+
     for p in &plan.placed {
-        let dest = target.join(&p.link);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        // Absolute targets, so the tree keeps working regardless of where it
-        // is read from or how deep the link sits.
+        let dest = root.join(&p.link);
+        let parent = dest
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("link {} has no parent", dest.display()))?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
         let source = p
             .source
             .canonicalize()
             .with_context(|| format!("resolving {}", p.source.display()))?;
-        symlink(&source, &dest)
-            .with_context(|| format!("linking {} -> {}", dest.display(), source.display()))?;
+        // Relative where possible, absolute only as a fallback.
+        //
+        // This is not a style preference. An absolute target breaks the moment
+        // any ancestor the two share is renamed - measured the hard way: a
+        // 965-image tree was linked absolutely, the dataset directory was
+        // renamed hours later, and every link died at once, taking a long
+        // feature run with it. A relative link survives that, because the link
+        // and its target move together.
+        let link_target = relative_link(parent, &source).unwrap_or_else(|| source.clone());
+        symlink(&link_target, &dest).with_context(|| {
+            format!("linking {} -> {}", dest.display(), link_target.display())
+        })?;
     }
     Ok(plan.placed.len())
+}
+
+/// Path from `from_dir` to `to`, both absolute, as `../..`-style components.
+///
+/// `None` when they share no common root (different Windows prefixes, say),
+/// which is the only case an absolute link is actually the better answer.
+fn relative_link(from_dir: &Path, to: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let from: Vec<Component> = from_dir.components().collect();
+    let to_c: Vec<Component> = to.components().collect();
+    if from.first() != to_c.first() {
+        return None;
+    }
+    let common = from
+        .iter()
+        .zip(to_c.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut out = PathBuf::new();
+    for _ in common..from.len() {
+        out.push("..");
+    }
+    for c in &to_c[common..] {
+        out.push(c);
+    }
+    Some(out)
 }
 
 #[cfg(unix)]
@@ -403,5 +447,71 @@ mod tests {
         assert!(apply(&p, &target, false).is_err());
         assert_eq!(apply(&p, &target, true).unwrap(), 4);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Renaming the dataset directory must not break the tree.
+    ///
+    /// Regression test for a real failure: the first implementation wrote
+    /// absolute link targets, the dataset directory was renamed a few hours
+    /// later, and all 965 links broke at once - surfacing only as a long
+    /// feature run dying partway through on a missing file.
+    #[test]
+    fn the_tree_survives_the_dataset_being_renamed() {
+        let base = tmp("rename");
+        let before = base.join("p44");
+        let src = before.join("images");
+        for cap in ["9", "16"] {
+            for cam in ["101", "102"] {
+                touch(&src.join(cap).join(format!("{cam}.jpg")));
+            }
+        }
+        let p = plan(&src, &cfg(IdSource::Dir, IdSource::Stem)).unwrap();
+        let target = before.join("cache/dataset/images");
+        assert_eq!(apply(&p, &target, false).unwrap(), 4);
+
+        // The link must not mention the directory that is about to move.
+        let one = target.join("capture_009/cam101/101.jpg");
+        let stored = std::fs::read_link(&one).unwrap();
+        assert!(
+            stored.is_relative(),
+            "link target must be relative, got {}",
+            stored.display()
+        );
+
+        let after = base.join("scan");
+        std::fs::rename(&before, &after).unwrap();
+
+        let moved = after.join("cache/dataset/images");
+        for cap in ["capture_009", "capture_016"] {
+            for cam in ["cam101", "cam102"] {
+                let link = moved.join(cap).join(cam);
+                let file = std::fs::read_dir(&link).unwrap().next().unwrap().unwrap();
+                assert!(
+                    file.path().exists(),
+                    "{} broke when the dataset was renamed",
+                    file.path().display()
+                );
+            }
+        }
+        // And discovery still reads the moved tree.
+        let (imgs, layout) = crate::dataset::discover(&moved).unwrap();
+        assert_eq!(layout, crate::dataset::Layout::CapturesAndCameras);
+        assert_eq!(imgs.len(), 4);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn relative_link_walks_up_to_the_common_ancestor() {
+        let from = Path::new("/a/b/cache/dataset/images/capture_009/cam101");
+        let to = Path::new("/a/b/images/9/101.jpg");
+        assert_eq!(
+            relative_link(from, to).unwrap(),
+            PathBuf::from("../../../../../images/9/101.jpg")
+        );
+        // Same directory needs no traversal at all.
+        assert_eq!(
+            relative_link(Path::new("/a/b"), Path::new("/a/b/x.jpg")).unwrap(),
+            PathBuf::from("x.jpg")
+        );
     }
 }
