@@ -207,6 +207,20 @@ The **Dataset layout** section in the left panel of `sfmtory gui` probes the
 tree's actual depth, offers one role dropdown per level, writes the `[layout]`
 block and runs the link for you.
 
+### Which marker family?
+
+The detector works with a board printed from **any** square-fiducial family and
+does not need that family's dictionary. A marker's id is its own bit pattern,
+reduced to the smallest of its four rotations, so the same physical marker gets
+the same id in every frame and from every angle — which is what correspondence
+needs. The number of data cells per side (4x4, 5x5, 6x6, 7x7) is measured per
+frame rather than assumed.
+
+The one thing this cannot do is recover the number *printed beside* a marker:
+that needs the family's own table, and nothing in the image determines it. If
+you print from `sfmtory`'s own generated dictionary, set
+`dictionary_free = false` to match against it and get error correction instead.
+
 ### Trying the ArUco detector on one image
 
 ```bash
@@ -215,7 +229,7 @@ sfmtory gui --view aruco
 
 Picks any frame from the dataset, runs detection with live parameter sliders
 (adaptive radius and threshold, minimum component size and perimeter, Hamming
-bound, contrast, gamma) and draws what it found: each marker's quad in a
+bound, contrast, gamma, and the marker family) and draws what it found: each marker's quad in a
 per-id colour with corner 0 marked and the id at the centre, plus decode and
 detect timings. Use it to see *why* a frame finds nothing before committing to
 a sweep; `sfmtory feature --detector aruco --find-params` then searches the

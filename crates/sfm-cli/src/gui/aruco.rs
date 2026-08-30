@@ -29,6 +29,8 @@ pub struct Marker {
 
 pub struct Detection {
     pub markers: Vec<Marker>,
+    /// Data cells per side that the detector inferred for this frame.
+    pub family: Option<usize>,
     pub num_corners: usize,
     pub decode: Duration,
     pub detect: Duration,
@@ -94,6 +96,7 @@ impl Tester {
                 let fs = sfm_features::aruco::detect(&img, &params);
                 let detect = t1.elapsed();
                 Ok(Detection {
+                    family: sfm_features::aruco::detect_family(&img, &params),
                     markers: group_markers(&fs),
                     num_corners: fs.keypoints.len(),
                     decode,

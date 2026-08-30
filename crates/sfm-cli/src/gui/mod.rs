@@ -1870,6 +1870,38 @@ impl App {
             changed |= ui
                 .add(egui::Slider::new(&mut p.gamma, 0.3..=3.0).text("gamma"))
                 .changed();
+            ui.separator();
+            // Family is detected per frame by default; pinning it is for when
+            // a board's markers are too small or blurred to vote reliably.
+            let mut pinned = p.data_bits.unwrap_or(0);
+            egui::ComboBox::from_id_salt("databits")
+                .selected_text(match p.data_bits {
+                    None => "family: auto".to_string(),
+                    Some(n) => format!("family: {n}x{n}"),
+                })
+                .width(120.0)
+                .show_ui(ui, |ui| {
+                    if ui.selectable_value(&mut pinned, 0, "auto").clicked() {
+                        p.data_bits = None;
+                        changed = true;
+                    }
+                    for n in sfm_features::aruco::CANDIDATE_DATA_BITS {
+                        if ui
+                            .selectable_value(&mut pinned, n, format!("{n}x{n}"))
+                            .clicked()
+                        {
+                            p.data_bits = Some(n);
+                            changed = true;
+                        }
+                    }
+                });
+            changed |= ui
+                .checkbox(&mut p.dictionary_free, "id from pattern")
+                .on_hover_text(
+                    "off: match this crate's own generated dictionary instead \
+                     (only for markers printed from it)",
+                )
+                .changed();
             // Re-detect on release rather than per-frame: a 12MP detection is
             // ~0.3s, so tracking every intermediate slider value would queue up
             // work the user never asked to see.
@@ -1987,9 +2019,13 @@ impl App {
                     }
                 }
                 format!(
-                    "{} marker(s), {} corners   ·   decode {}  detect {}   ·   {:.0}x{:.0}",
+                    "{} marker(s), {} corners   ·   family {}   ·   decode {}  detect {}   ·   {:.0}x{:.0}",
                     d.markers.len(),
                     d.num_corners,
+                    match d.family {
+                        Some(n) => format!("{n}x{n}"),
+                        None => "none found".into(),
+                    },
                     crate::progress::human_secs(d.decode.as_secs_f64()),
                     crate::progress::human_secs(d.detect.as_secs_f64()),
                     d.source_size[0],
