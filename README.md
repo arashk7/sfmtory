@@ -158,13 +158,29 @@ instead:
 ```toml
 # sfm.toml
 [layout]
-capture = "dir"     # capture id from the directory name
-camera  = "stem"    # camera id from the file name
-# source = "images" # optional; defaults to images_dir
+layers = ["capture", "camera"]
+# source = "images"   # optional; defaults to images_dir
 ```
 
-`dir`, `stem` and `none` are the available sources for each, so the transpose
-(`capture = "stem"`, `camera = "dir"`) works too. Then build the normalised
+`layers` names **one role per level of the path**, outermost first, ending with
+the file itself — so the declaration reads in the same order as the path it
+describes, and the same rule covers any depth:
+
+| dataset | `layers` |
+|---|---|
+| `images/9/101.jpg` | `["capture", "camera"]` |
+| `images/cap0/cam0/0001.jpg` | `["capture", "camera", "image"]` |
+| `images/cam0/0001.jpg` | `["camera", "image"]` |
+| `images/session/9/101.jpg` | `["ignore", "capture", "camera"]` |
+
+The roles are `capture`, `camera`, `image` (a shot within one camera, which
+becomes its slot index) and `ignore` (a wrapper level carrying no identity).
+Order is free, so the transpose — camera directories holding one file per
+capture — is just `["camera", "capture"]`. A level you omit simply isn't
+distinguished: with no `capture` level everything lands in one capture.
+
+If the declared depth doesn't match the tree, you get an error naming the file
+and both depths rather than silently misaligned ids. Then build the normalised
 tree once:
 
 ```bash
@@ -187,8 +203,26 @@ photographing a target that moves between captures:
 sfmtory feature --detector aruco --merge-multicaps
 ```
 
-The **Dataset layout** section in the left panel of `sfmtory gui` writes the
-`[layout]` block and runs the link for you.
+The **Dataset layout** section in the left panel of `sfmtory gui` probes the
+tree's actual depth, offers one role dropdown per level, writes the `[layout]`
+block and runs the link for you.
+
+### Progress on long stages
+
+`feature` and `match` both report progress to stderr as they go — item count,
+percentage, elapsed time, ETA, and throughput in whichever direction reads
+better:
+
+```
+feature: 0/965 starting
+feature: 9/965   0.9%  elapsed 1m58s  eta 3h29m  (13.1 s each)
+...
+feature: detection finished in 3h31m
+```
+
+This matters more than it sounds: `match --pairing exhaustive` is quadratic in
+image count, so 965 images is 465k pairs, and a run that would need another
+three hours used to be indistinguishable from a hung one.
 
 ### Fiducial markers
 

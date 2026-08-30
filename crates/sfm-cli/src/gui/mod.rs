@@ -118,9 +118,11 @@ struct App {
     show_residual_vectors: bool,
     image_zoom: f32,
     image_pan: egui::Vec2,
-    /// `[layout]` editor state: index into `ID_SOURCES` for capture and camera.
-    layout_capture: usize,
-    layout_camera: usize,
+    /// `[layout]` editor: one `LAYER_ROLES` index per path level. Sized from
+    /// the source tree's actual depth the first time the section is drawn, so
+    /// the user assigns roles to levels that exist rather than counting
+    /// directories themselves.
+    layout_layers: Vec<usize>,
     layout_note: Option<String>,
     /// Stage options mirrored from the CLI's own defaults.
     detector: usize,
@@ -133,8 +135,8 @@ const DETECTORS: [&str; 4] = ["sift", "aruco", "orb", "disk"];
 const PAIRINGS: [&str; 3] = ["exhaustive", "sequential", "vocab-tree"];
 const PIPELINES: [&str; 2] = ["incremental", "global"];
 const EXPORTS: [&str; 2] = ["colmap-text", "nerf-transforms"];
-/// The `project::IdSource` variants as `sfm.toml` spells them.
-const ID_SOURCES: [&str; 3] = ["dir", "stem", "none"];
+/// The `project::Layer` roles as `sfm.toml` spells them.
+const LAYER_ROLES: [&str; 4] = ["capture", "camera", "image", "ignore"];
 
 /// Distinct hues for connected components in the match graph.
 const COMPONENT_COLORS: [egui::Color32; 8] = [
@@ -192,10 +194,7 @@ impl App {
             show_residual_vectors: true,
             image_zoom: 1.0,
             image_pan: egui::Vec2::ZERO,
-            // Defaults to the rig case the declaration exists for: one
-            // directory per capture, one file per camera.
-            layout_capture: 0,
-            layout_camera: 1,
+            layout_layers: Vec::new(),
             layout_note: None,
             detector: 0,
             pairing: 0,
@@ -498,28 +497,54 @@ impl App {
                     }
                 }
                 ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("capture from");
-                    egui::ComboBox::from_id_salt("laycap")
-                        .selected_text(ID_SOURCES[self.layout_capture])
-                        .width(70.0)
-                        .show_ui(ui, |ui| {
-                            for (i, name) in ID_SOURCES.iter().enumerate() {
-                                ui.selectable_value(&mut self.layout_capture, i, *name);
+                // Size the editor from the tree itself: the number of levels
+                // is a fact about the dataset, not a choice.
+                if self.layout_layers.is_empty() {
+                    let depth = project
+                        .as_ref()
+                        .and_then(|p| {
+                            let src = p
+                                .config
+                                .layout
+                                .as_ref()
+                                .map(|l| l.source_dir(&p.root, &p.config.images_dir))
+                                .unwrap_or_else(|| p.config.images_dir.clone());
+                            crate::layout::probe_depth(&src)
+                        })
+                        .unwrap_or(2);
+                    // Guess the common case: the innermost level is the camera
+                    // and the outermost the capture, everything between ignored.
+                    self.layout_layers = (0..depth)
+                        .map(|i| {
+                            if i == 0 {
+                                0
+                            } else if i + 1 == depth {
+                                1
+                            } else {
+                                3
                             }
-                        });
-                });
-                ui.horizontal(|ui| {
-                    ui.label("camera from ");
-                    egui::ComboBox::from_id_salt("laycam")
-                        .selected_text(ID_SOURCES[self.layout_camera])
-                        .width(70.0)
-                        .show_ui(ui, |ui| {
-                            for (i, name) in ID_SOURCES.iter().enumerate() {
-                                ui.selectable_value(&mut self.layout_camera, i, *name);
-                            }
-                        });
-                });
+                        })
+                        .collect();
+                }
+                for i in 0..self.layout_layers.len() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("level {}", i + 1));
+                        let last = i + 1 == self.layout_layers.len();
+                        ui.label(
+                            egui::RichText::new(if last { "(file)" } else { "(dir) " })
+                                .small()
+                                .weak(),
+                        );
+                        egui::ComboBox::from_id_salt(("layer", i))
+                            .selected_text(LAYER_ROLES[self.layout_layers[i]])
+                            .width(90.0)
+                            .show_ui(ui, |ui| {
+                                for (k, name) in LAYER_ROLES.iter().enumerate() {
+                                    ui.selectable_value(&mut self.layout_layers[i], k, *name);
+                                }
+                            });
+                    });
+                }
                 ui.horizontal(|ui| {
                     if ui.button("Write to sfm.toml").clicked() {
                         self.layout_note = Some(match self.write_layout() {
@@ -560,13 +585,15 @@ impl App {
         } else {
             ""
         };
+        let layers = self
+            .layout_layers
+            .iter()
+            .map(|&i| format!("\"{}\"", LAYER_ROLES[i]))
+            .collect::<Vec<_>>()
+            .join(", ");
         std::fs::write(
             &path,
-            format!(
-                "{existing}{images_line}\n[layout]\ncapture = \"{}\"\ncamera = \"{}\"\n",
-                ID_SOURCES[self.layout_capture],
-                ID_SOURCES[self.layout_camera],
-            ),
+            format!("{existing}{images_line}\n[layout]\nlayers = [{layers}]\n"),
         )?;
         Ok(path)
     }

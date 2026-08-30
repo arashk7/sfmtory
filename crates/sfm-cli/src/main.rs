@@ -12,6 +12,7 @@ mod diagnostics;
 mod gui;
 mod initcam;
 mod layout;
+mod progress;
 mod project;
 
 use std::collections::HashMap;
@@ -379,11 +380,12 @@ fn cmd_dataset_link(args: DatasetLinkArgs) -> Result<()> {
     let Some(cfg) = project.config.layout.clone() else {
         bail!(
             "{} declares no [layout], so there is nothing to normalise.\n\
-             Add one when the dataset's directory shape cannot be inferred - for a rig \
-             dumping one directory per capture and one file per camera:\n\n\
+             Add one when the dataset's directory shape cannot be inferred. `layers` \
+             names each level of the path, ending with the file - for a rig dumping one \
+             directory per capture and one file per camera:\n\n\
              [layout]\n\
-             capture = \"dir\"\n\
-             camera = \"stem\"\n",
+             layers = [\"capture\", \"camera\"]\n\n\
+             Roles: capture, camera, image (a shot within one camera), ignore.\n",
             Project::config_path(&project.root).display()
         );
     };
@@ -418,6 +420,10 @@ fn cmd_dataset_link(args: DatasetLinkArgs) -> Result<()> {
         if plan.gaps.len() > 10 {
             println!("    ... and {} more", plan.gaps.len() - 10);
         }
+    }
+    let max_slot = plan.placed.iter().map(|p| p.image_index).max().unwrap_or(0);
+    if max_slot > 0 {
+        println!("  up to {} shot(s) per camera per capture", max_slot + 1);
     }
     for p in plan.placed.iter().take(3) {
         println!("  e.g. {} -> {}", p.source.display(), p.link.display());
@@ -638,6 +644,7 @@ fn cmd_feature(args: FeatureArgs) -> Result<()> {
         .num_threads(rayon::current_num_threads().min(4))
         .build()
         .context("building feature-extraction thread pool")?;
+    let reporter = progress::Progress::new("feature", discovered.len());
     let detected: Vec<Result<(u32, u32, sfm_core::FeatureSet)>> = pool.install(|| {
         discovered
             .par_iter()
@@ -650,10 +657,15 @@ fn cmd_feature(args: FeatureArgs) -> Result<()> {
                 // Stamp the capture so a fiducial that moved between captures
                 // cannot match itself across them.
                 sfm_features::aruco::stamp_capture_id(&mut features, d.capture_id);
+                reporter.tick();
                 Ok((w, h, features))
             })
             .collect()
     });
+    eprintln!(
+        "feature: detection finished in {}",
+        progress::human_secs(reporter.elapsed_secs())
+    );
 
     let mut records: Vec<(dataset::DiscoveredImage, u32, u32, sfm_core::FeatureSet)> = Vec::new();
     for (d, r) in discovered.into_iter().zip(detected) {
@@ -1020,15 +1032,24 @@ fn cmd_match(args: MatchArgs) -> Result<()> {
     };
 
     let params = sfm_match::VerificationParams::default();
+    // Pair count grows quadratically, so this is the stage most likely to run
+    // far longer than expected: 965 images exhaustively is 465k pairs.
+    let reporter = progress::Progress::new("match", pairs.len());
     let results: Vec<Option<(usize, usize, sfm_core::TwoViewGeometryRecord)>> = pairs
         .par_iter()
         .map(|&(i, j)| {
             let cam_i = &cameras[&images[i].1].model;
             let cam_j = &cameras[&images[j].1].model;
-            sfm_match::match_and_verify(&features[i], &features[j], cam_i, cam_j, &params)
-                .map(|rec| (i, j, rec))
+            let out = sfm_match::match_and_verify(&features[i], &features[j], cam_i, cam_j, &params)
+                .map(|rec| (i, j, rec));
+            reporter.tick();
+            out
         })
         .collect();
+    eprintln!(
+        "match: verification finished in {}",
+        progress::human_secs(reporter.elapsed_secs())
+    );
 
     db.clear_geometries()?;
     let mut num_verified = 0usize;

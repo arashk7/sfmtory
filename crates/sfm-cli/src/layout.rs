@@ -19,6 +19,16 @@
 //! resolved here into a symlink tree in the canonical `capture_<n>/cam<n>/`
 //! form. Nothing downstream changes, the mapping is inspectable on disk before
 //! a long run, and symlinks mean no image is copied.
+//!
+//! The declaration names each *level* of the path rather than naming each id's
+//! source, so one rule covers any depth and reads in the same order as the
+//! path it describes:
+//!
+//! ```toml
+//! layers = ["capture", "camera"]            # images/9/101.jpg
+//! layers = ["capture", "camera", "image"]   # images/cap0/cam0/0001.jpg
+//! layers = ["camera", "image"]              # images/cam0/0001.jpg
+//! ```
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -26,7 +36,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::dataset::is_image_file;
-use crate::project::{IdSource, LayoutConfig};
+use crate::project::{Layer, LayoutConfig};
 
 /// One raw image and the identity the layout gives it.
 #[derive(Debug, Clone)]
@@ -34,6 +44,9 @@ pub struct Placed {
     pub source: PathBuf,
     pub capture_id: u32,
     pub camera_id: u32,
+    /// Which shot this is within its (capture, camera), when the layout has an
+    /// `image` level. Zero when each camera contributes one frame per capture.
+    pub image_index: u32,
     /// Path of the symlink to create, relative to the link tree's root.
     pub link: PathBuf,
 }
@@ -55,9 +68,27 @@ pub fn plan(source: &Path, cfg: &LayoutConfig) -> Result<Plan> {
     if !source.is_dir() {
         bail!("layout source directory does not exist: {}", source.display());
     }
+    if cfg.layers.is_empty() {
+        bail!("[layout] layers is empty; it needs one entry per path level, e.g. layers = [\"capture\", \"camera\"]");
+    }
     let files = collect_images(source)?;
     if files.is_empty() {
         bail!("no images found under {}", source.display());
+    }
+
+    // Every image must sit at the declared depth, or the roles line up against
+    // the wrong path components and every id afterwards is quietly wrong.
+    for f in &files {
+        if f.parts.len() != cfg.layers.len() {
+            bail!(
+                "[layout] declares {} level(s) but {} is {} level(s) deep under {}.\n\
+                 `layers` lists one role per path level, ending with the file itself.",
+                cfg.layers.len(),
+                f.path.display(),
+                f.parts.len(),
+                source.display()
+            );
+        }
     }
 
     // Keys are resolved globally, not per directory, so one camera keeps one
@@ -66,49 +97,90 @@ pub fn plan(source: &Path, cfg: &LayoutConfig) -> Result<Plan> {
     // misalign the moment a camera is missing from one capture, and silently:
     // the ids would still be dense and unique, just attached to the wrong
     // cameras.
-    let capture_keys: Vec<String> = files.iter().map(|f| key(f, cfg.capture)).collect();
-    let camera_keys: Vec<String> = files.iter().map(|f| key(f, cfg.camera)).collect();
+    let capture_keys: Vec<String> = files.iter().map(|f| key(f, &cfg.layers, Layer::Capture)).collect();
+    let camera_keys: Vec<String> = files.iter().map(|f| key(f, &cfg.layers, Layer::Camera)).collect();
+    let image_keys: Vec<String> = files.iter().map(|f| key(f, &cfg.layers, Layer::Image)).collect();
     let capture_ids = assign_ids(&capture_keys);
     let camera_ids = assign_ids(&camera_keys);
 
+    // Shots within one (capture, camera) are numbered by their own key, so the
+    // slot a shot occupies is stable across captures - which is what
+    // `--merge-multicaps` pairs along.
+    let mut slots: BTreeMap<(u32, u32), BTreeSet<&String>> = BTreeMap::new();
+    for (i, _) in files.iter().enumerate() {
+        slots
+            .entry((capture_ids[&capture_keys[i]], camera_ids[&camera_keys[i]]))
+            .or_default()
+            .insert(&image_keys[i]);
+    }
+
     let mut placed = Vec::with_capacity(files.len());
-    let mut seen: BTreeMap<(u32, u32), PathBuf> = BTreeMap::new();
+    // Two distinct conflicts, both fatal and neither implying the other: two
+    // images claiming one identity, and two images claiming one path in the
+    // linked tree. `7.jpg` and `7.png` under a `[capture, camera]` layout are
+    // the first without being the second.
+    let mut seen_identity: BTreeMap<(u32, u32, &String), PathBuf> = BTreeMap::new();
+    let mut seen_link: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
     for (i, f) in files.iter().enumerate() {
         let capture_id = capture_ids[&capture_keys[i]];
         let camera_id = camera_ids[&camera_keys[i]];
+        let image_index = slots[&(capture_id, camera_id)]
+            .iter()
+            .position(|k| **k == image_keys[i])
+            .unwrap_or(0) as u32;
         let file_name = f
             .path
             .file_name()
             .map(|s| s.to_os_string())
             .unwrap_or_default();
-        // A collision means two raw images claim one (capture, camera) slot.
-        // One would overwrite the other, so refuse rather than lose data.
-        if let Some(prev) = seen.get(&(capture_id, camera_id)) {
+        let link = PathBuf::from(format!("capture_{capture_id:03}"))
+            .join(format!("cam{camera_id:03}"))
+            .join(file_name);
+        if let Some(prev) = seen_identity.get(&(capture_id, camera_id, &image_keys[i])) {
+            let hint = if cfg.layers.contains(&Layer::Image) {
+                "Check the [layout] layers in sfm.toml."
+            } else {
+                "If these are meant to be separate shots of one camera, add an \
+                 \"image\" level to `layers`."
+            };
             bail!(
                 "layout maps two images to capture {capture_id}, camera {camera_id}:\n  \
-                 {}\n  {}\nCheck the [layout] capture/camera settings in sfm.toml.",
+                 {}\n  {}\n{hint}",
                 prev.display(),
                 f.path.display()
             );
         }
-        seen.insert((capture_id, camera_id), f.path.clone());
+        seen_identity.insert((capture_id, camera_id, &image_keys[i]), f.path.clone());
+        // A distinct check: same identity resolved, the two could still land
+        // on one path once the tree is written.
+        if let Some(prev) = seen_link.get(&link) {
+            bail!(
+                "layout maps two images to the same place ({}):\n  {}\n  {}\n\
+                 Check the [layout] layers in sfm.toml.",
+                link.display(),
+                prev.display(),
+                f.path.display()
+            );
+        }
+        seen_link.insert(link.clone(), f.path.clone());
         placed.push(Placed {
             source: f.path.clone(),
             capture_id,
             camera_id,
-            link: PathBuf::from(format!("capture_{capture_id:03}"))
-                .join(format!("cam{camera_id:03}"))
-                .join(file_name),
+            image_index,
+            link,
         });
     }
 
     let captures: BTreeSet<u32> = placed.iter().map(|p| p.capture_id).collect();
     let cameras: BTreeSet<u32> = placed.iter().map(|p| p.camera_id).collect();
+    let filled: BTreeSet<(u32, u32)> =
+        placed.iter().map(|p| (p.capture_id, p.camera_id)).collect();
     let mut gaps: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     for cam in &cameras {
         let missing: Vec<u32> = captures
             .iter()
-            .filter(|c| !seen.contains_key(&(**c, *cam)))
+            .filter(|c| !filled.contains(&(**c, *cam)))
             .copied()
             .collect();
         if !missing.is_empty() {
@@ -212,10 +284,9 @@ fn symlink(source: &Path, dest: &Path) -> std::io::Result<()> {
 
 struct RawImage {
     path: PathBuf,
-    /// Name of the directory immediately containing the file, empty when the
-    /// file sits at the root of the source tree.
-    dir: String,
-    stem: String,
+    /// Path components relative to the source root, with the final one's
+    /// extension stripped - one entry per level the layout describes.
+    parts: Vec<String>,
 }
 
 fn collect_images(source: &Path) -> Result<Vec<RawImage>> {
@@ -233,30 +304,49 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<RawImage>) -> Result<()> {
         if path.is_dir() {
             walk(root, &path, out)?;
         } else if is_image_file(&path) {
-            out.push(RawImage {
-                dir: path
-                    .parent()
-                    .filter(|p| *p != root)
-                    .and_then(|p| p.file_name())
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default(),
-                stem: path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default(),
-                path,
-            });
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            let mut parts: Vec<String> = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().to_string())
+                .collect();
+            // The last component is the file; the extension is never part of
+            // an id.
+            if let Some(last) = parts.last_mut() {
+                if let Some(stem) = Path::new(last.as_str()).file_stem() {
+                    *last = stem.to_string_lossy().to_string();
+                }
+            }
+            out.push(RawImage { path, parts });
         }
     }
     Ok(())
 }
 
-fn key(f: &RawImage, from: IdSource) -> String {
-    match from {
-        IdSource::Dir => f.dir.clone(),
-        IdSource::Stem => f.stem.clone(),
-        IdSource::None => String::new(),
+/// Joins the components of every level carrying `role`, so two levels can
+/// jointly identify one thing (a session directory plus a capture directory,
+/// say) without needing a separate rule.
+fn key(f: &RawImage, layers: &[Layer], role: Layer) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for (i, l) in layers.iter().enumerate() {
+        if *l == role {
+            if let Some(p) = f.parts.get(i) {
+                parts.push(p);
+            }
+        }
     }
+    parts.join("/")
+}
+
+/// Depth of the first image found, so a UI can offer one role per real level
+/// instead of asking the user to count directories.
+///
+/// Only the viewer calls this; a headless build still compiles it so the
+/// module stays one thing rather than two.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn probe_depth(source: &Path) -> Option<usize> {
+    let mut out = Vec::new();
+    walk(source, source, &mut out).ok()?;
+    out.first().map(|f| f.parts.len())
 }
 
 /// Maps each distinct key to an id, preferring the number the name already
@@ -315,13 +405,14 @@ mod tests {
         d
     }
 
-    fn cfg(capture: IdSource, camera: IdSource) -> LayoutConfig {
+    fn cfg(layers: &[Layer]) -> LayoutConfig {
         LayoutConfig {
             source: None,
-            capture,
-            camera,
+            layers: layers.to_vec(),
         }
     }
+
+    const CAPTURE_CAMERA: [Layer; 2] = [Layer::Capture, Layer::Camera];
 
     /// The `p44` shape: capture directories holding one file per camera.
     #[test]
@@ -332,7 +423,7 @@ mod tests {
                 touch(&root.join(cap).join(format!("{cam}.jpg")));
             }
         }
-        let p = plan(&root, &cfg(IdSource::Dir, IdSource::Stem)).unwrap();
+        let p = plan(&root, &cfg(&CAPTURE_CAMERA)).unwrap();
         assert_eq!(p.placed.len(), 9);
         assert_eq!(p.captures, [9, 16, 23].into_iter().collect());
         assert_eq!(p.cameras, [7, 58, 101].into_iter().collect());
@@ -358,7 +449,7 @@ mod tests {
         touch(&root.join("1").join("alpha.jpg"));
         touch(&root.join("1").join("beta.jpg"));
         touch(&root.join("2").join("beta.jpg")); // alpha missing here
-        let p = plan(&root, &cfg(IdSource::Dir, IdSource::Stem)).unwrap();
+        let p = plan(&root, &cfg(&CAPTURE_CAMERA)).unwrap();
         let id_of = |cap: u32, stem: &str| {
             p.placed
                 .iter()
@@ -384,7 +475,7 @@ mod tests {
                 touch(&root.join(cap).join(format!("{cam}.png")));
             }
         }
-        let p = plan(&root, &cfg(IdSource::Dir, IdSource::Stem)).unwrap();
+        let p = plan(&root, &cfg(&CAPTURE_CAMERA)).unwrap();
         assert_eq!(p.captures, [0, 1].into_iter().collect());
         assert_eq!(p.cameras, [0, 1].into_iter().collect());
         assert_eq!(p.placed.len(), 4);
@@ -393,14 +484,15 @@ mod tests {
 
     #[test]
     fn the_transposed_layout_also_works() {
-        // Camera directories holding one file per capture.
+        // Camera directories holding one file per capture: the same two roles
+        // in the other order.
         let root = tmp("transposed");
         for cam in ["cam1", "cam2"] {
             for cap in ["5", "6"] {
                 touch(&root.join(cam).join(format!("{cap}.jpg")));
             }
         }
-        let p = plan(&root, &cfg(IdSource::Stem, IdSource::Dir)).unwrap();
+        let p = plan(&root, &cfg(&[Layer::Camera, Layer::Capture])).unwrap();
         assert_eq!(p.captures, [5, 6].into_iter().collect());
         assert_eq!(p.cameras, [1, 2].into_iter().collect());
         std::fs::remove_dir_all(&root).unwrap();
@@ -413,9 +505,11 @@ mod tests {
         let root = tmp("collide");
         touch(&root.join("1").join("7.jpg"));
         touch(&root.join("1").join("7.png"));
-        let err = plan(&root, &cfg(IdSource::Dir, IdSource::Stem)).unwrap_err();
+        let err = plan(&root, &cfg(&CAPTURE_CAMERA)).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("two images"), "{msg}");
+        assert!(msg.contains("capture 1, camera 7"), "{msg}");
+        // And the message points at the fix rather than just the problem.
+        assert!(msg.contains("\"image\" level"), "{msg}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -428,7 +522,7 @@ mod tests {
                 touch(&src.join(cap).join(format!("{cam}.jpg")));
             }
         }
-        let p = plan(&src, &cfg(IdSource::Dir, IdSource::Stem)).unwrap();
+        let p = plan(&src, &cfg(&CAPTURE_CAMERA)).unwrap();
         let target = root.join("linked");
         assert_eq!(apply(&p, &target, false).unwrap(), 4);
 
@@ -465,7 +559,7 @@ mod tests {
                 touch(&src.join(cap).join(format!("{cam}.jpg")));
             }
         }
-        let p = plan(&src, &cfg(IdSource::Dir, IdSource::Stem)).unwrap();
+        let p = plan(&src, &cfg(&CAPTURE_CAMERA)).unwrap();
         let target = before.join("cache/dataset/images");
         assert_eq!(apply(&p, &target, false).unwrap(), 4);
 
@@ -498,6 +592,88 @@ mod tests {
         assert_eq!(layout, crate::dataset::Layout::CapturesAndCameras);
         assert_eq!(imgs.len(), 4);
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Three levels: captures of cameras of several shots each.
+    #[test]
+    fn an_image_level_numbers_shots_within_each_camera() {
+        let root = tmp("threelevel");
+        for cap in ["cap1", "cap2"] {
+            for cam in ["cam1", "cam2"] {
+                for shot in ["0001", "0002", "0003"] {
+                    touch(&root.join(cap).join(cam).join(format!("{shot}.jpg")));
+                }
+            }
+        }
+        let p = plan(
+            &root,
+            &cfg(&[Layer::Capture, Layer::Camera, Layer::Image]),
+        )
+        .unwrap();
+        assert_eq!(p.placed.len(), 12);
+        assert_eq!(p.captures.len(), 2);
+        assert_eq!(p.cameras.len(), 2);
+        // Slots are numbered per (capture, camera), and the same shot name
+        // lands on the same index everywhere - which is what --merge-multicaps
+        // pairs along.
+        let idx = |cap: u32, cam: u32, shot: &str| {
+            p.placed
+                .iter()
+                .find(|x| {
+                    x.capture_id == cap
+                        && x.camera_id == cam
+                        && x.source.ends_with(format!("{shot}.jpg"))
+                })
+                .unwrap()
+                .image_index
+        };
+        assert_eq!(idx(1, 1, "0001"), 0);
+        assert_eq!(idx(1, 1, "0003"), 2);
+        assert_eq!(idx(2, 2, "0003"), 2);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A wrapper directory that means nothing is skipped rather than forcing
+    /// the user to restructure the dataset.
+    #[test]
+    fn an_ignore_level_is_skipped() {
+        let root = tmp("ignored");
+        for cap in ["9", "16"] {
+            touch(&root.join("session_a").join(cap).join("101.jpg"));
+        }
+        let p = plan(
+            &root,
+            &cfg(&[Layer::Ignore, Layer::Capture, Layer::Camera]),
+        )
+        .unwrap();
+        assert_eq!(p.captures, [9, 16].into_iter().collect());
+        assert_eq!(p.cameras, [101].into_iter().collect());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The wrong number of layers must be an error naming the offending file,
+    /// not silently-misaligned roles.
+    #[test]
+    fn a_depth_mismatch_is_reported_against_the_actual_file() {
+        let root = tmp("depth");
+        touch(&root.join("9").join("101.jpg"));
+        let err = plan(
+            &root,
+            &cfg(&[Layer::Capture, Layer::Camera, Layer::Image]),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("declares 3 level(s)"), "{msg}");
+        assert!(msg.contains("is 2 level(s) deep"), "{msg}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn probe_depth_reports_the_tree_depth() {
+        let root = tmp("probe");
+        touch(&root.join("a").join("b").join("c.jpg"));
+        assert_eq!(probe_depth(&root), Some(3));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

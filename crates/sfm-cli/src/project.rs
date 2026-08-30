@@ -73,22 +73,37 @@ pub struct LayoutConfig {
     /// `images_dir`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<PathBuf>,
-    /// Where each image's capture identity comes from.
-    pub capture: IdSource,
-    /// Where each image's camera identity comes from.
-    pub camera: IdSource,
+    /// What each level of the path means, outermost first, ending with the
+    /// file itself.
+    ///
+    /// One entry per level, so the list length is the depth of the tree:
+    ///
+    /// ```toml
+    /// layers = ["capture", "camera"]            # images/9/101.jpg
+    /// layers = ["capture", "camera", "image"]   # images/cap0/cam0/0001.jpg
+    /// layers = ["camera", "image"]              # images/cam0/0001.jpg
+    /// layers = ["image"]                        # images/0001.jpg
+    /// ```
+    ///
+    /// Naming the levels rather than naming the ids ("capture comes from the
+    /// directory, camera from the file stem") means one rule covers any depth
+    /// instead of one flag per identity, and the declaration reads in the same
+    /// order as the path it describes.
+    pub layers: Vec<Layer>,
 }
 
-/// Which part of a file's path carries an id.
+/// What one level of a dataset path identifies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum IdSource {
-    /// The name of the directory immediately containing the image.
-    Dir,
-    /// The image's file name without its extension.
-    Stem,
-    /// Not distinguished: every image shares a single id.
-    None,
+pub enum Layer {
+    /// A capture: one session of a target, moved between sessions.
+    Capture,
+    /// A physical camera.
+    Camera,
+    /// A shot within one (capture, camera) - several frames from one camera.
+    Image,
+    /// Carries no identity; a wrapper or grouping directory to skip over.
+    Ignore,
 }
 
 impl LayoutConfig {
