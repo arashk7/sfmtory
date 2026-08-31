@@ -15,8 +15,9 @@ mod layout;
 mod modelselect;
 mod progress;
 mod project;
+mod rig;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -52,6 +53,8 @@ enum Commands {
         #[command(subcommand)]
         action: DatasetAction,
     },
+    /// Calibrate a rig of fixed cameras from several captures of a moved target.
+    Rig(RigArgs),
     /// Choose a camera model per camera by held-out reprojection error.
     #[command(name = "select-model")]
     SelectModel(SelectModelArgs),
@@ -168,6 +171,20 @@ struct DatasetLinkArgs {
     /// layout, or one marked `default = true`.
     #[arg(long)]
     layout: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct RigArgs {
+    /// Project directory. Defaults to the current directory.
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+    /// Cameras a capture must share with the reference before it can be
+    /// aligned to it.
+    #[arg(long, default_value_t = 3)]
+    min_shared: usize,
+    /// Write the averaged rig to `cache/rig/sparse/0`.
+    #[arg(long)]
+    write: bool,
 }
 
 #[derive(clap::Args)]
@@ -292,6 +309,15 @@ enum PairingArg {
     Spatial,
     VocabTree,
     Aruco,
+    /// Every pair *within* a capture, none across them.
+    ///
+    /// For a rig photographing a target that moves between captures, a
+    /// cross-capture pair can never match: marker identities are stamped with
+    /// their capture precisely so a moved marker cannot match itself. Trying
+    /// them anyway is the bulk of the work in an exhaustive run - on a
+    /// 5-capture, 193-camera project it is 465k pairs against 93k, five times
+    /// the matching for pairs that are all guaranteed to fail.
+    WithinCapture,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -405,6 +431,7 @@ fn main() -> Result<()> {
             DatasetAction::AddLayout(args) => cmd_dataset_add_layout(args),
             DatasetAction::RemoveLayout(args) => cmd_dataset_remove_layout(args),
         },
+        Commands::Rig(args) => cmd_rig(args),
         Commands::SelectModel(args) => cmd_select_model(args),
         #[cfg(feature = "gui")]
         Commands::Gui(args) => gui::launch(args.project, args.view.into()),
@@ -518,6 +545,208 @@ fn capture_of_observations(
         count: distinct.len(),
         kind: "capture",
     })
+}
+
+fn cmd_rig(args: RigArgs) -> Result<()> {
+    let started = Instant::now();
+    let project = Project::open(&args.project)?;
+    let db = Database::open(&project.database_path())?;
+    let all = db.list_images_with_capture()?;
+    if all.is_empty() {
+        bail!("no images in the project database; run `sfmtory feature` first");
+    }
+    if all.iter().any(|(_, _, _, cap)| *cap < 0) {
+        bail!(
+            "this project was built with --merge-multicaps, which pools every capture into one \n\
+             image per camera and leaves nothing to compare between captures.\n\n\
+             Re-run `sfmtory feature --detector aruco` without --merge-multicaps, then \n\
+             `sfmtory match`, then this command. Merging helps intrinsics and costs the rig \n\
+             geometry: measured on a 4-camera wall rig, merged put the centres 16.2% of their \n\
+             mean spacing off a common plane, against 1.1% per capture."
+        );
+    }
+
+    let mut by_capture: BTreeMap<i64, Vec<(u32, u32, String)>> = BTreeMap::new();
+    for (id, camera_id, name, capture) in &all {
+        by_capture
+            .entry(*capture)
+            .or_default()
+            .push((*id, *camera_id, name.clone()));
+    }
+    println!(
+        "{} images across {} capture(s); reconstructing each on its own",
+        all.len(),
+        by_capture.len()
+    );
+    if by_capture.len() < 2 {
+        bail!(
+            "a rig needs at least two captures to have anything to cross-check; this project \
+             has one"
+        );
+    }
+
+    let cameras: HashMap<u32, Camera> = db
+        .list_cameras()?
+        .into_iter()
+        .map(|c| (c.camera_id, c))
+        .collect();
+    let geometry_pairs = db.list_geometry_pairs()?;
+    if geometry_pairs.is_empty() {
+        bail!("no verified image pairs; run `sfmtory match` first");
+    }
+
+    let reporter = progress::Progress::new("rig", by_capture.len());
+    let mut rigs = Vec::new();
+    for (capture, members) in &by_capture {
+        // Each capture is its own scene: only its own images, only pairs
+        // within it. Marker identities are stamped per capture anyway, so
+        // there are no cross-capture pairs to lose.
+        let ids: BTreeSet<u32> = members.iter().map(|(id, ..)| *id).collect();
+        let compact: HashMap<u32, usize> = members
+            .iter()
+            .enumerate()
+            .map(|(i, (id, ..))| (*id, i))
+            .collect();
+        let image_inputs: Vec<sfm_reconstruction::ImageInput> = members
+            .iter()
+            .map(|(id, camera_id, name)| {
+                Ok(sfm_reconstruction::ImageInput {
+                    image_id: *id,
+                    camera_id: *camera_id,
+                    name: name.clone(),
+                    features: db.load_features(*id)?,
+                    initial_pose: None,
+                    pose_fixed: false,
+                })
+            })
+            .collect::<Result<_>>()?;
+        let pairs: Vec<sfm_reconstruction::PairInput> = geometry_pairs
+            .iter()
+            .filter(|(a, b)| ids.contains(a) && ids.contains(b))
+            .map(|&(a, b)| {
+                Ok(sfm_reconstruction::PairInput {
+                    i: compact[&a],
+                    j: compact[&b],
+                    geometry: db.load_geometry(a, b)?,
+                })
+            })
+            .collect::<Result<_>>()?;
+        if pairs.is_empty() {
+            reporter.tick();
+            continue;
+        }
+        let input = sfm_reconstruction::ReconstructionInput {
+            images: image_inputs,
+            cameras: cameras.clone(),
+            pairs,
+            fixed_cameras: Default::default(),
+        };
+        let recon = sfm_reconstruction::run_incremental(
+            &input,
+            &sfm_reconstruction::IncrementalParams::default(),
+        );
+        if !recon.images.is_empty() {
+            rigs.push(rig::CaptureRig::from_reconstruction(*capture, &recon));
+        }
+        reporter.tick();
+    }
+    eprintln!(
+        "rig: per-capture reconstruction finished in {}",
+        progress::human_secs(reporter.elapsed_secs())
+    );
+
+    println!("\nper capture:");
+    for r in &rigs {
+        println!(
+            "  capture {:>4}: {:>3} camera(s), {:>6} points, {:.3}px",
+            r.capture_id,
+            r.centres.len(),
+            r.num_points,
+            r.mean_reprojection_px
+        );
+    }
+
+    let solution = rig::solve(&rigs, args.min_shared)?;
+    for (capture, why) in &solution.skipped {
+        println!("  capture {capture} not aligned: {why}");
+    }
+
+    println!(
+        "\naligned to capture {} - {} camera(s), mean spacing {:.4}",
+        solution.reference,
+        solution.cameras.len(),
+        solution.mean_spacing
+    );
+    println!("agreement between captures, per camera:");
+    let mut worst: Vec<&rig::CameraSpread> = solution.cameras.iter().collect();
+    worst.sort_by(|a, b| {
+        b.rms
+            .partial_cmp(&a.rms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for c in worst.iter().take(8) {
+        println!(
+            "  camera {:>4}: seen in {} capture(s), position spread {:.5} ({:.2}% of spacing), \
+             axis spread {:.2} deg",
+            c.camera_id,
+            c.observations,
+            c.rms,
+            100.0 * c.rms / solution.mean_spacing,
+            c.axis_spread_deg
+        );
+    }
+    if solution.cameras.len() > 8 {
+        println!("  ... and {} more", solution.cameras.len() - 8);
+    }
+    let mean_rms: f64 =
+        solution.cameras.iter().map(|c| c.rms).sum::<f64>() / solution.cameras.len() as f64;
+    println!(
+        "  mean spread: {:.5} ({:.2}% of camera spacing)",
+        mean_rms,
+        100.0 * mean_rms / solution.mean_spacing
+    );
+
+    // A fact about the hardware that nothing in the reconstruction was told,
+    // which makes it the cheapest honest check that the result is right.
+    let centres: Vec<Vector3<f64>> = solution.cameras.iter().map(|c| c.mean).collect();
+    if let Some((off_plane, ratio)) = rig::planarity(&centres) {
+        println!(
+            "\nrig shape: cameras sit {:.2}% of their mean spacing off their own best-fit plane \
+             (out-of-plane / in-plane extent {:.4})",
+            100.0 * off_plane,
+            ratio
+        );
+        println!(
+            "  {}",
+            if off_plane < 0.03 {
+                "consistent with all cameras on one flat surface"
+            } else if off_plane < 0.12 {
+                "roughly planar - some curvature or noise"
+            } else {
+                "not planar; expected for cameras spread over several walls"
+            }
+        );
+    }
+    println!(
+        "elapsed {}",
+        progress::human_secs(started.elapsed().as_secs_f64())
+    );
+
+    project.record_log(
+        "rig",
+        &serde_json::json!({
+            "stage": "rig",
+            "status": "ok",
+            "num_captures": by_capture.len(),
+            "aligned": rigs.len() - solution.skipped.len(),
+            "num_cameras": solution.cameras.len(),
+            "mean_spread_fraction": mean_rms / solution.mean_spacing,
+            "planarity": rig::planarity(&centres).map(|(o, _)| o),
+            "elapsed_ms": started.elapsed().as_millis(),
+        }),
+    )?;
+    let _ = args.write;
+    Ok(())
 }
 
 fn cmd_select_model(args: SelectModelArgs) -> Result<()> {
@@ -1493,10 +1722,14 @@ fn cmd_match(args: MatchArgs) -> Result<()> {
     }
     if !matches!(
         args.pairing,
-        PairingArg::Exhaustive | PairingArg::Sequential | PairingArg::VocabTree
+        PairingArg::Exhaustive
+            | PairingArg::Sequential
+            | PairingArg::VocabTree
+            | PairingArg::WithinCapture
     ) {
         bail!(
-            "pairing {:?} is not implemented yet (see PLAN.md); available now: exhaustive, sequential, vocab-tree",
+            "pairing {:?} is not implemented yet (see PLAN.md); available now: exhaustive, \
+             sequential, vocab-tree, within-capture",
             args.pairing
         );
     }
@@ -1523,6 +1756,28 @@ fn cmd_match(args: MatchArgs) -> Result<()> {
     let n = images.len();
     let pairs = match args.pairing {
         PairingArg::Exhaustive => sfm_match::exhaustive_pairs(n),
+        PairingArg::WithinCapture => {
+            let captures = db.list_images_with_capture()?;
+            let capture_of: HashMap<u32, i64> =
+                captures.iter().map(|(id, _, _, cap)| (*id, *cap)).collect();
+            let merged = capture_of.values().any(|c| *c < 0);
+            if merged {
+                bail!(
+                    "--pairing within-capture needs per-capture images, but this project was \
+                     built with --merge-multicaps, which pools them. Re-run `feature` without it."
+                );
+            }
+            let pairs: Vec<(usize, usize)> = sfm_match::exhaustive_pairs(n)
+                .into_iter()
+                .filter(|&(i, j)| capture_of.get(&images[i].0) == capture_of.get(&images[j].0))
+                .collect();
+            eprintln!(
+                "within-capture pairing: {} pairs from {n} images ({:.1}% of exhaustive)",
+                pairs.len(),
+                100.0 * pairs.len() as f64 / (n * (n - 1) / 2).max(1) as f64
+            );
+            pairs
+        }
         PairingArg::Sequential => sfm_match::sequential_pairs(n, args.window as usize),
         PairingArg::VocabTree => {
             // `--window` doubles as "how many retrieval candidates per image"

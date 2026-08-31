@@ -185,6 +185,19 @@ impl Database {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Images with the capture each belongs to, for callers that need to work
+    /// per capture rather than over the whole project. `-1` marks a row that
+    /// `--merge-multicaps` pooled across captures.
+    pub fn list_images_with_capture(&self) -> Result<Vec<(u32, u32, String, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, camera_id, name, capture_id FROM images ORDER BY id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn store_features(
         &self,
         image_id: u32,

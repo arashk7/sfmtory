@@ -130,6 +130,7 @@ struct App {
     layout_name: String,
     layout_default: bool,
     aruco: aruco::Tester,
+    status: StageStatus,
     /// Stage options mirrored from the CLI's own defaults.
     detector: usize,
     camera_model: usize,
@@ -156,6 +157,72 @@ const COMPONENT_COLORS: [egui::Color32; 8] = [
     egui::Color32::from_rgb(200, 90, 90),
     egui::Color32::from_rgb(160, 150, 230),
 ];
+
+/// Which stages have already produced output, so the viewer can show where a
+/// project stands instead of leaving the user to guess.
+///
+/// A beginner opening a half-finished project cannot tell from the buttons
+/// alone whether features exist, whether matching ran, or why Map fails. These
+/// are cheap filesystem and database facts, refreshed when a stage finishes
+/// rather than polled every frame.
+#[derive(Default, Clone, Copy)]
+struct StageStatus {
+    features: usize,
+    pairs: usize,
+    registered: usize,
+}
+
+impl StageStatus {
+    fn read(project: &Path) -> Self {
+        let Ok(p) = Project::open(project) else {
+            return Self::default();
+        };
+        let mut st = StageStatus::default();
+        if let Ok(db) = crate::db::Database::open(&p.database_path()) {
+            st.features = db.list_images().map(|v| v.len()).unwrap_or(0);
+            st.pairs = db.list_geometry_pairs().map(|v| v.len()).unwrap_or(0);
+        }
+        st.registered = sfm_io::read_colmap_model(&p.sparse_dir())
+            .map(|r| r.images.len())
+            .unwrap_or(0);
+        st
+    }
+}
+
+/// A pipeline-stage button that also says whether that stage has run.
+///
+/// The count is the point: "① Feature" alone cannot distinguish a project with
+/// no features from one with 965 of them, and that is exactly the question
+/// someone asks when a later stage fails.
+fn stage_button(ui: &mut egui::Ui, label: &str, count: usize, noun: &str) -> egui::Response {
+    let text = if count > 0 {
+        egui::RichText::new(format!("{label}  ✔")).color(ok_color())
+    } else {
+        egui::RichText::new(label)
+    };
+    let r = ui.button(text);
+    if count > 0 {
+        r.on_hover_text(format!("{count} {noun} already"))
+    } else {
+        r.on_hover_text("not run yet for this project")
+    }
+}
+
+/// One line telling the user what to do next, from what the project contains.
+fn next_step_hint(st: &StageStatus) -> String {
+    if st.features == 0 {
+        "no features yet - start with ① Feature, or ▶ Run all".into()
+    } else if st.pairs == 0 {
+        format!("{} images have features - next is ② Match", st.features)
+    } else if st.registered == 0 {
+        format!("{} verified pairs - next is ③ Map", st.pairs)
+    } else {
+        format!(
+            "{} images registered - inspect in the views below, or ④ Export",
+            st.registered
+        )
+    }
+}
 
 fn warn_color() -> egui::Color32 {
     egui::Color32::from_rgb(235, 150, 40)
@@ -205,6 +272,7 @@ impl App {
             layout_name: String::new(),
             layout_default: false,
             aruco: aruco::Tester::default(),
+            status: StageStatus::default(),
             detector: 0,
             // Index of SIMPLE_RADIAL, matching the CLI default.
             camera_model: 2,
@@ -227,6 +295,7 @@ impl App {
 
     /// Loads whatever `sfmtory map` last wrote, if anything.
     fn reload(&mut self) {
+        self.status = StageStatus::read(&self.project);
         self.load_error = None;
         self.selected_point = None;
         self.loaded_image = None;
@@ -328,11 +397,38 @@ impl App {
 
     fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("stages").show(ctx, |ui| {
+            let busy = self.run.is_running();
+            let st = self.status;
             ui.add_space(4.0);
+
+            // Row one is the pipeline in order, each stage showing whether it
+            // has already produced something. A project half-finished used to
+            // look exactly like a project not started.
             ui.horizontal_wrapped(|ui| {
-                let busy = self.run.is_running();
-                ui.strong("Pipeline:");
+                ui.strong("Pipeline");
                 ui.add_enabled_ui(!busy, |ui| {
+                    if ui
+                        .button("▶ Run all")
+                        .on_hover_text("feature → match → map → export, with the options set here")
+                        .clicked()
+                    {
+                        self.run.spawn(
+                            &self.project,
+                            vec![
+                                "run".into(),
+                                "--detector".into(),
+                                DETECTORS[self.detector].into(),
+                                "--camera-model".into(),
+                                crate::CAMERA_MODELS[self.camera_model].into(),
+                                "--pairing".into(),
+                                PAIRINGS[self.pairing].into(),
+                                "--pipeline".into(),
+                                PIPELINES[self.pipeline_kind].into(),
+                            ],
+                        );
+                    }
+                    ui.separator();
+
                     egui::ComboBox::from_id_salt("detector")
                         .selected_text(DETECTORS[self.detector])
                         .width(70.0)
@@ -341,10 +437,6 @@ impl App {
                                 ui.selectable_value(&mut self.detector, i, *d);
                             }
                         });
-                    // Lens model for the feature stage, which is where camera
-                    // rows are created. Listed narrowest-to-widest, which is
-                    // also increasing parameter count, so the order itself
-                    // hints at what a wider lens needs.
                     egui::ComboBox::from_id_salt("cameramodel")
                         .selected_text(crate::CAMERA_MODELS[self.camera_model])
                         .width(130.0)
@@ -355,9 +447,9 @@ impl App {
                         })
                         .response
                         .on_hover_text(
-                            "Camera model for images no [[cameras]] entry covers.                              SIMPLE_RADIAL suits a narrow lens; a wide one needs                              OPENCV, and past ~100 degrees diagonal, OPENCV_FISHEYE.",
+                            "Camera model for images no [[cameras]] entry covers.                              SIMPLE_RADIAL suits a narrow lens; a wide one needs OPENCV, and                              past ~100 degrees diagonal, OPENCV_FISHEYE.",
                         );
-                    if ui.button("① Feature").clicked() {
+                    if stage_button(ui, "① Feature", st.features, "images").clicked() {
                         self.run.spawn(
                             &self.project,
                             vec![
@@ -369,15 +461,16 @@ impl App {
                             ],
                         );
                     }
+
                     egui::ComboBox::from_id_salt("pairing")
                         .selected_text(PAIRINGS[self.pairing])
-                        .width(95.0)
+                        .width(120.0)
                         .show_ui(ui, |ui| {
                             for (i, p) in PAIRINGS.iter().enumerate() {
                                 ui.selectable_value(&mut self.pairing, i, *p);
                             }
                         });
-                    if ui.button("② Match").clicked() {
+                    if stage_button(ui, "② Match", st.pairs, "pairs").clicked() {
                         self.run.spawn(
                             &self.project,
                             vec![
@@ -387,6 +480,7 @@ impl App {
                             ],
                         );
                     }
+
                     egui::ComboBox::from_id_salt("pipeline")
                         .selected_text(PIPELINES[self.pipeline_kind])
                         .width(95.0)
@@ -395,7 +489,7 @@ impl App {
                                 ui.selectable_value(&mut self.pipeline_kind, i, *p);
                             }
                         });
-                    if ui.button("③ Map").clicked() {
+                    if stage_button(ui, "③ Map", st.registered, "registered").clicked() {
                         self.run.spawn(
                             &self.project,
                             vec![
@@ -405,7 +499,7 @@ impl App {
                             ],
                         );
                     }
-                    ui.separator();
+
                     egui::ComboBox::from_id_salt("export")
                         .selected_text(EXPORTS[self.export_format])
                         .width(120.0)
@@ -424,26 +518,7 @@ impl App {
                             ],
                         );
                     }
-                    if ui.button("Eval").clicked() {
-                        self.run.spawn(&self.project, vec!["eval".into()]);
-                    }
-                    if ui.button("Init-cam").clicked() {
-                        self.run.spawn(&self.project, vec!["init-cam".into()]);
-                    }
-                    if ui
-                        .button("Select-model")
-                        .on_hover_text(
-                            "score every camera model on held-out reprojection error                              and report which one this lens actually needs",
-                        )
-                        .clicked()
-                    {
-                        self.run.spawn(&self.project, vec!["select-model".into()]);
-                    }
                 });
-                ui.separator();
-                if ui.button("⟳ Reload model").clicked() {
-                    self.reload();
-                }
                 if busy {
                     ui.spinner();
                     let stage = self
@@ -454,6 +529,57 @@ impl App {
                         .unwrap_or_default();
                     ui.label(format!("running {stage}..."));
                 }
+            });
+
+            // Row two is everything that inspects or calibrates rather than
+            // builds, kept off the main path so the four numbered steps read
+            // as the thing to do first.
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Analysis");
+                ui.add_enabled_ui(!busy, |ui| {
+                    if ui
+                        .button("Init-cam")
+                        .on_hover_text("estimate a focal length before reconstructing")
+                        .clicked()
+                    {
+                        self.run.spawn(&self.project, vec!["init-cam".into()]);
+                    }
+                    if ui
+                        .button("Rig")
+                        .on_hover_text(
+                            "for fixed cameras and a target that moved between captures:                              reconstruct each capture, align them, and report how well the                              cameras agree",
+                        )
+                        .clicked()
+                    {
+                        self.run.spawn(&self.project, vec!["rig".into()]);
+                    }
+                    if ui
+                        .button("Select-model")
+                        .on_hover_text(
+                            "score every camera model on held-out reprojection error and                              report which one this lens actually needs",
+                        )
+                        .clicked()
+                    {
+                        self.run.spawn(&self.project, vec!["select-model".into()]);
+                    }
+                    if ui
+                        .button("Eval")
+                        .on_hover_text("reprojection statistics for the current model")
+                        .clicked()
+                    {
+                        self.run.spawn(&self.project, vec!["eval".into()]);
+                    }
+                });
+                ui.separator();
+                if ui.button("⟳ Reload").clicked() {
+                    self.reload();
+                }
+                // The one-line answer to "what should I do next?".
+                ui.label(
+                    egui::RichText::new(next_step_hint(&st))
+                        .small()
+                        .color(if st.registered > 0 { ok_color() } else { warn_color() }),
+                );
             });
             ui.add_space(4.0);
         });
