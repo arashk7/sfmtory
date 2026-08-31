@@ -232,6 +232,12 @@ struct FeatureArgs {
     /// N times the observations of one unmoved viewpoint.
     #[arg(long)]
     merge_multicaps: bool,
+    /// Camera model for images not covered by a `[[cameras]]` entry.
+    ///
+    /// SIMPLE_RADIAL (one radial term) is a safe default for a narrow lens and
+    /// too simple for a wide one. See the Camera setup section of the README.
+    #[arg(long, default_value = "SIMPLE_RADIAL", value_parser = CAMERA_MODELS)]
+    camera_model: String,
     #[arg(long)]
     gpu: bool,
 }
@@ -363,6 +369,9 @@ struct RunArgs {
     matcher: MatcherArg,
     #[arg(long, value_enum, default_value_t = PipelineArg::Global)]
     pipeline: PipelineArg,
+    /// Camera model for images not covered by a `[[cameras]]` entry.
+    #[arg(long, default_value = "SIMPLE_RADIAL", value_parser = CAMERA_MODELS)]
+    camera_model: String,
 }
 
 fn main() -> Result<()> {
@@ -410,6 +419,17 @@ fn cmd_project_new(dir: &PathBuf, images: &PathBuf) -> Result<()> {
 /// Starting intrinsics for a declared camera with no `params` given: the same
 /// wide-FOV focal guess the resolution-grouped path uses, expressed in
 /// whichever model was requested. Distortion terms start at zero.
+/// Every model `CameraModel::from_name_and_params` understands, in increasing
+/// order of parameter count.
+pub const CAMERA_MODELS: [&str; 6] = [
+    "SIMPLE_PINHOLE",
+    "PINHOLE",
+    "SIMPLE_RADIAL",
+    "RADIAL",
+    "OPENCV",
+    "OPENCV_FISHEYE",
+];
+
 fn default_camera_model(name: &str, w: u32, h: u32) -> Option<CameraModel> {
     let f = w.max(h) as f64 * 1.2;
     let (cx, cy) = (w as f64 / 2.0, h as f64 / 2.0);
@@ -971,7 +991,8 @@ fn cmd_feature(args: FeatureArgs) -> Result<()> {
                     next_camera_id += 1;
                     db.upsert_camera(&Camera {
                         camera_id: id,
-                        model: default_camera_model("SIMPLE_RADIAL", w, h).unwrap(),
+                        model: default_camera_model(&args.camera_model, w, h)
+                            .expect("clap restricts this to a known model"),
                         width: w,
                         height: h,
                     })?;
@@ -989,7 +1010,8 @@ fn cmd_feature(args: FeatureArgs) -> Result<()> {
             next_camera_id += 1;
             db.upsert_camera(&Camera {
                 camera_id: id,
-                model: default_camera_model("SIMPLE_RADIAL", w, h).unwrap(),
+                model: default_camera_model(&args.camera_model, w, h)
+                    .expect("clap restricts this to a known model"),
                 width: w,
                 height: h,
             })?;
@@ -2024,6 +2046,7 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         find_params: false,
         merge_multicaps: false,
         gpu: false,
+        camera_model: args.camera_model.clone(),
     })?;
     cmd_match(MatchArgs {
         project: args.project.clone(),

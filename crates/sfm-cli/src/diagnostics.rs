@@ -116,6 +116,13 @@ pub struct CameraDiag {
     /// the specific pathology that makes a shared focal unobservable, so it is
     /// carried alongside the verdict rather than left to the global histogram.
     pub max_track_len: usize,
+    /// `(horizontal, diagonal)` field of view in degrees.
+    ///
+    /// Carried because it, not the focal length, is what says whether a camera
+    /// model can represent this lens: a single radial term stops coping past
+    /// roughly 70 degrees diagonal, and a rectilinear projection stops being a
+    /// good description at all past about 100.
+    pub field_of_view_deg: Option<(f64, f64)>,
 }
 
 impl CameraDiag {
@@ -448,6 +455,14 @@ fn camera_diags(
                 num_images,
                 pinned.contains(&cam.camera_id),
             );
+            let (fx, _) = focal_final;
+            let field_of_view_deg = (fx > 1.0).then(|| {
+                let (w, h) = (cam.width as f64, cam.height as f64);
+                (
+                    2.0 * (w / (2.0 * fx)).atan().to_degrees(),
+                    2.0 * (w.hypot(h) / (2.0 * fx)).atan().to_degrees(),
+                )
+            });
             CameraDiag {
                 camera_id: cam.camera_id,
                 model_name: cam.model.name().to_string(),
@@ -457,6 +472,7 @@ fn camera_diags(
                 focal_initial,
                 verdict,
                 max_track_len: max_track.get(&cam.camera_id).copied().unwrap_or(0),
+                field_of_view_deg,
             }
         })
         .collect()
@@ -994,5 +1010,56 @@ mod tests {
         assert_eq!(grid[1][0], 1);
         assert_eq!(grid[3][4], 1);
         assert_eq!(azimuth_sectors(&views), [1, 0, 0, 0, 1, 0, 0, 0]);
+    }
+}
+
+#[cfg(test)]
+mod fov_tests {
+    use super::*;
+    use sfm_core::Camera;
+
+    /// The two focal estimates measured on the `scan2` rig, which differ by
+    /// 2.1x and land on opposite sides of every model-choice threshold.
+    #[test]
+    fn field_of_view_separates_the_two_focal_estimates() {
+        let fov = |f: f64| {
+            let (w, h) = (3840.0f64, 3104.0f64);
+            (
+                2.0 * (w / (2.0 * f)).atan().to_degrees(),
+                2.0 * (w.hypot(h) / (2.0 * f)).atan().to_degrees(),
+            )
+        };
+        // The 1.2 x width placeholder: narrow, and a single radial term would
+        // look adequate.
+        let (h_placeholder, d_placeholder) = fov(4608.0);
+        assert!((h_placeholder - 45.2).abs() < 0.2, "{h_placeholder}");
+        assert!(d_placeholder < 70.0);
+
+        // What init-cam actually measured from the marker squares: wide enough
+        // that SIMPLE_RADIAL is the wrong model and fisheye is worth testing.
+        let (h_measured, d_measured) = fov(2185.71);
+        assert!((h_measured - 82.6).abs() < 0.2, "{h_measured}");
+        assert!(d_measured > 95.0, "{d_measured}");
+    }
+
+    #[test]
+    fn a_degenerate_focal_reports_no_field_of_view() {
+        let mut recon = Reconstruction::new();
+        recon.cameras.insert(
+            1,
+            Camera {
+                camera_id: 1,
+                model: CameraModel::Pinhole {
+                    fx: 0.0,
+                    fy: 0.0,
+                    cx: 0.0,
+                    cy: 0.0,
+                },
+                width: 640,
+                height: 480,
+            },
+        );
+        let d = Diagnostics::compute(&recon, &BTreeMap::new(), &std::collections::BTreeSet::new());
+        assert_eq!(d.cameras[0].field_of_view_deg, None);
     }
 }

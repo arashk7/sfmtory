@@ -415,8 +415,9 @@ it.
   diagnostic sections:
   - *Calibration quality* — per camera, whether self-calibration refined the
     focal, rejected its own result, never considered the camera eligible, or
-    was pinned by `sfm.toml`; plus the track-length histogram and per-image
-    observation counts that explain the verdict.
+    was pinned by `sfm.toml`; the field of view, which is what says whether the
+    chosen camera model can represent the lens at all; plus the track-length
+    histogram and per-image observation counts that explain the verdict.
   - *Viewing-angle diversity* — for a planar target, the best-fit plane and
     the spread of the axis it is tilted about. Rotating a board about one
     fixed axis is degenerate for single-plane self-calibration however wide
@@ -429,7 +430,8 @@ it.
   it the active project) and carries a **Dataset layout** section for declaring
   and building the `[layout]` symlink tree — see *Input layouts*.
 - **Top bar** runs `init-cam`, `feature`, `match`, `map`, `export` and `eval`
-  with the main options exposed as dropdowns. Output streams into a log pane,
+  with the main options exposed as dropdowns — detector, **camera model**,
+  pairing, pipeline and export format. Output streams into a log pane,
   and the model reloads automatically when a stage finishes.
 
 Residuals shown here are recomputed from the model's own poses and intrinsics,

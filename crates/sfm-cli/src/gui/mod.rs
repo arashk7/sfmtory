@@ -132,6 +132,7 @@ struct App {
     aruco: aruco::Tester,
     /// Stage options mirrored from the CLI's own defaults.
     detector: usize,
+    camera_model: usize,
     pairing: usize,
     pipeline_kind: usize,
     export_format: usize,
@@ -205,6 +206,8 @@ impl App {
             layout_default: false,
             aruco: aruco::Tester::default(),
             detector: 0,
+            // Index of SIMPLE_RADIAL, matching the CLI default.
+            camera_model: 2,
             pairing: 0,
             pipeline_kind: 0,
             export_format: 0,
@@ -338,6 +341,22 @@ impl App {
                                 ui.selectable_value(&mut self.detector, i, *d);
                             }
                         });
+                    // Lens model for the feature stage, which is where camera
+                    // rows are created. Listed narrowest-to-widest, which is
+                    // also increasing parameter count, so the order itself
+                    // hints at what a wider lens needs.
+                    egui::ComboBox::from_id_salt("cameramodel")
+                        .selected_text(crate::CAMERA_MODELS[self.camera_model])
+                        .width(130.0)
+                        .show_ui(ui, |ui| {
+                            for (i, m) in crate::CAMERA_MODELS.iter().enumerate() {
+                                ui.selectable_value(&mut self.camera_model, i, *m);
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Camera model for images no [[cameras]] entry covers.                              SIMPLE_RADIAL suits a narrow lens; a wide one needs                              OPENCV, and past ~100 degrees diagonal, OPENCV_FISHEYE.",
+                        );
                     if ui.button("① Feature").clicked() {
                         self.run.spawn(
                             &self.project,
@@ -345,6 +364,8 @@ impl App {
                                 "feature".into(),
                                 "--detector".into(),
                                 DETECTORS[self.detector].into(),
+                                "--camera-model".into(),
+                                crate::CAMERA_MODELS[self.camera_model].into(),
                             ],
                         );
                     }
@@ -920,6 +941,30 @@ impl App {
                         "camera {}  ({})  ·  {} image(s)  ·  {} observation(s)",
                         cam.camera_id, cam.model_name, cam.num_images, cam.num_observations
                     ));
+                    // Field of view decides whether the chosen model can even
+                    // represent this lens, and it is not otherwise anywhere in
+                    // the UI - the focal alone does not say, because it means
+                    // nothing without the sensor size beside it.
+                    if let Some((hfov, dfov)) = cam.field_of_view_deg {
+                        let advice = if dfov > 100.0 {
+                            Some("wide enough that OPENCV_FISHEYE is worth testing")
+                        } else if dfov > 70.0 && cam.model_name.starts_with("SIMPLE_") {
+                            Some("too wide for a single radial term - try OPENCV")
+                        } else {
+                            None
+                        };
+                        let text =
+                            format!("field of view  {hfov:.0}° horizontal, {dfov:.0}° diagonal");
+                        match advice {
+                            Some(a) => {
+                                ui.label(egui::RichText::new(text).color(warn_color()));
+                                ui.label(egui::RichText::new(format!("   {a}")).small().weak());
+                            }
+                            None => {
+                                ui.label(text);
+                            }
+                        }
+                    }
                     match cam.focal_initial {
                         Some((ix, iy)) => ui.label(format!(
                             "focal  initial {:.2} / {:.2}   →   final {:.2} / {:.2}",
