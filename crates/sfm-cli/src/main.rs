@@ -715,6 +715,31 @@ fn cmd_rig(args: RigArgs) -> Result<()> {
         100.0 * mean_rms / solution.mean_spacing
     );
 
+    // The spread is only over captures that agreed about a camera, so on its
+    // own it is survivorship bias: a camera two captures agree on looks as
+    // good as one all five agree on, and it is far less determined. Say how
+    // many captures actually back each number.
+    let mut seen: Vec<usize> = solution.cameras.iter().map(|c| c.observations).collect();
+    seen.sort_unstable();
+    let median_seen = seen.get(seen.len() / 2).copied().unwrap_or(0);
+    let well_backed = seen.iter().filter(|n| **n >= 3).count();
+    println!(
+        "  backed by: median {median_seen} of {} captures; {well_backed}/{} cameras agreed \
+         across 3 or more",
+        rigs.len(),
+        solution.cameras.len()
+    );
+    if median_seen * 2 < rigs.len() {
+        println!(
+            "{}",
+            format_args!(
+                "  NOTE: most cameras agreed in fewer than half the captures, so the spread \
+                 above describes the subset that agreed rather than the rig as a whole. \
+                 Treat it as a lower bound on the real uncertainty."
+            )
+        );
+    }
+
     // A fact about the hardware that nothing in the reconstruction was told,
     // which makes it the cheapest honest check that the result is right.
     let centres: Vec<Vector3<f64>> = solution.cameras.iter().map(|c| c.mean).collect();
