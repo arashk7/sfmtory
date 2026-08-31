@@ -430,6 +430,15 @@ impl App {
                     if ui.button("Init-cam").clicked() {
                         self.run.spawn(&self.project, vec!["init-cam".into()]);
                     }
+                    if ui
+                        .button("Select-model")
+                        .on_hover_text(
+                            "score every camera model on held-out reprojection error                              and report which one this lens actually needs",
+                        )
+                        .clicked()
+                    {
+                        self.run.spawn(&self.project, vec!["select-model".into()]);
+                    }
                 });
                 ui.separator();
                 if ui.button("⟳ Reload model").clicked() {
