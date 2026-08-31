@@ -51,6 +51,10 @@ pub struct ProjectConfig {
     /// infer. Absent for the three layouts it recognises on its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout: Option<LayoutConfig>,
+    /// Several named layouts, for a project that holds more than one dataset
+    /// shape. Takes precedence over `layout` when non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layouts: Vec<NamedLayout>,
 }
 
 /// Declares where capture and camera identity live in a dataset's own naming,
@@ -89,13 +93,41 @@ pub struct LayoutConfig {
     /// directory, camera from the file stem") means one rule covers any depth
     /// instead of one flag per identity, and the declaration reads in the same
     /// order as the path it describes.
-    pub layers: Vec<Layer>,
+    ///
+    /// A level may instead be a *pattern*, when one name carries more than one
+    /// id, or carries one alongside text that is not an id:
+    ///
+    /// ```toml
+    /// layers = ["camera", "frame_{image}"]        # cam3/frame_0007.jpg
+    /// layers = ["cam{camera}_{image}"]            # cam03_0007.jpg
+    /// layers = ["{capture}", "{camera}_left"]     # 9/101_left.jpg
+    /// ```
+    ///
+    /// Anything containing `{` is read as a pattern; everything else is a bare
+    /// role name. See `crate::layout::Layer`.
+    pub layers: Vec<String>,
+}
+
+/// One named layout in a project that keeps several.
+///
+/// Datasets arrive in more than one shape, and a project may hold more than
+/// one - a rig capture beside a video sequence, say - so layouts are named and
+/// listed rather than there being exactly one. `[layout]` remains valid and
+/// means the same as a single unnamed entry here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NamedLayout {
+    pub name: String,
+    /// Used when `sfmtory dataset link` is not given a `--layout`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default: bool,
+    #[serde(flatten)]
+    pub layout: LayoutConfig,
 }
 
 /// What one level of a dataset path identifies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Layer {
+pub enum Role {
     /// A capture: one session of a target, moved between sessions.
     Capture,
     /// A physical camera.
@@ -115,6 +147,13 @@ impl LayoutConfig {
     pub fn source_dir(&self, root: &Path, images_dir: &Path) -> PathBuf {
         let p = self.source.as_deref().unwrap_or(images_dir);
         if p.is_absolute() {
+            return p.to_path_buf();
+        }
+        // Strip a leading `./` from both sides before joining, or a project
+        // opened as `.` with `images_dir = "./images"` prints as `././images`.
+        let root = root.strip_prefix("./").unwrap_or(root);
+        let p = p.strip_prefix("./").unwrap_or(p);
+        if root.as_os_str().is_empty() || root == Path::new(".") {
             p.to_path_buf()
         } else {
             root.join(p)
@@ -225,10 +264,63 @@ impl Project {
     /// the raw tree is by definition in a shape discovery would misread, which
     /// is why the declaration exists.
     pub fn effective_images_dir(&self) -> PathBuf {
-        if self.config.layout.is_some() {
+        if self.config.layout.is_some() || !self.config.layouts.is_empty() {
             self.linked_images_dir()
         } else {
             self.config.images_dir.clone()
+        }
+    }
+
+    /// Every layout this project declares, in a single list regardless of
+    /// whether they came from `[layout]` or `[[layouts]]`.
+    pub fn all_layouts(&self) -> Vec<NamedLayout> {
+        if !self.config.layouts.is_empty() {
+            return self.config.layouts.clone();
+        }
+        self.config
+            .layout
+            .clone()
+            .map(|layout| NamedLayout {
+                name: "default".into(),
+                default: true,
+                layout,
+            })
+            .into_iter()
+            .collect()
+    }
+
+    /// Picks the layout to build a link tree from.
+    ///
+    /// Ambiguity is refused rather than guessed at: with several layouts and
+    /// none marked default, linking the wrong one produces a plausible tree
+    /// with every id wrong, which is worse than an error.
+    pub fn resolve_layout(&self, requested: Option<&str>) -> Result<NamedLayout> {
+        let all = self.all_layouts();
+        if all.is_empty() {
+            anyhow::bail!("this project declares no [layout] or [[layouts]]");
+        }
+        if let Some(name) = requested {
+            return all
+                .into_iter()
+                .find(|l| l.name == name)
+                .ok_or_else(|| anyhow::anyhow!("no layout named \"{name}\" in sfm.toml"));
+        }
+        if all.len() == 1 {
+            return Ok(all.into_iter().next().unwrap());
+        }
+        let defaults: Vec<&NamedLayout> = all.iter().filter(|l| l.default).collect();
+        match defaults.len() {
+            1 => Ok(defaults[0].clone()),
+            0 => anyhow::bail!(
+                "this project declares {} layouts and none is marked `default = true`; \
+                 pass --layout <name>. Available: {}",
+                all.len(),
+                all.iter()
+                    .map(|l| l.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            n => anyhow::bail!("{n} layouts are marked `default = true`; only one may be"),
         }
     }
 
@@ -236,7 +328,7 @@ impl Project {
     /// letting discovery fail with a bare "directory does not exist".
     pub fn require_images_dir(&self) -> Result<PathBuf> {
         let dir = self.effective_images_dir();
-        if self.config.layout.is_some() && !dir.is_dir() {
+        if (self.config.layout.is_some() || !self.config.layouts.is_empty()) && !dir.is_dir() {
             anyhow::bail!(
                 "sfm.toml declares a [layout], but its linked image tree is missing at {}.\n\
                  Run `sfmtory dataset link` to build it.",
@@ -288,6 +380,7 @@ impl Project {
             cameras: Vec::new(),
             poses: Vec::new(),
             layout: None,
+            layouts: Vec::new(),
         };
         let toml_str = toml::to_string_pretty(&config)?;
         fs::write(Self::config_path(root), toml_str)?;
@@ -322,6 +415,7 @@ impl Project {
                 cameras: Vec::new(),
                 poses: Vec::new(),
                 layout: None,
+                layouts: Vec::new(),
             },
             Err(e) => return Err(e).with_context(|| format!("reading {}", config_path.display())),
         };

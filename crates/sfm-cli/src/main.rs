@@ -103,8 +103,50 @@ enum ProjectAction {
 #[derive(Subcommand)]
 enum DatasetAction {
     /// Build the normalised `capture_<n>/cam<n>/` symlink tree that the
-    /// pipeline reads, from the raw tree and the `[layout]` in sfm.toml.
+    /// pipeline reads, from the raw tree and the layout in sfm.toml.
     Link(DatasetLinkArgs),
+    /// List the layouts this project declares.
+    Layouts(DatasetProjectArgs),
+    /// Add a named layout to sfm.toml.
+    AddLayout(DatasetAddLayoutArgs),
+    /// Remove a named layout from sfm.toml.
+    RemoveLayout(DatasetRemoveLayoutArgs),
+}
+
+#[derive(clap::Args)]
+struct DatasetProjectArgs {
+    /// Project directory. Defaults to the current directory.
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct DatasetAddLayoutArgs {
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+    /// Name to refer to this layout by.
+    #[arg(long)]
+    name: String,
+    /// One role per path level, outermost first, ending with the file.
+    /// Roles: capture, camera, image (or frame), ignore. A level may instead
+    /// be a pattern such as `cam{camera}_{image}` when one name carries two
+    /// ids.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    layers: Vec<String>,
+    /// Raw image tree, relative to the project root. Defaults to images_dir.
+    #[arg(long)]
+    source: Option<PathBuf>,
+    /// Use this layout when `dataset link` is not given a `--layout`.
+    #[arg(long)]
+    default: bool,
+}
+
+#[derive(clap::Args)]
+struct DatasetRemoveLayoutArgs {
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+    /// Name of the layout to remove.
+    name: String,
 }
 
 #[derive(clap::Args)]
@@ -118,6 +160,10 @@ struct DatasetLinkArgs {
     /// Replace an existing link tree.
     #[arg(long)]
     force: bool,
+    /// Which named layout to build from. Optional when the project has one
+    /// layout, or one marked `default = true`.
+    #[arg(long)]
+    layout: Option<String>,
 }
 
 #[cfg(feature = "gui")]
@@ -329,6 +375,9 @@ fn main() -> Result<()> {
         },
         Commands::Dataset { action } => match action {
             DatasetAction::Link(args) => cmd_dataset_link(args),
+            DatasetAction::Layouts(args) => cmd_dataset_layouts(args),
+            DatasetAction::AddLayout(args) => cmd_dataset_add_layout(args),
+            DatasetAction::RemoveLayout(args) => cmd_dataset_remove_layout(args),
         },
         #[cfg(feature = "gui")]
         Commands::Gui(args) => gui::launch(args.project, args.view.into()),
@@ -376,21 +425,175 @@ fn default_camera_model(name: &str, w: u32, h: u32) -> Option<CameraModel> {
     CameraModel::from_name_and_params(name, &params)
 }
 
+fn cmd_dataset_layouts(args: DatasetProjectArgs) -> Result<()> {
+    let project = Project::open(&args.project)?;
+    let all = project.all_layouts();
+    if all.is_empty() {
+        println!(
+            "{} declares no layouts. Add one with `sfmtory dataset add-layout`.",
+            Project::config_path(&project.root).display()
+        );
+        return Ok(());
+    }
+    let linked = project.linked_images_dir();
+    for l in &all {
+        let source = l
+            .layout
+            .source_dir(&project.root, &project.config.images_dir);
+        println!("{}{}", l.name, if l.default { "  (default)" } else { "" });
+        println!("  layers  [{}]", l.layout.layers.join(", "));
+        println!("  source  {}", source.display());
+    }
+    println!(
+        "\nlink tree: {} ({})",
+        linked.display(),
+        if linked.is_dir() {
+            "built"
+        } else {
+            "not built"
+        }
+    );
+    Ok(())
+}
+
+/// Appends a `[[layouts]]` block, migrating a lone `[layout]` first.
+///
+/// Editing the file textually rather than re-serialising the parsed config
+/// keeps the user's comments and ordering, which a round-trip through `toml`
+/// would silently discard.
+fn cmd_dataset_add_layout(args: DatasetAddLayoutArgs) -> Result<()> {
+    if args.layers.is_empty() {
+        bail!("--layers needs at least one role, e.g. --layers capture,camera");
+    }
+    let project = Project::open(&args.project)?;
+    if project.all_layouts().iter().any(|l| l.name == args.name) {
+        bail!("this project already has a layout named \"{}\"", args.name);
+    }
+    let path = Project::config_path(&project.root);
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+
+    // A lone `[layout]` and a `[[layouts]]` list cannot both be authoritative,
+    // so the first add converts the old form rather than leaving one silently
+    // ignored.
+    if let Some(existing) = project.config.layout.clone() {
+        let start = text.find("[layout]").unwrap_or(text.len());
+        let end = text[start..]
+            .find("\n[")
+            .map(|i| start + i + 1)
+            .unwrap_or(text.len());
+        text.replace_range(start..end, "");
+        text.push_str(&render_layout("default", true, &existing));
+        println!("migrated the existing [layout] to [[layouts]] named \"default\"");
+    }
+
+    let cfg = project::LayoutConfig {
+        source: args.source,
+        layers: args.layers,
+    };
+    // Fail before writing if the roles are not understood.
+    layout::validate(&cfg)?;
+    text.push_str(&render_layout(&args.name, args.default, &cfg));
+    std::fs::write(&path, text)?;
+    println!("added layout \"{}\" to {}", args.name, path.display());
+    println!(
+        "Run `sfmtory dataset link --layout {}` to build its tree.",
+        args.name
+    );
+    Ok(())
+}
+
+fn render_layout(name: &str, default: bool, cfg: &project::LayoutConfig) -> String {
+    let mut out = format!("\n[[layouts]]\nname = \"{name}\"\n");
+    if default {
+        out.push_str("default = true\n");
+    }
+    if let Some(src) = &cfg.source {
+        out.push_str(&format!("source = {:?}\n", src.display().to_string()));
+    }
+    let layers = cfg
+        .layers
+        .iter()
+        .map(|l| format!("{l:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push_str(&format!("layers = [{layers}]\n"));
+    out
+}
+
+fn cmd_dataset_remove_layout(args: DatasetRemoveLayoutArgs) -> Result<()> {
+    let project = Project::open(&args.project)?;
+    if !project.all_layouts().iter().any(|l| l.name == args.name) {
+        bail!(
+            "no layout named \"{}\"; this project has: {}",
+            args.name,
+            project
+                .all_layouts()
+                .iter()
+                .map(|l| l.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let path = Project::config_path(&project.root);
+    let text = std::fs::read_to_string(&path)?;
+    let Some(updated) = remove_layout_block(&text, &args.name) else {
+        bail!(
+            "layout \"{}\" is not a [[layouts]] block in {}; edit the file by hand",
+            args.name,
+            path.display()
+        );
+    };
+    std::fs::write(&path, updated)?;
+    println!("removed layout \"{}\" from {}", args.name, path.display());
+    Ok(())
+}
+
+/// Deletes the `[[layouts]]` block whose `name` matches, textually.
+///
+/// Returns `None` when no such block is found, so the caller can say so rather
+/// than silently writing the file back unchanged.
+fn remove_layout_block(text: &str, name: &str) -> Option<String> {
+    let needle = format!("name = {name:?}");
+    let mut search_from = 0usize;
+    while let Some(rel) = text[search_from..].find("[[layouts]]") {
+        let start = search_from + rel;
+        let end = text[start + 1..]
+            .find("\n[")
+            .map(|i| start + 1 + i + 1)
+            .unwrap_or(text.len());
+        if text[start..end].lines().any(|l| l.trim() == needle) {
+            let mut out = String::with_capacity(text.len());
+            out.push_str(&text[..start]);
+            out.push_str(&text[end..]);
+            // Collapse the blank run the removal leaves behind.
+            while out.contains("\n\n\n") {
+                out = out.replace("\n\n\n", "\n\n");
+            }
+            return Some(out);
+        }
+        search_from = end;
+    }
+    None
+}
+
 fn cmd_dataset_link(args: DatasetLinkArgs) -> Result<()> {
     let started = Instant::now();
     let project = Project::open(&args.project)?;
-    let Some(cfg) = project.config.layout.clone() else {
+    if project.all_layouts().is_empty() {
         bail!(
-            "{} declares no [layout], so there is nothing to normalise.\n\
+            "{} declares no layout, so there is nothing to normalise.\n\
              Add one when the dataset's directory shape cannot be inferred. `layers` \
              names each level of the path, ending with the file - for a rig dumping one \
              directory per capture and one file per camera:\n\n\
-             [layout]\n\
-             layers = [\"capture\", \"camera\"]\n\n\
-             Roles: capture, camera, image (a shot within one camera), ignore.\n",
+             sfmtory dataset add-layout --name rig --layers capture,camera\n\n\
+             Roles: capture, camera, image (a shot within one camera), ignore. A level \
+             may also be a pattern such as cam{{camera}}_{{image}}.\n",
             Project::config_path(&project.root).display()
         );
-    };
+    }
+    let named = project.resolve_layout(args.layout.as_deref())?;
+    let cfg = named.layout.clone();
+    println!("Layout \"{}\"", named.name);
     let source = cfg.source_dir(&project.root, &project.config.images_dir);
     let plan = layout::plan(&source, &cfg)?;
 
@@ -401,8 +604,11 @@ fn cmd_dataset_link(args: DatasetLinkArgs) -> Result<()> {
         plan.cameras.len(),
         plan.placed.len()
     );
+    let max_slot = plan.placed.iter().map(|p| p.image_index).max().unwrap_or(0);
+    // Only meaningful when each (capture, camera) holds a single frame; with an
+    // image level there are legitimately more images than slots.
     let full = plan.captures.len() * plan.cameras.len();
-    if plan.placed.len() != full {
+    if max_slot == 0 && plan.placed.len() != full {
         println!(
             "  {} of {} (capture, camera) slots are filled",
             plan.placed.len(),
@@ -423,7 +629,6 @@ fn cmd_dataset_link(args: DatasetLinkArgs) -> Result<()> {
             println!("    ... and {} more", plan.gaps.len() - 10);
         }
     }
-    let max_slot = plan.placed.iter().map(|p| p.image_index).max().unwrap_or(0);
     if max_slot > 0 {
         println!("  up to {} shot(s) per camera per capture", max_slot + 1);
     }
@@ -444,6 +649,7 @@ fn cmd_dataset_link(args: DatasetLinkArgs) -> Result<()> {
     let payload = serde_json::json!({
         "stage": "dataset-link",
         "status": "ok",
+        "layout": named.name,
         "source": source.display().to_string(),
         "target": target.display().to_string(),
         "num_captures": plan.captures.len(),

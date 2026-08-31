@@ -126,7 +126,9 @@ struct App {
     /// the user assigns roles to levels that exist rather than counting
     /// directories themselves.
     layout_layers: Vec<usize>,
-    layout_note: Option<String>,
+    /// Name for the layout being added in the editor.
+    layout_name: String,
+    layout_default: bool,
     aruco: aruco::Tester,
     /// Stage options mirrored from the CLI's own defaults.
     detector: usize,
@@ -199,7 +201,8 @@ impl App {
             image_zoom: 1.0,
             image_pan: egui::Vec2::ZERO,
             layout_layers: Vec::new(),
-            layout_note: None,
+            layout_name: String::new(),
+            layout_default: false,
             aruco: aruco::Tester::default(),
             detector: 0,
             pairing: 0,
@@ -452,71 +455,110 @@ impl App {
             });
     }
 
-    /// Declare and build the `[layout]` symlink tree without leaving the
+    /// Declare, select, build and delete dataset layouts without leaving the
     /// viewer.
     ///
-    /// Writing `sfm.toml` from here follows the precedent `init-cam --apply`
-    /// set, including its refusal to overwrite a section that already exists -
-    /// a config file is the user's, and silently rewriting one is worse than
-    /// asking them to edit it.
+    /// Every button here runs the same `sfmtory dataset ...` subcommand you
+    /// would type, as a child process, so the file-editing rules - migrating a
+    /// lone `[layout]`, preserving comments, refusing a duplicate name - live
+    /// in one place and the viewer cannot drift from them.
     fn layout_section(&mut self, ui: &mut egui::Ui) {
         let project = Project::open(&self.project).ok();
-        let declared = project
+        let layouts = project
             .as_ref()
-            .and_then(|p| p.config.layout.as_ref())
-            .is_some();
+            .map(|p| p.all_layouts())
+            .unwrap_or_default();
         let linked = project
             .as_ref()
             .map(|p| p.linked_images_dir().is_dir())
             .unwrap_or(false);
+        let busy = self.run.is_running();
+        let mut action: Option<Vec<String>> = None;
 
         egui::CollapsingHeader::new("Dataset layout")
-            .default_open(declared && !linked)
+            .default_open(!layouts.is_empty() && !linked)
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new(
-                        "For a dataset whose folder shape cannot be inferred - a rig                          dumping one folder per capture and one file per camera, say.",
+                        "For a dataset whose folder shape cannot be inferred - one folder \
+                         per capture with a file per camera, a folder per camera holding a \
+                         video's frames, or ids encoded in the names.",
                     )
                     .small()
                     .weak(),
                 );
-                match (declared, linked) {
-                    (false, _) => {
-                        ui.label("no [layout] declared - the usual case");
-                    }
-                    (true, true) => {
-                        ui.label(
-                            egui::RichText::new("[layout] declared, link tree built")
-                                .color(ok_color()),
-                        );
-                    }
-                    (true, false) => {
-                        ui.label(
-                            egui::RichText::new(
-                                "[layout] declared but not linked yet - run Link",
-                            )
-                            .color(warn_color()),
-                        );
-                    }
-                }
                 ui.add_space(4.0);
-                // Size the editor from the tree itself: the number of levels
-                // is a fact about the dataset, not a choice.
+
+                if layouts.is_empty() {
+                    ui.label("no layouts declared - the usual case");
+                } else {
+                    for l in &layouts {
+                        ui.horizontal(|ui| {
+                            let tag = if l.default { " (default)" } else { "" };
+                            ui.label(egui::RichText::new(format!("{}{tag}", l.name)).strong());
+                            if ui
+                                .add_enabled(!busy, egui::Button::new("link").small())
+                                .on_hover_text("build this layout's symlink tree")
+                                .clicked()
+                            {
+                                action = Some(vec![
+                                    "dataset".into(),
+                                    "link".into(),
+                                    "--force".into(),
+                                    "--layout".into(),
+                                    l.name.clone(),
+                                ]);
+                            }
+                            if ui
+                                .add_enabled(!busy, egui::Button::new("remove").small())
+                                .clicked()
+                            {
+                                action = Some(vec![
+                                    "dataset".into(),
+                                    "remove-layout".into(),
+                                    l.name.clone(),
+                                ]);
+                            }
+                        });
+                        ui.label(
+                            egui::RichText::new(format!("   [{}]", l.layout.layers.join(", ")))
+                                .small()
+                                .weak(),
+                        );
+                    }
+                    ui.label(
+                        egui::RichText::new(if linked {
+                            "link tree built"
+                        } else {
+                            "link tree not built - press link"
+                        })
+                        .small()
+                        .color(if linked {
+                            ok_color()
+                        } else {
+                            warn_color()
+                        }),
+                    );
+                }
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.strong("Add a layout");
+                ui.horizontal(|ui| {
+                    ui.label("name");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.layout_name)
+                            .desired_width(110.0)
+                            .hint_text("rig"),
+                    );
+                });
+                // One row per path level, sized from the tree itself: the depth
+                // is a fact about the dataset rather than a choice.
                 if self.layout_layers.is_empty() {
                     let depth = project
                         .as_ref()
-                        .and_then(|p| {
-                            let src = p
-                                .config
-                                .layout
-                                .as_ref()
-                                .map(|l| l.source_dir(&p.root, &p.config.images_dir))
-                                .unwrap_or_else(|| p.config.images_dir.clone());
-                            crate::layout::probe_depth(&src)
-                        })
+                        .and_then(|p| crate::layout::probe_depth(&p.config.images_dir))
                         .unwrap_or(2);
-                    // Guess the common case: the innermost level is the camera
-                    // and the outermost the capture, everything between ignored.
                     self.layout_layers = (0..depth)
                         .map(|i| {
                             if i == 0 {
@@ -531,8 +573,8 @@ impl App {
                 }
                 for i in 0..self.layout_layers.len() {
                     ui.horizontal(|ui| {
-                        ui.label(format!("level {}", i + 1));
                         let last = i + 1 == self.layout_layers.len();
+                        ui.label(format!("level {}", i + 1));
                         ui.label(
                             egui::RichText::new(if last { "(file)" } else { "(dir) " })
                                 .small()
@@ -549,56 +591,51 @@ impl App {
                     });
                 }
                 ui.horizontal(|ui| {
-                    if ui.button("Write to sfm.toml").clicked() {
-                        self.layout_note = Some(match self.write_layout() {
-                            Ok(path) => format!("wrote [layout] to {}", path.display()),
-                            Err(e) => format!("{e}"),
-                        });
+                    if ui.small_button("+ level").clicked() {
+                        self.layout_layers.push(3);
                     }
-                    let busy = self.run.is_running();
-                    if ui
-                        .add_enabled(!busy, egui::Button::new("Link"))
-                        .on_hover_text("runs `sfmtory dataset link --force`")
-                        .clicked()
-                    {
-                        self.run.spawn(
-                            &self.project,
-                            vec!["dataset".into(), "link".into(), "--force".into()],
-                        );
+                    if ui.small_button("- level").clicked() && self.layout_layers.len() > 1 {
+                        self.layout_layers.pop();
                     }
+                    ui.checkbox(&mut self.layout_default, "default");
                 });
-                if let Some(note) = &self.layout_note {
-                    ui.label(egui::RichText::new(note).small());
+                if ui
+                    .add_enabled(
+                        !busy && !self.layout_name.trim().is_empty(),
+                        egui::Button::new("Add layout"),
+                    )
+                    .clicked()
+                {
+                    let mut args = vec![
+                        "dataset".into(),
+                        "add-layout".into(),
+                        "--name".into(),
+                        self.layout_name.trim().to_string(),
+                        "--layers".into(),
+                    ];
+                    args.extend(
+                        self.layout_layers
+                            .iter()
+                            .map(|&i| LAYER_ROLES[i].to_string()),
+                    );
+                    if self.layout_default {
+                        args.push("--default".into());
+                    }
+                    action = Some(args);
                 }
+                ui.label(
+                    egui::RichText::new(
+                        "A level can also be a pattern like cam{camera}_{image} when one \
+                         name carries two ids; add those by editing sfm.toml.",
+                    )
+                    .small()
+                    .weak(),
+                );
             });
-    }
 
-    /// Appends a `[layout]` block to the project's `sfm.toml`.
-    fn write_layout(&self) -> Result<PathBuf> {
-        let path = Project::config_path(&self.project);
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        if existing.contains("[layout]") {
-            anyhow::bail!(
-                "{} already declares [layout]; edit it by hand instead",
-                path.display()
-            );
+        if let Some(args) = action {
+            self.run.spawn(&self.project, args);
         }
-        let images_line = if existing.trim().is_empty() {
-            "images_dir = \"images\"\n\n"
-        } else {
-            ""
-        };
-        let layers = self
-            .layout_layers
-            .iter()
-            .map(|&i| format!("\"{}\"", LAYER_ROLES[i]))
-            .collect::<Vec<_>>()
-            .join(", ");
-        std::fs::write(
-            &path,
-            format!("{existing}{images_line}\n[layout]\nlayers = [{layers}]\n"),
-        )?;
-        Ok(path)
     }
 
     fn dir_tree(&mut self, ui: &mut egui::Ui, dir: &Path, depth: usize) {

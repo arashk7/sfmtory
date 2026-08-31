@@ -155,12 +155,26 @@ above, which is read the other way round. Nothing in the tree can settle which
 was meant, so guessing would silently reinterpret existing datasets. Declare it
 instead:
 
+```bash
+sfmtory dataset add-layout --name rig --layers capture,camera
+sfmtory dataset layouts          # list
+sfmtory dataset link             # build the symlink tree
+```
+
+which writes:
+
 ```toml
 # sfm.toml
-[layout]
+[[layouts]]
+name = "rig"
 layers = ["capture", "camera"]
 # source = "images"   # optional; defaults to images_dir
 ```
+
+A project may declare several named layouts and pick one with
+`dataset link --layout <name>`; mark one `default = true` to choose it
+implicitly. `dataset remove-layout <name>` deletes one. A lone `[layout]`
+table also still works and means a single unnamed layout.
 
 `layers` names **one role per level of the path**, outermost first, ending with
 the file itself — so the declaration reads in the same order as the path it
@@ -168,16 +182,24 @@ describes, and the same rule covers any depth:
 
 | dataset | `layers` |
 |---|---|
-| `images/9/101.jpg` | `["capture", "camera"]` |
-| `images/cap0/cam0/0001.jpg` | `["capture", "camera", "image"]` |
-| `images/cam0/0001.jpg` | `["camera", "image"]` |
-| `images/session/9/101.jpg` | `["ignore", "capture", "camera"]` |
+| capture dirs, one file per camera — `images/9/101.jpg` | `["capture", "camera"]` |
+| camera dirs holding a video — `images/cam01/frame_0007.jpg` | `["camera", "frame_{image}"]` |
+| camera dirs, one file per capture — `images/cam01/9.jpg` | `["camera", "capture"]` |
+| captures × cameras × frames | `["capture", "camera", "image"]` |
+| everything in the file name — `images/cam03_0007.jpg` | `["cam{camera}_{image}"]` |
+| a wrapper level to skip — `images/session/9/101.jpg` | `["ignore", "capture", "camera"]` |
 
 The roles are `capture`, `camera`, `image` (a shot within one camera, which
-becomes its slot index) and `ignore` (a wrapper level carrying no identity).
-Order is free, so the transpose — camera directories holding one file per
-capture — is just `["camera", "capture"]`. A level you omit simply isn't
-distinguished: with no `capture` level everything lands in one capture.
+becomes its slot index; `frame` is an alias) and `ignore` (a level carrying no
+identity). Order is free, so the transpose — camera directories holding one
+file per capture — is just `["camera", "capture"]`. A level you omit simply
+isn't distinguished: with no `capture` level everything lands in one capture.
+
+When a single name carries **two** ids, write the level as a **pattern**:
+`"cam{camera}_{image}"` reads `cam03_0007` as camera 3, frame 7. Anything
+containing `{` is a pattern; everything else is a bare role. Placeholders
+capture up to the next literal, so they need something to split on — two
+placeholders side by side is rejected rather than split arbitrarily.
 
 If the declared depth doesn't match the tree, you get an error naming the file
 and both depths rather than silently misaligned ids. Then build the normalised

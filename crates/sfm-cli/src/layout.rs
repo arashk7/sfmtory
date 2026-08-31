@@ -36,7 +36,145 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::dataset::is_image_file;
-use crate::project::{Layer, LayoutConfig};
+use crate::project::{LayoutConfig, Role};
+
+/// What one level of a path means: either the whole component is one id, or a
+/// pattern picks several ids out of it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Layer {
+    /// The entire component is this id.
+    Whole(Role),
+    /// Literal text and placeholders, in order.
+    Pattern(Vec<Part>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Part {
+    Literal(String),
+    Placeholder(Role),
+}
+
+impl Layer {
+    /// Parses one `layers` entry. Anything containing `{` is a pattern.
+    pub fn parse(spec: &str) -> Result<Layer> {
+        if !spec.contains('{') {
+            return Ok(Layer::Whole(role_from_name(spec)?));
+        }
+        let mut parts = Vec::new();
+        let mut rest = spec;
+        while let Some(open) = rest.find('{') {
+            if open > 0 {
+                parts.push(Part::Literal(rest[..open].to_string()));
+            }
+            let after = &rest[open + 1..];
+            let close = after
+                .find('}')
+                .ok_or_else(|| anyhow::anyhow!("layer \"{spec}\" has an unclosed `{{`"))?;
+            parts.push(Part::Placeholder(role_from_name(&after[..close])?));
+            rest = &after[close + 1..];
+        }
+        if !rest.is_empty() {
+            parts.push(Part::Literal(rest.to_string()));
+        }
+        // Two placeholders in a row have no boundary between them, so the split
+        // point would be arbitrary and the ids silently wrong.
+        for w in parts.windows(2) {
+            if matches!((&w[0], &w[1]), (Part::Placeholder(_), Part::Placeholder(_))) {
+                bail!(
+                    "layer \"{spec}\" puts two placeholders next to each other; \
+                     separate them with literal text so there is something to split on"
+                );
+            }
+        }
+        Ok(Layer::Pattern(parts))
+    }
+
+    /// Pulls the ids out of one path component, or `None` if it does not match.
+    fn apply(&self, component: &str, out: &mut RoleValues) -> Option<()> {
+        match self {
+            Layer::Whole(role) => {
+                out.push(*role, component);
+                Some(())
+            }
+            Layer::Pattern(parts) => {
+                let mut rest = component;
+                let mut i = 0;
+                while i < parts.len() {
+                    match &parts[i] {
+                        Part::Literal(lit) => {
+                            rest = rest.strip_prefix(lit.as_str())?;
+                            i += 1;
+                        }
+                        Part::Placeholder(role) => {
+                            // Capture up to the next literal, or to the end when
+                            // this placeholder is last. Non-greedy, so
+                            // `cam{camera}_{image}` splits `cam03_0007` at the
+                            // first underscore.
+                            let taken = match parts.get(i + 1) {
+                                Some(Part::Literal(next)) => {
+                                    let at = rest.find(next.as_str())?;
+                                    let (head, tail) = rest.split_at(at);
+                                    rest = tail;
+                                    head
+                                }
+                                _ => {
+                                    let head = rest;
+                                    rest = "";
+                                    head
+                                }
+                            };
+                            if taken.is_empty() {
+                                return None;
+                            }
+                            out.push(*role, taken);
+                            i += 1;
+                        }
+                    }
+                }
+                rest.is_empty().then_some(())
+            }
+        }
+    }
+}
+
+fn role_from_name(name: &str) -> Result<Role> {
+    match name.trim() {
+        "capture" => Ok(Role::Capture),
+        "camera" => Ok(Role::Camera),
+        "image" | "frame" => Ok(Role::Image),
+        "ignore" => Ok(Role::Ignore),
+        other => bail!(
+            "unknown layer role \"{other}\"; expected capture, camera, image (or frame), or ignore"
+        ),
+    }
+}
+
+/// The id text collected for each role while walking one path.
+#[derive(Default)]
+struct RoleValues {
+    capture: Vec<String>,
+    camera: Vec<String>,
+    image: Vec<String>,
+}
+
+impl RoleValues {
+    fn push(&mut self, role: Role, value: &str) {
+        match role {
+            Role::Capture => self.capture.push(value.to_string()),
+            Role::Camera => self.camera.push(value.to_string()),
+            Role::Image => self.image.push(value.to_string()),
+            Role::Ignore => {}
+        }
+    }
+    fn key(&self, role: Role) -> String {
+        match role {
+            Role::Capture => self.capture.join("/"),
+            Role::Camera => self.camera.join("/"),
+            Role::Image => self.image.join("/"),
+            Role::Ignore => String::new(),
+        }
+    }
+}
 
 /// One raw image and the identity the layout gives it.
 #[derive(Debug, Clone)]
@@ -63,6 +201,17 @@ pub struct Plan {
     pub gaps: BTreeMap<u32, Vec<u32>>,
 }
 
+/// Checks a layout's `layers` parse, without touching the filesystem.
+pub fn validate(cfg: &LayoutConfig) -> Result<()> {
+    if cfg.layers.is_empty() {
+        bail!("layers is empty; it needs one entry per path level");
+    }
+    for spec in &cfg.layers {
+        Layer::parse(spec)?;
+    }
+    Ok(())
+}
+
 /// Reads `source` and works out where every image belongs. Creates nothing.
 pub fn plan(source: &Path, cfg: &LayoutConfig) -> Result<Plan> {
     if !source.is_dir() {
@@ -74,6 +223,11 @@ pub fn plan(source: &Path, cfg: &LayoutConfig) -> Result<Plan> {
     if cfg.layers.is_empty() {
         bail!("[layout] layers is empty; it needs one entry per path level, e.g. layers = [\"capture\", \"camera\"]");
     }
+    let layers: Vec<Layer> = cfg
+        .layers
+        .iter()
+        .map(|spec| Layer::parse(spec))
+        .collect::<Result<_>>()?;
     let files = collect_images(source)?;
     if files.is_empty() {
         bail!("no images found under {}", source.display());
@@ -82,11 +236,11 @@ pub fn plan(source: &Path, cfg: &LayoutConfig) -> Result<Plan> {
     // Every image must sit at the declared depth, or the roles line up against
     // the wrong path components and every id afterwards is quietly wrong.
     for f in &files {
-        if f.parts.len() != cfg.layers.len() {
+        if f.parts.len() != layers.len() {
             bail!(
                 "[layout] declares {} level(s) but {} is {} level(s) deep under {}.\n\
                  `layers` lists one role per path level, ending with the file itself.",
-                cfg.layers.len(),
+                layers.len(),
                 f.path.display(),
                 f.parts.len(),
                 source.display()
@@ -100,18 +254,25 @@ pub fn plan(source: &Path, cfg: &LayoutConfig) -> Result<Plan> {
     // misalign the moment a camera is missing from one capture, and silently:
     // the ids would still be dense and unique, just attached to the wrong
     // cameras.
-    let capture_keys: Vec<String> = files
-        .iter()
-        .map(|f| key(f, &cfg.layers, Layer::Capture))
-        .collect();
-    let camera_keys: Vec<String> = files
-        .iter()
-        .map(|f| key(f, &cfg.layers, Layer::Camera))
-        .collect();
-    let image_keys: Vec<String> = files
-        .iter()
-        .map(|f| key(f, &cfg.layers, Layer::Image))
-        .collect();
+    let mut capture_keys = Vec::with_capacity(files.len());
+    let mut camera_keys = Vec::with_capacity(files.len());
+    let mut image_keys = Vec::with_capacity(files.len());
+    for f in &files {
+        let mut values = RoleValues::default();
+        for (layer, component) in layers.iter().zip(&f.parts) {
+            if layer.apply(component, &mut values).is_none() {
+                bail!(
+                    "layer pattern did not match: {} has \"{component}\" where the layout \
+                     expects {}.",
+                    f.path.display(),
+                    describe_layer(layer)
+                );
+            }
+        }
+        capture_keys.push(values.key(Role::Capture));
+        camera_keys.push(values.key(Role::Camera));
+        image_keys.push(values.key(Role::Image));
+    }
     let capture_ids = assign_ids(&capture_keys);
     let camera_ids = assign_ids(&camera_keys);
 
@@ -149,7 +310,7 @@ pub fn plan(source: &Path, cfg: &LayoutConfig) -> Result<Plan> {
             .join(format!("cam{camera_id:03}"))
             .join(file_name);
         if let Some(prev) = seen_identity.get(&(capture_id, camera_id, &image_keys[i])) {
-            let hint = if cfg.layers.contains(&Layer::Image) {
+            let hint = if layers.iter().any(|l| uses_role(l, Role::Image)) {
                 "Check the [layout] layers in sfm.toml."
             } else {
                 "If these are meant to be separate shots of one camera, add an \
@@ -331,19 +492,30 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<RawImage>) -> Result<()> {
     Ok(())
 }
 
-/// Joins the components of every level carrying `role`, so two levels can
-/// jointly identify one thing (a session directory plus a capture directory,
-/// say) without needing a separate rule.
-fn key(f: &RawImage, layers: &[Layer], role: Layer) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    for (i, l) in layers.iter().enumerate() {
-        if *l == role {
-            if let Some(p) = f.parts.get(i) {
-                parts.push(p);
-            }
-        }
+/// Whether a layer contributes to `role`, for error messages and hints.
+fn uses_role(layer: &Layer, role: Role) -> bool {
+    match layer {
+        Layer::Whole(r) => *r == role,
+        Layer::Pattern(parts) => parts
+            .iter()
+            .any(|p| matches!(p, Part::Placeholder(r) if *r == role)),
     }
-    parts.join("/")
+}
+
+/// Renders a layer back to roughly its `sfm.toml` spelling, so an error can
+/// quote what the layout asked for.
+fn describe_layer(layer: &Layer) -> String {
+    match layer {
+        Layer::Whole(r) => format!("{r:?}").to_lowercase(),
+        Layer::Pattern(parts) => parts
+            .iter()
+            .map(|p| match p {
+                Part::Literal(l) => l.clone(),
+                Part::Placeholder(r) => format!("{{{}}}", format!("{r:?}").to_lowercase()),
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+    }
 }
 
 /// Depth of the first image found, so a UI can offer one role per real level
@@ -414,14 +586,14 @@ mod tests {
         d
     }
 
-    fn cfg(layers: &[Layer]) -> LayoutConfig {
+    fn cfg(layers: &[&str]) -> LayoutConfig {
         LayoutConfig {
             source: None,
-            layers: layers.to_vec(),
+            layers: layers.iter().map(|s| s.to_string()).collect(),
         }
     }
 
-    const CAPTURE_CAMERA: [Layer; 2] = [Layer::Capture, Layer::Camera];
+    const CAPTURE_CAMERA: [&str; 2] = ["capture", "camera"];
 
     /// The `p44` shape: capture directories holding one file per camera.
     #[test]
@@ -501,7 +673,7 @@ mod tests {
                 touch(&root.join(cam).join(format!("{cap}.jpg")));
             }
         }
-        let p = plan(&root, &cfg(&[Layer::Camera, Layer::Capture])).unwrap();
+        let p = plan(&root, &cfg(&["camera", "capture"])).unwrap();
         assert_eq!(p.captures, [5, 6].into_iter().collect());
         assert_eq!(p.cameras, [1, 2].into_iter().collect());
         std::fs::remove_dir_all(&root).unwrap();
@@ -614,7 +786,7 @@ mod tests {
                 }
             }
         }
-        let p = plan(&root, &cfg(&[Layer::Capture, Layer::Camera, Layer::Image])).unwrap();
+        let p = plan(&root, &cfg(&["capture", "camera", "image"])).unwrap();
         assert_eq!(p.placed.len(), 12);
         assert_eq!(p.captures.len(), 2);
         assert_eq!(p.cameras.len(), 2);
@@ -646,7 +818,7 @@ mod tests {
         for cap in ["9", "16"] {
             touch(&root.join("session_a").join(cap).join("101.jpg"));
         }
-        let p = plan(&root, &cfg(&[Layer::Ignore, Layer::Capture, Layer::Camera])).unwrap();
+        let p = plan(&root, &cfg(&["ignore", "capture", "camera"])).unwrap();
         assert_eq!(p.captures, [9, 16].into_iter().collect());
         assert_eq!(p.cameras, [101].into_iter().collect());
         std::fs::remove_dir_all(&root).unwrap();
@@ -658,7 +830,7 @@ mod tests {
     fn a_depth_mismatch_is_reported_against_the_actual_file() {
         let root = tmp("depth");
         touch(&root.join("9").join("101.jpg"));
-        let err = plan(&root, &cfg(&[Layer::Capture, Layer::Camera, Layer::Image])).unwrap_err();
+        let err = plan(&root, &cfg(&["capture", "camera", "image"])).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("declares 3 level(s)"), "{msg}");
         assert!(msg.contains("is 2 level(s) deep"), "{msg}");
@@ -686,5 +858,142 @@ mod tests {
             relative_link(Path::new("/a/b"), Path::new("/a/b/x.jpg")).unwrap(),
             PathBuf::from("x.jpg")
         );
+    }
+
+    fn roles(spec: &str, component: &str) -> Option<(String, String, String)> {
+        let layer = Layer::parse(spec).unwrap();
+        let mut v = RoleValues::default();
+        layer.apply(component, &mut v)?;
+        Some((
+            v.key(Role::Capture),
+            v.key(Role::Camera),
+            v.key(Role::Image),
+        ))
+    }
+
+    #[test]
+    fn a_bare_role_takes_the_whole_component() {
+        assert_eq!(Layer::parse("camera").unwrap(), Layer::Whole(Role::Camera));
+        assert_eq!(
+            roles("camera", "cam007"),
+            Some((String::new(), "cam007".into(), String::new()))
+        );
+        // `frame` is an alias for `image`, since that is what a video dataset
+        // calls it.
+        assert_eq!(Layer::parse("frame").unwrap(), Layer::Whole(Role::Image));
+    }
+
+    /// One file name carrying two ids - the case a whole-component role
+    /// cannot express.
+    #[test]
+    fn a_pattern_splits_one_name_into_two_ids() {
+        assert_eq!(
+            roles("cam{camera}_{image}", "cam03_0007"),
+            Some((String::new(), "03".into(), "0007".into()))
+        );
+        assert_eq!(
+            roles("{capture}-{camera}", "9-101"),
+            Some(("9".into(), "101".into(), String::new()))
+        );
+        // Literal text around a single id.
+        assert_eq!(
+            roles("frame_{image}", "frame_0042"),
+            Some((String::new(), String::new(), "0042".into()))
+        );
+    }
+
+    #[test]
+    fn a_pattern_that_does_not_fit_is_rejected_rather_than_guessed() {
+        assert_eq!(roles("cam{camera}_{image}", "img03_0007"), None); // wrong prefix
+        assert_eq!(roles("cam{camera}_{image}", "cam030007"), None); // no separator
+        assert_eq!(
+            roles("frame_{image}", "frame_0042.extra"),
+            Some((String::new(), String::new(), "0042.extra".into()))
+        );
+        assert_eq!(roles("{camera}_left", "101_right"), None); // wrong suffix
+                                                               // An empty capture is not an id.
+        assert_eq!(roles("cam{camera}_{image}", "cam_0007"), None);
+    }
+
+    #[test]
+    fn adjacent_placeholders_are_refused_at_parse_time() {
+        // There would be no way to know where one id ends and the next begins,
+        // so this fails loudly rather than splitting somewhere arbitrary.
+        let err = Layer::parse("{camera}{image}").unwrap_err().to_string();
+        assert!(err.contains("next to each other"), "{err}");
+        assert!(Layer::parse("cam{camera")
+            .unwrap_err()
+            .to_string()
+            .contains("unclosed"));
+        assert!(Layer::parse("{nonsense}")
+            .unwrap_err()
+            .to_string()
+            .contains("unknown layer role"));
+    }
+
+    /// A camera folder holding a video's frames - one of the shapes this has
+    /// to cover.
+    #[test]
+    fn a_video_per_camera_layout_numbers_frames_within_each_camera() {
+        let root = tmp("video");
+        for cam in ["cam01", "cam02"] {
+            for f in ["frame_0001", "frame_0002", "frame_0003"] {
+                touch(&root.join(cam).join(format!("{f}.jpg")));
+            }
+        }
+        let p = plan(&root, &cfg(&["camera", "frame_{image}"])).unwrap();
+        assert_eq!(p.placed.len(), 6);
+        assert_eq!(p.cameras, [1, 2].into_iter().collect());
+        // No capture level, so everything is one capture and the frames become
+        // slots within each camera.
+        assert_eq!(p.captures, [0].into_iter().collect());
+        let idx = |cam: u32, frame: &str| {
+            p.placed
+                .iter()
+                .find(|x| x.camera_id == cam && x.source.ends_with(format!("{frame}.jpg")))
+                .unwrap()
+                .image_index
+        };
+        assert_eq!(idx(1, "frame_0001"), 0);
+        assert_eq!(idx(1, "frame_0003"), 2);
+        assert_eq!(idx(2, "frame_0003"), 2);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Everything encoded in one flat file name.
+    #[test]
+    fn a_flat_layout_can_carry_both_ids_in_the_file_name() {
+        let root = tmp("flat_encoded");
+        for cam in ["01", "02"] {
+            for cap in ["9", "16"] {
+                touch(&root.join(format!("cam{cam}_{cap}.png")));
+            }
+        }
+        let p = plan(&root, &cfg(&["cam{camera}_{capture}"])).unwrap();
+        assert_eq!(p.placed.len(), 4);
+        assert_eq!(p.cameras, [1, 2].into_iter().collect());
+        assert_eq!(p.captures, [9, 16].into_iter().collect());
+        assert!(p.gaps.is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_pattern_mismatch_names_the_file_and_what_was_expected() {
+        let root = tmp("mismatch");
+        touch(&root.join("cam01_0007.jpg"));
+        touch(&root.join("stray.jpg"));
+        let err = plan(&root, &cfg(&["cam{camera}_{image}"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("stray"), "{err}");
+        assert!(err.contains("cam{camera}_{image}"), "{err}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_bad_specs_without_touching_the_filesystem() {
+        assert!(validate(&cfg(&["capture", "camera"])).is_ok());
+        assert!(validate(&cfg(&[])).is_err());
+        assert!(validate(&cfg(&["capture", "nonsense"])).is_err());
     }
 }
