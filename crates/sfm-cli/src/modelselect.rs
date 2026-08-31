@@ -59,6 +59,36 @@ pub struct CameraChoice {
     pub recommended: &'static str,
 }
 
+/// A glob selecting exactly one camera's images, for a `[[cameras]]` entry.
+///
+/// Different lenses on one rig need different models, so applying a single
+/// choice to `images = "*"` would be wrong wherever the answer varies. The
+/// glob is derived from the images themselves: a path component that all of
+/// this camera's images share and no other camera's image has. In a linked
+/// tree that is the `camNNN` directory, but nothing here assumes that - a
+/// dataset whose cameras are distinguished some other way works the same, and
+/// one where no such component exists says so instead of guessing.
+pub fn glob_for_camera(mine: &[String], others: &[String]) -> Option<String> {
+    let components =
+        |name: &str| -> Vec<String> { name.split('/').map(|s| s.to_string()).collect() };
+    let mut shared: Option<std::collections::BTreeSet<String>> = None;
+    for name in mine {
+        let set: std::collections::BTreeSet<String> = components(name).into_iter().collect();
+        shared = Some(match shared {
+            Some(acc) => acc.intersection(&set).cloned().collect(),
+            None => set,
+        });
+    }
+    let shared = shared?;
+    let elsewhere: std::collections::BTreeSet<String> =
+        others.iter().flat_map(|n| components(n)).collect();
+    // Longest first, so a more specific component wins over a shorter one that
+    // happens to be unique by accident.
+    let mut unique: Vec<&String> = shared.difference(&elsewhere).collect();
+    unique.sort_by_key(|c| std::cmp::Reverse(c.len()));
+    unique.first().map(|c| format!("*{c}*"))
+}
+
 /// How much better a richer model must be before it is worth its parameters.
 ///
 /// Held-out error already penalises overfitting, but it is itself a noisy
@@ -71,13 +101,58 @@ const IMPROVEMENT_MARGIN: f64 = 0.02;
 /// no distortion term at all is never the right answer for a real lens, and
 /// including it only invites it to win on a camera with too few observations
 /// to fit anything.
-pub const CANDIDATES: [&str; 5] = [
+pub const CANDIDATES: [&str; 6] = [
     "PINHOLE",
     "SIMPLE_RADIAL",
     "RADIAL",
+    "RADIAL3",
     "OPENCV",
     "OPENCV_FISHEYE",
 ];
+
+/// How much the folds actually overlap in the points they observe.
+///
+/// Held-out reprojection error only means anything when the held-out
+/// observations are scored against points the training folds could place. If
+/// every point belongs to exactly one fold, holding that fold out removes the
+/// point entirely, the score falls back on structure fitted with the held-out
+/// data in it, and the comparison silently measures nothing.
+///
+/// That is not hypothetical. Fiducial corners are stamped with their capture
+/// so a marker moved between captures cannot match itself across them - which
+/// means, on a capture-folded dataset, every point belongs to exactly one
+/// capture by construction. Measured on a 4-camera rig: 0% of points were
+/// shared between folds, and the selector confidently recommended PINHOLE for
+/// four cameras whose true models were two RADIAL3 and two OPENCV_FISHEYE.
+pub struct FoldOverlap {
+    /// Points observed in more than one fold, over all points.
+    pub shared_fraction: f64,
+    pub num_points: usize,
+}
+
+/// Below this the folds are too disjoint for held-out scoring to mean
+/// anything, and the selector abstains instead of ranking noise.
+pub const MIN_SHARED_POINTS: f64 = 0.2;
+
+pub fn fold_overlap(problem: &Problem, folds: &Folds) -> FoldOverlap {
+    let mut folds_of_point: BTreeMap<usize, std::collections::BTreeSet<usize>> = BTreeMap::new();
+    for (i, o) in problem.observations.iter().enumerate() {
+        folds_of_point
+            .entry(o.point_idx)
+            .or_default()
+            .insert(folds.of_observation[i]);
+    }
+    let num_points = folds_of_point.len();
+    let shared = folds_of_point.values().filter(|f| f.len() > 1).count();
+    FoldOverlap {
+        shared_fraction: if num_points == 0 {
+            0.0
+        } else {
+            shared as f64 / num_points as f64
+        },
+        num_points,
+    }
+}
 
 /// Which fold each observation belongs to.
 pub struct Folds {
@@ -200,6 +275,7 @@ pub fn reseed(cam: &CameraModel, name: &str) -> Option<CameraModel> {
         "PINHOLE" => vec![fx, fy, cx, cy],
         "SIMPLE_RADIAL" => vec![fx, cx, cy, 0.0],
         "RADIAL" => vec![fx, cx, cy, 0.0, 0.0],
+        "RADIAL3" => vec![fx, cx, cy, 0.0, 0.0, 0.0],
         "OPENCV" | "OPENCV_FISHEYE" => vec![fx, fy, cx, cy, 0.0, 0.0, 0.0, 0.0],
         _ => return None,
     };
@@ -402,6 +478,91 @@ mod tests {
             count: p.poses.len(),
             kind: "image",
         }
+    }
+
+    /// The confound that made the selector confidently wrong: capture folds
+    /// on fiducial data share no points at all, because every marker is
+    /// stamped with its capture.
+    #[test]
+    fn disjoint_folds_are_detected_as_unable_to_discriminate() {
+        let truth = CameraModel::SimpleRadial {
+            f: 900.0,
+            cx: 640.0,
+            cy: 512.0,
+            k: -0.1,
+        };
+        let recon = synthetic(truth, 0.0);
+        let problem = Problem::from_reconstruction(&recon).unwrap();
+
+        // Each point assigned wholly to one fold, as capture stamping does.
+        let disjoint = Folds {
+            of_observation: problem
+                .observations
+                .iter()
+                .map(|o| o.point_idx % 5)
+                .collect(),
+            count: 5,
+            kind: "capture",
+        };
+        assert_eq!(fold_overlap(&problem, &disjoint).shared_fraction, 0.0);
+        assert!(fold_overlap(&problem, &disjoint).shared_fraction < MIN_SHARED_POINTS);
+
+        // Folding by image keeps every point in several folds, which is what
+        // makes held-out scoring meaningful.
+        let by_image = Folds {
+            of_observation: problem.observations.iter().map(|o| o.image_idx).collect(),
+            count: problem.poses.len(),
+            kind: "image",
+        };
+        let o = fold_overlap(&problem, &by_image);
+        assert!(
+            o.shared_fraction > 0.99,
+            "every point is seen by every image here, got {}",
+            o.shared_fraction
+        );
+        assert_eq!(o.num_points, 144);
+    }
+
+    #[test]
+    fn a_glob_selects_one_camera_and_no_other() {
+        // The linked-tree shape: the camNNN directory is what distinguishes
+        // cameras, and every capture directory is shared between them.
+        let cam1 = vec![
+            "capture_009/cam001/1.jpg".to_string(),
+            "capture_016/cam001/1.jpg".to_string(),
+        ];
+        let cam2 = vec![
+            "capture_009/cam002/2.jpg".to_string(),
+            "capture_016/cam002/2.jpg".to_string(),
+        ];
+        let g = glob_for_camera(&cam1, &cam2).unwrap();
+        assert_eq!(g, "*cam001*");
+        assert!(cam1.iter().all(|n| crate::project::glob_match(&g, n)));
+        assert!(cam2.iter().all(|n| !crate::project::glob_match(&g, n)));
+    }
+
+    #[test]
+    fn indistinguishable_cameras_report_no_glob_rather_than_a_wrong_one() {
+        // Same file names under the same directories: nothing tells them
+        // apart, so there is no glob and the caller must be told.
+        let a = vec!["shared/1.jpg".to_string()];
+        let b = vec!["shared/1.jpg".to_string()];
+        assert!(glob_for_camera(&a, &b).is_none());
+    }
+
+    #[test]
+    fn radial3_is_a_candidate_and_reseeds_with_three_terms() {
+        assert!(CANDIDATES.contains(&"RADIAL3"));
+        let cam = CameraModel::SimpleRadial {
+            f: 900.0,
+            cx: 320.0,
+            cy: 240.0,
+            k: -0.2,
+        };
+        let r3 = reseed(&cam, "RADIAL3").unwrap();
+        assert_eq!(r3.name(), "RADIAL3");
+        assert_eq!(r3.params().len(), 6);
+        assert!(r3.opencv_distortion().iter().all(|d| *d == 0.0));
     }
 
     #[test]

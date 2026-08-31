@@ -439,11 +439,12 @@ fn cmd_project_new(dir: &PathBuf, images: &PathBuf) -> Result<()> {
 /// whichever model was requested. Distortion terms start at zero.
 /// Every model `CameraModel::from_name_and_params` understands, in increasing
 /// order of parameter count.
-pub const CAMERA_MODELS: [&str; 6] = [
+pub const CAMERA_MODELS: [&str; 7] = [
     "SIMPLE_PINHOLE",
     "PINHOLE",
     "SIMPLE_RADIAL",
     "RADIAL",
+    "RADIAL3",
     "OPENCV",
     "OPENCV_FISHEYE",
 ];
@@ -456,6 +457,7 @@ fn default_camera_model(name: &str, w: u32, h: u32) -> Option<CameraModel> {
         "PINHOLE" => vec![f, f, cx, cy],
         "SIMPLE_RADIAL" => vec![f, cx, cy, 0.0],
         "RADIAL" => vec![f, cx, cy, 0.0, 0.0],
+        "RADIAL3" => vec![f, cx, cy, 0.0, 0.0, 0.0],
         "OPENCV" => vec![f, f, cx, cy, 0.0, 0.0, 0.0, 0.0],
         "OPENCV_FISHEYE" => vec![f, f, cx, cy, 0.0, 0.0, 0.0, 0.0],
         _ => return None,
@@ -552,6 +554,31 @@ fn cmd_select_model(args: SelectModelArgs) -> Result<()> {
         bail!("need at least 2 folds to score a model on data it was not fitted to");
     }
 
+    // Refuse to rank models the data cannot separate. See `fold_overlap`.
+    let overlap = modelselect::fold_overlap(&problem, &folds);
+    println!(
+        "{:.0}% of points are observed in more than one fold",
+        overlap.shared_fraction * 100.0
+    );
+    if overlap.shared_fraction < modelselect::MIN_SHARED_POINTS {
+        println!();
+        bail!(
+            "these folds share almost no points ({:.0}% of {}), so held-out reprojection error \
+             cannot tell the models apart - a point that only its own fold observes is scored \
+             against structure that fold helped place.\n\n\
+             With fiducial folds this is structural: every marker is stamped with its capture, \
+             so each point belongs to exactly one capture by construction.\n\n\
+             What does work here is comparing whole reconstructions: run `map` with each \
+             candidate set via `[[cameras]] model = ...` and compare point count and mean \
+             reprojection error. On a 4-camera rig that separated the true models clearly \
+             (0.921px/677pts) from a swapped assignment (1.239px/649pts) while this comparison \
+             saw nothing.\n\n\
+             Pass --fold-by-image to score anyway, understanding the above.",
+            overlap.shared_fraction * 100.0,
+            overlap.num_points
+        );
+    }
+
     let choices = modelselect::select(&problem, &folds);
     let mut tally: std::collections::BTreeMap<&str, usize> = Default::default();
     for c in &choices {
@@ -588,26 +615,70 @@ fn cmd_select_model(args: SelectModelArgs) -> Result<()> {
         progress::human_secs(started.elapsed().as_secs_f64())
     );
 
+    // One entry per camera, because a rig can carry more than one lens and
+    // this is exactly the case where a single `images = "*"` rule is wrong.
+    let names_of: HashMap<u32, Vec<String>> =
+        recon.images.values().fold(HashMap::new(), |mut acc, im| {
+            acc.entry(im.camera_id).or_default().push(im.name.clone());
+            acc
+        });
+    let mut blocks = Vec::new();
+    let mut ungloballable = Vec::new();
+    for c in &choices {
+        let mine = names_of.get(&c.camera_id).cloned().unwrap_or_default();
+        let others: Vec<String> = names_of
+            .iter()
+            .filter(|(id, _)| **id != c.camera_id)
+            .flat_map(|(_, v)| v.clone())
+            .collect();
+        match modelselect::glob_for_camera(&mine, &others) {
+            Some(glob) => blocks.push((c.camera_id, glob, c.recommended)),
+            None => ungloballable.push(c.camera_id),
+        }
+    }
+    if !ungloballable.is_empty() {
+        println!(
+            "note: {} camera(s) share every path component with another, so no glob can \
+             select them individually: {:?}",
+            ungloballable.len(),
+            &ungloballable[..ungloballable.len().min(8)]
+        );
+    }
+
     if args.apply {
+        if blocks.is_empty() {
+            bail!("no camera could be selected by a glob, so there is nothing to write");
+        }
         let path = Project::config_path(&project.root);
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
         if existing.contains("[[cameras]]") {
             bail!(
-                "{} already declares [[cameras]]; not overwriting. Set `model = \"{winner}\"` \
-                 there by hand instead.",
+                "{} already declares [[cameras]]; not overwriting. The recommendations are \
+                 above - set them there by hand instead.",
                 path.display()
             );
         }
-        std::fs::write(
-            &path,
-            format!(
-                "{existing}\n# Selected by `sfmtory select-model` on held-out reprojection error.\n\
-                 [[cameras]]\nname = \"select-model\"\nimages = \"*\"\nmodel = \"{winner}\"\n"
-            ),
-        )?;
-        println!("Applied {winner} to {}", path.display());
+        let mut out = format!(
+            "{existing}\n# Selected by `sfmtory select-model` on held-out reprojection error,\n\
+             # scored over {} fold(s) by {}.\n",
+            folds.count, folds.kind
+        );
+        for (camera_id, glob, model) in &blocks {
+            out.push_str(&format!(
+                "\n[[cameras]]\nname = \"camera{camera_id}\"\nimages = \"{glob}\"\nmodel = \"{model}\"\n"
+            ));
+        }
+        std::fs::write(&path, out)?;
+        println!(
+            "Applied {} per-camera entr(y/ies) to {}",
+            blocks.len(),
+            path.display()
+        );
     } else {
-        println!("Re-run with --apply to write `model = \"{winner}\"` into sfm.toml.");
+        println!("Re-run with --apply to write one [[cameras]] entry per camera.");
+        for (camera_id, glob, model) in blocks.iter().take(6) {
+            println!("   camera {camera_id}: images = \"{glob}\"  model = \"{model}\"");
+        }
     }
 
     project.record_log(

@@ -36,6 +36,7 @@ fn principal_point_indices(cam: &CameraModel) -> &'static [usize] {
         CameraModel::Pinhole { .. } => &[2, 3],
         CameraModel::SimpleRadial { .. } => &[1, 2],
         CameraModel::Radial { .. } => &[1, 2],
+        CameraModel::Radial3 { .. } => &[1, 2],
         CameraModel::OpenCV { .. } => &[2, 3],
         CameraModel::OpenCVFisheye { .. } => &[2, 3],
     }

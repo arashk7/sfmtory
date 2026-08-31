@@ -33,6 +33,21 @@ pub enum CameraModel {
         k1: f64,
         k2: f64,
     },
+    /// params: f, cx, cy, k1, k2, k3
+    ///
+    /// `Radial` with a third radial term. The extra coefficient matters on
+    /// wide lenses, where distortion stops being well described by a
+    /// quadratic in `r^2` before the projection stops being rectilinear -
+    /// leaving a gap between `RADIAL` and `OPENCV_FISHEYE` that neither
+    /// covers well.
+    Radial3 {
+        f: f64,
+        cx: f64,
+        cy: f64,
+        k1: f64,
+        k2: f64,
+        k3: f64,
+    },
     /// params: fx, fy, cx, cy, k1, k2, p1, p2
     OpenCV {
         fx: f64,
@@ -65,6 +80,7 @@ impl CameraModel {
             CameraModel::Pinhole { .. } => "PINHOLE",
             CameraModel::SimpleRadial { .. } => "SIMPLE_RADIAL",
             CameraModel::Radial { .. } => "RADIAL",
+            CameraModel::Radial3 { .. } => "RADIAL3",
             CameraModel::OpenCV { .. } => "OPENCV",
             CameraModel::OpenCVFisheye { .. } => "OPENCV_FISHEYE",
         }
@@ -77,6 +93,7 @@ impl CameraModel {
             CameraModel::Pinhole { .. } => 1,
             CameraModel::SimpleRadial { .. } => 2,
             CameraModel::Radial { .. } => 3,
+            CameraModel::Radial3 { .. } => 4,
             CameraModel::OpenCV { .. } => 4,
             CameraModel::OpenCVFisheye { .. } => 5,
         }
@@ -100,6 +117,14 @@ impl CameraModel {
                 cx: params[1],
                 cy: params[2],
                 k: params[3],
+            },
+            "RADIAL3" => CameraModel::Radial3 {
+                f: params[0],
+                cx: params[1],
+                cy: params[2],
+                k1: params[3],
+                k2: params[4],
+                k3: params[5],
             },
             "RADIAL" => CameraModel::Radial {
                 f: params[0],
@@ -139,6 +164,14 @@ impl CameraModel {
             CameraModel::Pinhole { fx, fy, cx, cy } => vec![fx, fy, cx, cy],
             CameraModel::SimpleRadial { f, cx, cy, k } => vec![f, cx, cy, k],
             CameraModel::Radial { f, cx, cy, k1, k2 } => vec![f, cx, cy, k1, k2],
+            CameraModel::Radial3 {
+                f,
+                cx,
+                cy,
+                k1,
+                k2,
+                k3,
+            } => vec![f, cx, cy, k1, k2, k3],
             CameraModel::OpenCV {
                 fx,
                 fy,
@@ -169,6 +202,7 @@ impl CameraModel {
             CameraModel::Pinhole { fx, fy, .. } => (fx, fy),
             CameraModel::SimpleRadial { f, .. } => (f, f),
             CameraModel::Radial { f, .. } => (f, f),
+            CameraModel::Radial3 { f, .. } => (f, f),
             CameraModel::OpenCV { fx, fy, .. } => (fx, fy),
             CameraModel::OpenCVFisheye { fx, fy, .. } => (fx, fy),
         }
@@ -181,6 +215,7 @@ impl CameraModel {
             | CameraModel::Pinhole { cx, cy, .. }
             | CameraModel::SimpleRadial { cx, cy, .. }
             | CameraModel::Radial { cx, cy, .. }
+            | CameraModel::Radial3 { cx, cy, .. }
             | CameraModel::OpenCV { cx, cy, .. }
             | CameraModel::OpenCVFisheye { cx, cy, .. } => (cx, cy),
         }
@@ -194,6 +229,7 @@ impl CameraModel {
             CameraModel::SimplePinhole { .. } | CameraModel::Pinhole { .. } => [0.0; 6],
             CameraModel::SimpleRadial { k, .. } => [k, 0.0, 0.0, 0.0, 0.0, 0.0],
             CameraModel::Radial { k1, k2, .. } => [k1, k2, 0.0, 0.0, 0.0, 0.0],
+            CameraModel::Radial3 { k1, k2, k3, .. } => [k1, k2, 0.0, 0.0, k3, 0.0],
             CameraModel::OpenCV { k1, k2, p1, p2, .. } => [k1, k2, p1, p2, 0.0, 0.0],
             CameraModel::OpenCVFisheye { k1, k2, k3, k4, .. } => [k1, k2, 0.0, 0.0, k3, k4],
         }
@@ -220,6 +256,11 @@ impl CameraModel {
                 let d = 1.0 + k1 * r2 + k2 * r2 * r2;
                 (fx * (x * d) + cx, fy * (y * d) + cy)
             }
+            CameraModel::Radial3 { k1, k2, k3, .. } => {
+                let r2 = x * x + y * y;
+                let d = 1.0 + r2 * (k1 + r2 * (k2 + r2 * k3));
+                (fx * (x * d) + cx, fy * (y * d) + cy)
+            }
             CameraModel::OpenCV { k1, k2, p1, p2, .. } => {
                 let r2 = x * x + y * y;
                 let radial = 1.0 + k1 * r2 + k2 * r2 * r2;
@@ -241,5 +282,94 @@ impl CameraModel {
                 (fx * (x * scale) + cx, fy * (y * scale) + cy)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod radial3_tests {
+    use super::*;
+
+    #[test]
+    fn radial3_round_trips_through_its_name_and_params() {
+        let cam = CameraModel::Radial3 {
+            f: 1234.5,
+            cx: 640.0,
+            cy: 512.0,
+            k1: -0.21,
+            k2: 0.04,
+            k3: -0.006,
+        };
+        assert_eq!(cam.name(), "RADIAL3");
+        let params = cam.params();
+        assert_eq!(params.len(), 6);
+        assert_eq!(
+            CameraModel::from_name_and_params("RADIAL3", &params),
+            Some(cam)
+        );
+        // The third coefficient must survive the OpenCV-ordered view, which
+        // puts k3 in slot 4 (after the two tangential terms this model lacks).
+        assert_eq!(
+            cam.opencv_distortion(),
+            [-0.21, 0.04, 0.0, 0.0, -0.006, 0.0]
+        );
+    }
+
+    /// With `k3 = 0` it must reduce exactly to `RADIAL`, or the extra term is
+    /// changing the model rather than extending it.
+    #[test]
+    fn radial3_with_zero_k3_matches_radial() {
+        let r = CameraModel::Radial {
+            f: 900.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: -0.3,
+            k2: 0.09,
+        };
+        let r3 = CameraModel::Radial3 {
+            f: 900.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: -0.3,
+            k2: 0.09,
+            k3: 0.0,
+        };
+        for (x, y, z) in [(0.1, 0.2, 3.0), (-0.4, 0.35, 2.0), (0.0, 0.0, 1.5)] {
+            let p = nalgebra::Vector3::new(x, y, z);
+            let (ur, vr) = r.project(&p);
+            let (u3, v3) = r3.project(&p);
+            assert!((ur - u3).abs() < 1e-12 && (vr - v3).abs() < 1e-12);
+        }
+    }
+
+    /// The third term has to actually bend the projection further out, or it
+    /// buys nothing over `RADIAL`.
+    #[test]
+    fn the_third_term_acts_where_the_second_cannot() {
+        let base = CameraModel::Radial3 {
+            f: 900.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: -0.3,
+            k2: 0.09,
+            k3: 0.0,
+        };
+        let CameraModel::Radial3 { k1, k2, .. } = base else {
+            unreachable!()
+        };
+        let bent = CameraModel::Radial3 {
+            f: 900.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1,
+            k2,
+            k3: -0.05,
+        };
+        // Near the axis the r^6 term is negligible; far out it is not.
+        let near = nalgebra::Vector3::new(0.02, 0.0, 1.0);
+        let far = nalgebra::Vector3::new(0.9, 0.0, 1.0);
+        let d_near = (base.project(&near).0 - bent.project(&near).0).abs();
+        let d_far = (base.project(&far).0 - bent.project(&far).0).abs();
+        assert!(d_near < 1e-6, "near-axis shift {d_near}");
+        assert!(d_far > 1.0, "far-field shift {d_far} should be pixels");
     }
 }

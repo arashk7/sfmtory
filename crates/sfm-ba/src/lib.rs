@@ -457,6 +457,54 @@ fn analytic_jacobians(
                 jc,
             )
         }
+        CameraModel::Radial3 {
+            f,
+            cx,
+            cy,
+            k1,
+            k2,
+            k3,
+        } => {
+            let r2 = xp * xp + yp * yp;
+            let d = 1.0 + r2 * (k1 + r2 * (k2 + r2 * k3));
+            let u = f * xp * d + cx;
+            let v = f * yp * d + cy;
+
+            // kr = d(d)/d(r2), one more term than `Radial`.
+            let kr = k1 + r2 * (2.0 * k2 + 3.0 * k3 * r2);
+            let du_dxp = f * (d + 2.0 * kr * xp * xp);
+            let du_dyp = 2.0 * f * kr * xp * yp;
+            let dv_dxp = du_dyp;
+            let dv_dyp = f * (d + 2.0 * kr * yp * yp);
+            let du_dpc = Vector3::new(
+                du_dxp * inv_z,
+                du_dyp * inv_z,
+                -(du_dxp * pc.x + du_dyp * pc.y) * inv_z * inv_z,
+            );
+            let dv_dpc = Vector3::new(
+                dv_dxp * inv_z,
+                dv_dyp * inv_z,
+                -(dv_dxp * pc.x + dv_dyp * pc.y) * inv_z * inv_z,
+            );
+
+            let mut jc = DMatrix::<f64>::zeros(2, 6);
+            jc[(0, 0)] = xp * d;
+            jc[(0, 1)] = 1.0;
+            jc[(0, 3)] = f * xp * r2;
+            jc[(0, 4)] = f * xp * r2 * r2;
+            jc[(0, 5)] = f * xp * r2 * r2 * r2;
+            jc[(1, 0)] = yp * d;
+            jc[(1, 2)] = 1.0;
+            jc[(1, 3)] = f * yp * r2;
+            jc[(1, 4)] = f * yp * r2 * r2;
+            jc[(1, 5)] = f * yp * r2 * r2 * r2;
+            (
+                SVector::<f64, 2>::new(u - obs.0, v - obs.1),
+                du_dpc,
+                dv_dpc,
+                jc,
+            )
+        }
         CameraModel::OpenCV {
             fx,
             fy,
@@ -1326,6 +1374,18 @@ mod tests {
             cy: 240.0,
             k1: -0.35,
             k2: 0.12,
+        });
+    }
+
+    #[test]
+    fn analytic_matches_numerical_for_radial3() {
+        assert_analytic_matches_numerical(&CameraModel::Radial3 {
+            f: 1420.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: -0.35,
+            k2: 0.12,
+            k3: -0.03,
         });
     }
 
