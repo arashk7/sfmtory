@@ -12,6 +12,7 @@ mod diagnostics;
 mod gui;
 mod initcam;
 mod layout;
+mod modelselect;
 mod progress;
 mod project;
 
@@ -51,6 +52,9 @@ enum Commands {
         #[command(subcommand)]
         action: DatasetAction,
     },
+    /// Choose a camera model per camera by held-out reprojection error.
+    #[command(name = "select-model")]
+    SelectModel(SelectModelArgs),
     /// Open the viewer: 3D scene, camera inspection, and the pipeline stages.
     #[cfg(feature = "gui")]
     Gui(GuiArgs),
@@ -164,6 +168,19 @@ struct DatasetLinkArgs {
     /// layout, or one marked `default = true`.
     #[arg(long)]
     layout: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct SelectModelArgs {
+    /// Project directory. Defaults to the current directory.
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+    /// Write the winning model into sfm.toml as a `[[cameras]]` entry.
+    #[arg(long)]
+    apply: bool,
+    /// Score folds by image even when capture information is available.
+    #[arg(long)]
+    fold_by_image: bool,
 }
 
 #[cfg(feature = "gui")]
@@ -388,6 +405,7 @@ fn main() -> Result<()> {
             DatasetAction::AddLayout(args) => cmd_dataset_add_layout(args),
             DatasetAction::RemoveLayout(args) => cmd_dataset_remove_layout(args),
         },
+        Commands::SelectModel(args) => cmd_select_model(args),
         #[cfg(feature = "gui")]
         Commands::Gui(args) => gui::launch(args.project, args.view.into()),
         Commands::InitCam(args) => cmd_init_cam(args),
@@ -443,6 +461,168 @@ fn default_camera_model(name: &str, w: u32, h: u32) -> Option<CameraModel> {
         _ => return None,
     };
     CameraModel::from_name_and_params(name, &params)
+}
+
+/// Each observation's capture, recovered from the fiducial descriptors.
+///
+/// The reconstruction does not carry capture identity - `--merge-multicaps`
+/// deliberately pools several captures into one image row, and marks it
+/// `capture_id = -1` precisely because no single value is right. The identity
+/// survives per *observation* though: every marker corner was stamped with its
+/// capture at detection time so a moved marker cannot match itself across
+/// captures, and that stamp is still in the descriptor blob.
+fn capture_of_observations(
+    problem: &modelselect::Problem,
+    db: &Database,
+) -> Option<modelselect::Folds> {
+    const STRIDE: usize = 12;
+    let mut per_image: Vec<Vec<u32>> = Vec::with_capacity(problem.image_ids.len());
+    for &id in &problem.image_ids {
+        let fs = db.load_features(id).ok()?;
+        let sfm_core::Descriptors::MarkerCorner { data } = &fs.descriptors else {
+            return None;
+        };
+        per_image.push(
+            (0..fs.keypoints.len())
+                .map(|i| {
+                    let r = data.get(i * STRIDE..i * STRIDE + 4)?;
+                    Some(u32::from_le_bytes([r[0], r[1], r[2], r[3]]))
+                })
+                .collect::<Option<Vec<u32>>>()?,
+        );
+    }
+
+    // Observations carry a point index, not a keypoint index, so recover the
+    // capture by matching the observed pixel back to its keypoint.
+    let mut of_observation = Vec::with_capacity(problem.observations.len());
+    let mut distinct: std::collections::BTreeSet<u32> = Default::default();
+    for o in &problem.observations {
+        let caps = &per_image[o.image_idx];
+        let fs = db.load_features(problem.image_ids[o.image_idx]).ok()?;
+        let idx = fs
+            .keypoints
+            .iter()
+            .position(|k| (k.x as f64 - o.x).abs() < 1e-3 && (k.y as f64 - o.y).abs() < 1e-3)?;
+        let c = *caps.get(idx)?;
+        distinct.insert(c);
+        of_observation.push(c);
+    }
+    if distinct.len() < 2 {
+        return None;
+    }
+    let index: HashMap<u32, usize> = distinct.iter().enumerate().map(|(i, c)| (*c, i)).collect();
+    Some(modelselect::Folds {
+        of_observation: of_observation.iter().map(|c| index[c]).collect(),
+        count: distinct.len(),
+        kind: "capture",
+    })
+}
+
+fn cmd_select_model(args: SelectModelArgs) -> Result<()> {
+    let started = Instant::now();
+    let project = Project::open(&args.project)?;
+    let dir = project.sparse_dir();
+    let recon = sfm_io::read_colmap_model(&dir)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", dir.display()))?;
+    let problem = modelselect::Problem::from_reconstruction(&recon)?;
+
+    // Whole captures are the right folds when they exist; whole images
+    // otherwise. Never a random split - see the module docs.
+    let folds = if args.fold_by_image {
+        None
+    } else {
+        Database::open(&project.database_path())
+            .ok()
+            .and_then(|db| capture_of_observations(&problem, &db))
+    }
+    .unwrap_or_else(|| modelselect::Folds {
+        of_observation: problem.observations.iter().map(|o| o.image_idx).collect(),
+        count: problem.poses.len(),
+        kind: "image",
+    });
+
+    println!(
+        "{} camera(s), {} observations, {} folds by {}",
+        problem.cameras.len(),
+        problem.observations.len(),
+        folds.count,
+        folds.kind
+    );
+    if folds.count < 2 {
+        bail!("need at least 2 folds to score a model on data it was not fitted to");
+    }
+
+    let choices = modelselect::select(&problem, &folds);
+    let mut tally: std::collections::BTreeMap<&str, usize> = Default::default();
+    for c in &choices {
+        *tally.entry(c.recommended).or_insert(0) += 1;
+    }
+
+    // Per-camera detail is unreadable at 193 cameras, so show a few and
+    // summarise the rest.
+    for c in choices.iter().take(3) {
+        println!(
+            "\ncamera {} ({} observations) -> {}",
+            c.camera_id, c.num_observations, c.recommended
+        );
+        for s in &c.scores {
+            println!(
+                "   {:<15} {:>2} params   held-out {:>8.4}px   in-sample {:>8.4}px   ({} folds)",
+                s.name, s.num_params, s.held_out_px, s.in_sample_px, s.folds
+            );
+        }
+    }
+    if choices.len() > 3 {
+        println!("\n... and {} more cameras", choices.len() - 3);
+    }
+
+    println!("\nRecommended model, over {} camera(s):", choices.len());
+    let mut ranked: Vec<(&&str, &usize)> = tally.iter().collect();
+    ranked.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+    for (name, n) in &ranked {
+        println!("  {name:<15} {n} camera(s)");
+    }
+    let winner = ranked.first().map(|(n, _)| **n).unwrap_or("SIMPLE_RADIAL");
+    println!(
+        "elapsed {}",
+        progress::human_secs(started.elapsed().as_secs_f64())
+    );
+
+    if args.apply {
+        let path = Project::config_path(&project.root);
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        if existing.contains("[[cameras]]") {
+            bail!(
+                "{} already declares [[cameras]]; not overwriting. Set `model = \"{winner}\"` \
+                 there by hand instead.",
+                path.display()
+            );
+        }
+        std::fs::write(
+            &path,
+            format!(
+                "{existing}\n# Selected by `sfmtory select-model` on held-out reprojection error.\n\
+                 [[cameras]]\nname = \"select-model\"\nimages = \"*\"\nmodel = \"{winner}\"\n"
+            ),
+        )?;
+        println!("Applied {winner} to {}", path.display());
+    } else {
+        println!("Re-run with --apply to write `model = \"{winner}\"` into sfm.toml.");
+    }
+
+    project.record_log(
+        "select-model",
+        &serde_json::json!({
+            "stage": "select-model",
+            "status": "ok",
+            "fold_kind": folds.kind,
+            "num_folds": folds.count,
+            "recommended": winner,
+            "tally": tally,
+            "elapsed_ms": started.elapsed().as_millis(),
+        }),
+    )?;
+    Ok(())
 }
 
 fn cmd_dataset_layouts(args: DatasetProjectArgs) -> Result<()> {

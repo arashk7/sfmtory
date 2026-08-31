@@ -609,6 +609,43 @@ For a rig of **fixed** cameras where you move the marker board between shots,
 add `--merge-multicaps` to the `feature` step — see
 [Quick start](#quick-start).
 
+## Choosing a camera model (`select-model`)
+
+Every camera starts as whatever `--camera-model` said (default
+`SIMPLE_RADIAL`). To find out what the lens actually needs:
+
+```bash
+sfmtory select-model            # report
+sfmtory select-model --apply    # and write it into sfm.toml
+```
+
+It refits each camera's intrinsics under every candidate model and scores them
+on data they were **not** fitted to. A richer model always fits its own
+training data better, so in-sample error would just rank models by parameter
+count.
+
+The folds are whole **captures** where the dataset has them, whole images
+otherwise — never a random split. Observations inside one capture share a board
+pose and are correlated, so a random split lets a model be scored on the same
+capture it was fitted to and systematically over-selects complex models. (AIC
+and BIC have the same problem: they count correlated observations as
+independent.)
+
+```
+193 camera(s), 310476 observations, 5 folds by capture
+
+camera 1 (1584 observations) -> OPENCV
+   PINHOLE          4 params   held-out   3.1204px   in-sample   3.0981px   (5 folds)
+   SIMPLE_RADIAL    4 params   held-out   1.8830px   in-sample   1.8402px   (5 folds)
+   OPENCV           8 params   held-out   0.7215px   in-sample   0.6944px   (5 folds)
+```
+
+The winner is the *simplest* model within 2% of the best held-out error, so
+extra parameters have to earn their place. In-sample error is shown beside it
+because a model whose in-sample error keeps falling while held-out error rises
+is overfitting, and you should be able to see that rather than take it on
+trust.
+
 ## Evaluating a reconstruction
 
 `sfmtory eval` reads a COLMAP-format model and reports reprojection error
