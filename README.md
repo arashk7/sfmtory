@@ -609,6 +609,54 @@ For a rig of **fixed** cameras where you move the marker board between shots,
 add `--merge-multicaps` to the `feature` step — see
 [Quick start](#quick-start).
 
+## Calibrating a fixed rig (`rig`)
+
+For a scanner rig — cameras bolted in place, target moved between captures:
+
+```bash
+sfmtory feature --detector aruco        # no --merge-multicaps
+sfmtory match --pairing within-capture
+sfmtory rig
+```
+
+A rig is not one scene. The cameras never move, the target does, and each
+capture is a separate scene seen by the same hardware — which is why captures
+are disconnected components of the match graph and an ordinary reconstruction
+can only grow one of them.
+
+`rig` reconstructs each capture on its own, where tracks are long, then uses
+what makes it a rig: every capture is an **independent estimate of the same
+camera arrangement**. It aligns them by their shared cameras and reports the
+spread per camera, in position and optical-axis angle — a measured statement of
+how well your calibration is actually determined, which no single
+reconstruction can give you.
+
+```
+aligned to capture 37 - 4 camera(s), mean spacing 1.2300
+  camera 3: seen in 4 capture(s), position spread 0.10497 (8.53% of spacing), axis spread 21.32 deg
+  mean spread: 0.07906 (6.43% of camera spacing)
+
+rig shape: cameras sit 2.13% of their mean spacing off their own best-fit plane
+  consistent with all cameras on one flat surface
+```
+
+That last line is an **independent** check: it uses a fact about your hardware
+that nothing in the reconstruction was told, so unlike reprojection error it
+cannot be satisfied by a self-consistent but wrong answer.
+
+Alignment is robust to a minority of badly-placed cameras — on a 193-camera rig
+a plain least-squares fit gave a mean spread of 124% of camera spacing, because
+one bad correspondence in a least-squares similarity moves the answer for every
+other camera.
+
+**Do not use `--merge-multicaps` before `rig`.** It pools corners that are
+different 3D points per capture, collapsing multi-view tracks: measured, it put
+a one-wall rig's cameras 16.2% off-plane against 1.1% per capture. It helps
+intrinsics and costs the extrinsics.
+
+`--pairing within-capture` skips pairs that can never match by construction —
+30 pairs instead of 190 on a 5-capture rig, 93k instead of 465k on a larger one.
+
 ## Choosing a camera model (`select-model`)
 
 Every camera starts as whatever `--camera-model` said (default

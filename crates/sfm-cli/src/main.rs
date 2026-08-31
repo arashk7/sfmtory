@@ -670,6 +670,15 @@ fn cmd_rig(args: RigArgs) -> Result<()> {
     for (capture, why) in &solution.skipped {
         println!("  capture {capture} not aligned: {why}");
     }
+    if !solution.agreement.is_empty() {
+        println!("\nhow much of the rig each capture agrees with the reference on:");
+        for (capture, inliers, shared) in &solution.agreement {
+            println!(
+                "  capture {capture:>4}: {inliers:>4}/{shared:<4} cameras ({:.0}%)",
+                100.0 * *inliers as f64 / (*shared).max(1) as f64
+            );
+        }
+    }
 
     println!(
         "\naligned to capture {} - {} camera(s), mean spacing {:.4}",

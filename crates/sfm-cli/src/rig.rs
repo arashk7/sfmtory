@@ -146,12 +146,99 @@ pub struct RigSolution {
     pub skipped: Vec<(i64, String)>,
     /// Mean spacing between cameras, the scale everything else is relative to.
     pub mean_spacing: f64,
+    /// `(capture, cameras that agreed, cameras shared)` per aligned capture.
+    /// A low ratio means that capture's reconstruction disagrees with the
+    /// reference about where most of the rig is, which is worth seeing.
+    pub agreement: Vec<(i64, usize, usize)>,
+}
+
+/// Similarity alignment that tolerates a minority of badly-placed cameras.
+///
+/// Plain least squares is the wrong tool here and measurably so. On a
+/// 193-camera cube rig every capture reconstructed 189-192 cameras, but a
+/// handful in each came out grossly misplaced; fitting all of them at once
+/// dragged the whole transform, and the aligned result had a mean spread of
+/// **124% of camera spacing** with individual cameras past 1000%. A single bad
+/// correspondence in a least-squares similarity moves the answer for every
+/// other camera.
+///
+/// So the transform is estimated from minimal samples and scored by how many
+/// cameras it explains, then refitted on those. `threshold` is in the units of
+/// `to`, and callers should scale it to the rig rather than pass an absolute.
+pub fn robust_umeyama(
+    from: &[Vector3<f64>],
+    to: &[Vector3<f64>],
+    threshold: f64,
+) -> Option<(Similarity, Vec<usize>)> {
+    let n = from.len();
+    if n < 3 {
+        return None;
+    }
+    // Deterministic sampling: a calibration that changes between identical
+    // runs cannot be checked against itself.
+    let mut best: Option<(Similarity, Vec<usize>)> = None;
+    let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    const ITERATIONS: usize = 256;
+    for _ in 0..ITERATIONS {
+        let mut idx = [0usize; 3];
+        for slot in idx.iter_mut() {
+            *slot = (next() % n as u64) as usize;
+        }
+        if idx[0] == idx[1] || idx[1] == idx[2] || idx[0] == idx[2] {
+            continue;
+        }
+        let f: Vec<Vector3<f64>> = idx.iter().map(|&i| from[i]).collect();
+        let t: Vec<Vector3<f64>> = idx.iter().map(|&i| to[i]).collect();
+        let Some(sim) = umeyama(&f, &t) else {
+            continue;
+        };
+        if !sim.scale.is_finite() || sim.scale <= 0.0 {
+            continue;
+        }
+        let inliers: Vec<usize> = (0..n)
+            .filter(|&i| (sim.apply(&from[i]) - to[i]).norm() < threshold)
+            .collect();
+        if best.as_ref().is_none_or(|(_, b)| inliers.len() > b.len()) {
+            best = Some((sim, inliers));
+        }
+    }
+    let (_, inliers) = best?;
+    if inliers.len() < 3 {
+        return None;
+    }
+    // Refit on everything the winning sample explained.
+    let f: Vec<Vector3<f64>> = inliers.iter().map(|&i| from[i]).collect();
+    let t: Vec<Vector3<f64>> = inliers.iter().map(|&i| to[i]).collect();
+    umeyama(&f, &t).map(|sim| (sim, inliers))
 }
 
 /// Brings every capture into the reference capture's frame and reports where
 /// each camera sits, with its spread.
 pub fn solve(rigs: &[CaptureRig], min_shared: usize) -> Result<RigSolution> {
-    let Some(reference) = rigs.iter().max_by_key(|r| r.centres.len()) else {
+    // Reference by quality, not just by count. Picking purely the most
+    // cameras chose a capture with 5.6px reprojection error over four others
+    // between 0.66 and 1.35 - every other capture was then aligned onto the
+    // worst reconstruction available.
+    let mut errs: Vec<f64> = rigs
+        .iter()
+        .filter(|r| r.mean_reprojection_px.is_finite() && r.mean_reprojection_px > 0.0)
+        .map(|r| r.mean_reprojection_px)
+        .collect();
+    errs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_err = errs.get(errs.len() / 2).copied().unwrap_or(f64::MAX);
+    let acceptable = median_err * 2.0;
+    let reference = rigs
+        .iter()
+        .filter(|r| r.mean_reprojection_px <= acceptable)
+        .max_by_key(|r| r.centres.len())
+        .or_else(|| rigs.iter().max_by_key(|r| r.centres.len()));
+    let Some(reference) = reference else {
         bail!("no capture produced a reconstruction");
     };
     if reference.centres.len() < 3 {
@@ -165,6 +252,7 @@ pub fn solve(rigs: &[CaptureRig], min_shared: usize) -> Result<RigSolution> {
     let mut accum: BTreeMap<u32, Vec<Vector3<f64>>> = BTreeMap::new();
     let mut axes: BTreeMap<u32, Vec<Vector3<f64>>> = BTreeMap::new();
     let mut skipped = Vec::new();
+    let mut agreement: Vec<(i64, usize, usize)> = Vec::new();
     for rig in rigs {
         if rig.capture_id == reference.capture_id {
             for (id, c) in &rig.centres {
@@ -194,11 +282,34 @@ pub fn solve(rigs: &[CaptureRig], min_shared: usize) -> Result<RigSolution> {
         }
         let from: Vec<Vector3<f64>> = shared.iter().map(|id| rig.centres[id]).collect();
         let to: Vec<Vector3<f64>> = shared.iter().map(|id| reference.centres[id]).collect();
-        let Some(sim) = umeyama(&from, &to) else {
+        // Threshold relative to the reference rig's own size, so it means the
+        // same thing whatever arbitrary scale this reconstruction came out at.
+        let mut spread = 0.0;
+        let mut count = 0usize;
+        for i in 0..to.len() {
+            for j in (i + 1)..to.len() {
+                spread += (to[i] - to[j]).norm();
+                count += 1;
+            }
+        }
+        let mean_spacing = if count > 0 {
+            spread / count as f64
+        } else {
+            1.0
+        };
+        let Some((sim, inliers)) = robust_umeyama(&from, &to, 0.15 * mean_spacing) else {
             skipped.push((rig.capture_id, "cameras are degenerate (collinear?)".into()));
             continue;
         };
+        agreement.push((rig.capture_id, inliers.len(), shared.len()));
+        // Only cameras the transform actually explains contribute. A camera
+        // this capture placed badly should not move the average for it.
+        let inlier_ids: std::collections::BTreeSet<u32> =
+            inliers.iter().map(|&i| shared[i]).collect();
         for (id, c) in &rig.centres {
+            if !inlier_ids.contains(id) {
+                continue;
+            }
             accum.entry(*id).or_default().push(sim.apply(c));
             if let Some(r) = rig.rotations.get(id) {
                 // Direction only, so the similarity's scale and translation
@@ -259,6 +370,7 @@ pub fn solve(rigs: &[CaptureRig], min_shared: usize) -> Result<RigSolution> {
         cameras,
         skipped,
         mean_spacing,
+        agreement,
     })
 }
 
@@ -364,6 +476,102 @@ mod tests {
         assert!(
             umeyama(&same, &same).is_none(),
             "zero variance must not divide"
+        );
+    }
+
+    /// The failure that made scan2's alignment useless: a handful of grossly
+    /// misplaced cameras dragging a least-squares fit for every other camera.
+    #[test]
+    fn robust_alignment_ignores_grossly_misplaced_cameras() {
+        let truth: Vec<Vector3<f64>> = (0..20)
+            .map(|i| {
+                let a = i as f64 * 0.31;
+                v(a.cos(), a.sin(), 0.1 * (i % 4) as f64)
+            })
+            .collect();
+        let angle = 0.4_f64;
+        let rot = Matrix3::new(
+            angle.cos(),
+            -angle.sin(),
+            0.0,
+            angle.sin(),
+            angle.cos(),
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        );
+        let (scale, t) = (1.7, v(2.0, -3.0, 1.0));
+        let mut moved: Vec<Vector3<f64>> = truth.iter().map(|p| scale * (rot * p) + t).collect();
+        // Four of twenty come out somewhere else entirely.
+        for k in [2usize, 7, 11, 18] {
+            moved[k] = v(40.0 + k as f64, -30.0, 25.0);
+        }
+
+        let plain = umeyama(&truth, &moved).unwrap();
+        let plain_err: f64 = truth
+            .iter()
+            .zip(&moved)
+            .enumerate()
+            .filter(|(i, _)| ![2, 7, 11, 18].contains(i))
+            .map(|(_, (f, t))| (plain.apply(f) - t).norm())
+            .sum();
+
+        let (robust, inliers) = robust_umeyama(&truth, &moved, 0.15 * 2.0).unwrap();
+        let robust_err: f64 = truth
+            .iter()
+            .zip(&moved)
+            .enumerate()
+            .filter(|(i, _)| ![2, 7, 11, 18].contains(i))
+            .map(|(_, (f, t))| (robust.apply(f) - t).norm())
+            .sum();
+
+        assert_eq!(inliers.len(), 16, "should keep exactly the 16 good cameras");
+        for bad in [2usize, 7, 11, 18] {
+            assert!(!inliers.contains(&bad), "kept a misplaced camera {bad}");
+        }
+        assert!(
+            robust_err < plain_err * 1e-3,
+            "robust {robust_err} should be far below least-squares {plain_err}"
+        );
+        assert!((robust.scale - scale).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reference_capture_is_chosen_by_quality_not_only_by_count() {
+        let centres = |n: u32| -> BTreeMap<u32, Vector3<f64>> {
+            (0..n)
+                .map(|i| (i, v(i as f64, 0.0, (i % 3) as f64)))
+                .collect()
+        };
+        let rigs = vec![
+            // Most cameras, but a badly-converged reconstruction.
+            CaptureRig {
+                capture_id: 16,
+                centres: centres(6),
+                rotations: BTreeMap::new(),
+                num_points: 10,
+                mean_reprojection_px: 5.6,
+            },
+            CaptureRig {
+                capture_id: 9,
+                centres: centres(5),
+                rotations: BTreeMap::new(),
+                num_points: 10,
+                mean_reprojection_px: 0.7,
+            },
+            CaptureRig {
+                capture_id: 23,
+                centres: centres(5),
+                rotations: BTreeMap::new(),
+                num_points: 10,
+                mean_reprojection_px: 0.8,
+            },
+        ];
+        let sol = solve(&rigs, 3).unwrap();
+        assert_ne!(
+            sol.reference, 16,
+            "the 5.6px capture must not be the reference"
         );
     }
 
