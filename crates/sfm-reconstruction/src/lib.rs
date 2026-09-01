@@ -45,6 +45,22 @@ use sfm_geometry::{
 /// - and drifting from - the pipeline's own threshold.
 pub const MIN_IMAGES_PER_CAMERA_FOR_INTRINSICS: usize = 5;
 
+/// Observations one camera needs before the *final* pass will refine its
+/// intrinsics, when it has too few image rows to pass the image-count gate.
+///
+/// The image count is the wrong measure for a merged fiducial capture. After
+/// `--merge-multicaps` a fixed camera has exactly one image row, and that row
+/// holds the target in as many poses as there were captures - which is
+/// precisely Zhang's configuration and precisely what self-calibration needs.
+/// Counting rows calls it ineligible; counting what the row actually contains
+/// does not.
+///
+/// This applies to the final guarded pass only. The growth-time pass keeps the
+/// image-count gate: it has no error comparison and no re-triangulation to
+/// recover from a bad step, and ungating it was measured at 5743px mean
+/// reprojection error against 0.83px.
+const MIN_OBSERVATIONS_FOR_INTRINSICS: usize = 200;
+
 /// How far a refined focal length may move from its starting guess before the
 /// solve is treated as diverged rather than calibrated. COLMAP's equivalent
 /// (`min/max_focal_length_ratio`) is 0.1x to 10x.
@@ -1213,6 +1229,30 @@ const COMPLETION_MAX_REPROJECTION_ERROR_PX: f64 = 0.5;
 /// redundancy anywhere in the model, no way to observe the shared focal
 /// length. They get the pipeline's ordinary observation bar instead, which
 /// still rejects genuinely bad geometry.
+/// Whether a correspondence in these features is proven by identity rather
+/// than inferred from appearance.
+///
+/// Fiducial corners match on an exact `(capture, marker, corner)` key, so a
+/// *wrong* correspondence is not possible - the identity either matches or it
+/// does not. The reprojection gate on track completion exists to catch
+/// mis-correspondence, and that failure mode does not exist here.
+///
+/// Gating them anyway is actively harmful, and measurably so. On a 4-camera
+/// rig, 472 corners were detected by all four cameras and the reconstruction
+/// produced **no track longer than three**: the initial focal guess was far
+/// enough off that an already-triangulated point reprojected into a
+/// newly-registered image well outside the bar, so every fourth observation
+/// was refused. That is exactly backwards - accepting the observation and
+/// re-triangulating is what *corrects* a point placed with a poor focal, and
+/// refusing it is what freezes the error in place and leaves nothing long
+/// enough to recover the focal from.
+fn correspondence_is_proven(features: &FeatureSet) -> bool {
+    matches!(
+        features.descriptors,
+        sfm_core::Descriptors::MarkerCorner { .. }
+    )
+}
+
 fn completion_threshold_px(features: &FeatureSet, max_reprojection_error_px: f64) -> f64 {
     if matches!(
         features.descriptors,
@@ -1365,14 +1405,16 @@ fn triangulate_and_complete_tracks(
             (None, None) => fresh.push((ka, kb)),
             (Some(point_idx), None) if !bootstrap_registered[b] => {
                 let obs_b = to_normalized(keypoint_px(&input.images[b].features, kb), &cam_b);
+                let proven = correspondence_is_proven(&input.images[b].features);
                 if let Some(err) =
                     reprojection_error_normalized(&pose_b, &points[point_idx].xyz, obs_b)
                 {
-                    if err * avg_focal_b
-                        <= completion_threshold_px(
-                            &input.images[b].features,
-                            params.max_reprojection_error_px,
-                        )
+                    if proven
+                        || err * avg_focal_b
+                            <= completion_threshold_px(
+                                &input.images[b].features,
+                                params.max_reprojection_error_px,
+                            )
                     {
                         points[point_idx].track.push((b, kb));
                         obs_to_point.insert((b, kb), point_idx);
@@ -1383,14 +1425,16 @@ fn triangulate_and_complete_tracks(
             }
             (None, Some(point_idx)) if !bootstrap_registered[a] => {
                 let obs_a = to_normalized(keypoint_px(&input.images[a].features, ka), &cam_a);
+                let proven = correspondence_is_proven(&input.images[a].features);
                 if let Some(err) =
                     reprojection_error_normalized(&pose_a, &points[point_idx].xyz, obs_a)
                 {
-                    if err * avg_focal_a
-                        <= completion_threshold_px(
-                            &input.images[a].features,
-                            params.max_reprojection_error_px,
-                        )
+                    if proven
+                        || err * avg_focal_a
+                            <= completion_threshold_px(
+                                &input.images[a].features,
+                                params.max_reprojection_error_px,
+                            )
                     {
                         points[point_idx].track.push((a, ka));
                         obs_to_point.insert((a, ka), point_idx);
@@ -1870,18 +1914,21 @@ fn run_bundle_adjustment(
     for &c in &camera_of_image {
         images_per_camera[c] += 1;
     }
-    let any_camera_eligible = images_per_camera
-        .iter()
-        .any(|&n| n >= MIN_IMAGES_PER_CAMERA_FOR_INTRINSICS);
+    // Observations per camera, as the fallback measure for the final pass.
+    let mut obs_per_camera = vec![0usize; camera_list.len()];
+    for o in &observations {
+        obs_per_camera[camera_of_image[o.image_idx]] += 1;
+    }
+    let final_pass = intrinsics == IntrinsicsMode::FreeBounded;
+    let eligible = |idx: usize| -> bool {
+        images_per_camera[idx] >= MIN_IMAGES_PER_CAMERA_FOR_INTRINSICS
+            || (final_pass && obs_per_camera[idx] >= MIN_OBSERVATIONS_FOR_INTRINSICS)
+    };
+    let any_camera_eligible = (0..camera_list.len()).any(eligible);
 
     let output = if allow_intrinsics && any_camera_eligible {
-        let free_fixed_cameras: Vec<bool> = images_per_camera
-            .iter()
-            .enumerate()
-            .map(|(idx, &n)| {
-                n < MIN_IMAGES_PER_CAMERA_FOR_INTRINSICS
-                    || input.fixed_cameras.contains(&camera_id_list[idx])
-            })
+        let free_fixed_cameras: Vec<bool> = (0..camera_list.len())
+            .map(|idx| !eligible(idx) || input.fixed_cameras.contains(&camera_id_list[idx]))
             .collect();
         let free_output = run_ba(free_fixed_cameras);
         // Belt-and-suspenders plausibility bound: a real photographic lens's
