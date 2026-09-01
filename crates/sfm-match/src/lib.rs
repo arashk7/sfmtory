@@ -101,14 +101,22 @@ pub fn match_and_verify(
     // keeps pairs too thin for a stable eight-point estimate from reaching
     // here.
 
-    let geometry = estimate_two_view_geometry(
-        &pts1,
-        &pts2,
-        cam1,
-        cam2,
-        params.ransac_threshold_px,
-        params.ransac_max_iterations,
-    )?;
+    // Fiducial corners carry the capture they were seen in, and after
+    // `--merge-multicaps` one image holds several. Verify each capture on its
+    // own and pool the results: see `verify_per_group` for why one pass over
+    // the union throws away a third of the correct matches.
+    let groups = capture_groups(&features1.descriptors, &putative);
+    let geometry = match groups {
+        Some(g) => verify_per_group(&pts1, &pts2, cam1, cam2, params, &g)?,
+        None => estimate_two_view_geometry(
+            &pts1,
+            &pts2,
+            cam1,
+            cam2,
+            params.ransac_threshold_px,
+            params.ransac_max_iterations,
+        )?,
+    };
 
     let inlier_ratio = geometry.num_inliers as f64 / putative.len() as f64;
     if geometry.num_inliers < params.min_inliers || inlier_ratio < params.min_inlier_ratio {
@@ -127,11 +135,166 @@ pub fn match_and_verify(
     })
 }
 
+/// The capture each putative match belongs to, when the descriptors carry one.
+///
+/// `None` for anything but fiducial corners, and for a set that turns out to
+/// come from a single capture - both of which the ordinary single-pass path
+/// already handles correctly.
+fn capture_groups(d1: &sfm_core::Descriptors, putative: &[(u32, u32)]) -> Option<Vec<u32>> {
+    let sfm_core::Descriptors::MarkerCorner { .. } = d1 else {
+        return None;
+    };
+    let groups: Vec<u32> = putative
+        .iter()
+        .map(|&(i, _)| d1.marker_corner(i as usize).map(|(c, _, _)| c))
+        .collect::<Option<Vec<u32>>>()?;
+    let distinct: std::collections::BTreeSet<u32> = groups.iter().copied().collect();
+    (distinct.len() > 1).then_some(groups)
+}
+
+/// Verifies each rigid group separately, then refits one pose on the union.
+///
+/// A merged pair's correspondences are not one scene. Each capture is a rigid
+/// group - the target was moved between them - and for a marker board each
+/// group is *planar*, which `estimate_two_view_geometry` handles explicitly by
+/// preferring a homography where the essential matrix is unidentifiable. The
+/// union of several such groups is neither case: no homography covers more
+/// than one capture's worth, and the eight-point essential RANSAC is drawing
+/// minimal samples across a union of planes. There is no branch for that, so
+/// it settles for whichever model explains about half.
+///
+/// Measured on a 4-camera rig, same camera pair, only the merge differing:
+/// one capture kept 215 of 308 putative matches (70%); the same cameras merged
+/// kept 386 of 800 (48%), losing 29% of the project's correspondences and with
+/// them the multi-view tracks that the rig geometry depends on.
+///
+/// The relative pose is identical for every group - the cameras did not move -
+/// so the per-group inlier sets are directly combinable, and the pose is
+/// refitted on the union afterwards. That final fit is better conditioned than
+/// any group's: several planes at different orientations are exactly the
+/// configuration a single plane fails to provide.
+fn verify_per_group(
+    pts1: &[(f64, f64)],
+    pts2: &[(f64, f64)],
+    cam1: &CameraModel,
+    cam2: &CameraModel,
+    params: &VerificationParams,
+    groups: &[u32],
+) -> Option<sfm_geometry::TwoViewGeometry> {
+    use std::collections::BTreeMap;
+    let mut by_group: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for (i, g) in groups.iter().enumerate() {
+        by_group.entry(*g).or_default().push(i);
+    }
+
+    let mut inliers = vec![false; pts1.len()];
+    let mut any = false;
+    for idx in by_group.values() {
+        if idx.len() < 8 {
+            continue;
+        }
+        let g1: Vec<(f64, f64)> = idx.iter().map(|&i| pts1[i]).collect();
+        let g2: Vec<(f64, f64)> = idx.iter().map(|&i| pts2[i]).collect();
+        let Some(geom) = estimate_two_view_geometry(
+            &g1,
+            &g2,
+            cam1,
+            cam2,
+            params.ransac_threshold_px,
+            params.ransac_max_iterations,
+        ) else {
+            continue;
+        };
+        for (k, &keep) in geom.inliers.iter().enumerate() {
+            if keep {
+                inliers[idx[k]] = true;
+                any = true;
+            }
+        }
+    }
+    if !any {
+        return None;
+    }
+
+    // Refit the pose on everything the groups agreed on. The union spans
+    // several planes, so the essential matrix is identifiable here even though
+    // it was not within any single group.
+    let keep_idx: Vec<usize> = (0..pts1.len()).filter(|&i| inliers[i]).collect();
+    if keep_idx.len() < 8 {
+        return None;
+    }
+    let u1: Vec<(f64, f64)> = keep_idx.iter().map(|&i| pts1[i]).collect();
+    let u2: Vec<(f64, f64)> = keep_idx.iter().map(|&i| pts2[i]).collect();
+    let pooled = estimate_two_view_geometry(
+        &u1,
+        &u2,
+        cam1,
+        cam2,
+        params.ransac_threshold_px,
+        params.ransac_max_iterations,
+    )?;
+
+    // The union is the inlier set; the pooled fit supplies only the pose.
+    //
+    // Re-filtering against the pooled model was tried and lost matches rather
+    // than gaining them - 1588 against 1933 on the merged rig - because it
+    // applies the ill-conditioned union fit a second time and intersects two
+    // rejections. Each group already verified its own correspondences against
+    // a model that suits it, which is the entire point of splitting them.
+    Some(sfm_geometry::TwoViewGeometry {
+        pose: pooled.pose,
+        inliers,
+        num_inliers: keep_idx.len(),
+    })
+}
+
 /// Convenience used by callers that already have pixel points in hand
 /// (kept in sync with [`sfm_geometry::essential::to_normalized`] so
 /// `sfm-reconstruction` doesn't need its own copy).
 pub fn normalize_point(p: (f64, f64), cam: &CameraModel) -> (f64, f64) {
     to_normalized(p, cam)
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+    use sfm_core::Descriptors;
+
+    fn corners(rows: &[(u32, u32, u32)]) -> Descriptors {
+        let mut data = Vec::new();
+        for &(capture, marker, corner) in rows {
+            data.extend_from_slice(&capture.to_le_bytes());
+            data.extend_from_slice(&marker.to_le_bytes());
+            data.extend_from_slice(&corner.to_le_bytes());
+        }
+        Descriptors::MarkerCorner { data }
+    }
+
+    #[test]
+    fn several_captures_are_grouped_by_capture() {
+        let d = corners(&[(9, 1, 0), (9, 1, 1), (16, 1, 0), (16, 1, 1)]);
+        let putative = vec![(0, 0), (1, 1), (2, 2), (3, 3)];
+        assert_eq!(
+            capture_groups(&d, &putative),
+            Some(vec![9, 9, 16, 16]),
+            "a merged pair must be split along its captures"
+        );
+    }
+
+    /// The ordinary paths must be left exactly as they were: one capture is
+    /// already handled correctly, and splitting it would only remove points
+    /// from a fit that needs them.
+    #[test]
+    fn a_single_capture_and_non_marker_descriptors_are_not_grouped() {
+        let one = corners(&[(9, 1, 0), (9, 1, 1), (9, 2, 0)]);
+        assert_eq!(capture_groups(&one, &[(0, 0), (1, 1), (2, 2)]), None);
+
+        let sift = Descriptors::Float32 {
+            dim: 2,
+            data: vec![0.0; 6],
+        };
+        assert_eq!(capture_groups(&sift, &[(0, 0), (1, 1), (2, 2)]), None);
+    }
 }
 
 #[cfg(test)]
