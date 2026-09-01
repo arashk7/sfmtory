@@ -45,6 +45,12 @@ use sfm_geometry::{
 /// - and drifting from - the pipeline's own threshold.
 pub const MIN_IMAGES_PER_CAMERA_FOR_INTRINSICS: usize = 5;
 
+/// How far a refined focal length may move from its starting guess before the
+/// solve is treated as diverged rather than calibrated. COLMAP's equivalent
+/// (`min/max_focal_length_ratio`) is 0.1x to 10x.
+const MIN_FOCAL_RATIO: f64 = 0.25;
+const MAX_FOCAL_RATIO: f64 = 4.0;
+
 pub struct ImageInput {
     pub image_id: u32,
     pub camera_id: u32,
@@ -132,6 +138,7 @@ impl Default for IncrementalParams {
     }
 }
 
+#[derive(Clone)]
 struct PointWork {
     xyz: Vector3<f64>,
     track: Vec<(usize, u32)>, // (image compact idx, keypoint idx)
@@ -392,24 +399,130 @@ fn finish_growth(
     // iteration budget on real test data (see PLAN.md). Doing it once, at
     // the end, from an otherwise-converged state is exactly the scenario
     // `sfm-ba`'s joint-optimization test validates.
-    run_bundle_adjustment(
-        input,
-        &mut cameras,
-        params.ba_robust_loss,
-        params.max_reprojection_error_px,
-        seed_i,
-        &registered,
-        &mut poses,
-        &mut points,
-        if params.refine_intrinsics {
-            IntrinsicsMode::FreeGuarded
-        } else {
-            IntrinsicsMode::Fixed
-        },
-        BaScope::Global,
-    );
+    if params.refine_intrinsics {
+        refine_intrinsics_iteratively(
+            input,
+            params,
+            seed_i,
+            &registered,
+            &mut cameras,
+            &mut poses,
+            &mut points,
+        );
+    }
 
     assemble_reconstruction(input, &cameras, &registered, &poses, &points)
+}
+
+/// Mean reprojection error over every triangulated observation, in pixels.
+fn mean_reprojection(
+    input: &ReconstructionInput,
+    cameras: &HashMap<u32, CameraModel>,
+    poses: &[Option<Pose>],
+    points: &[PointWork],
+) -> f64 {
+    let mut sum = 0.0;
+    let mut n = 0usize;
+    for p in points {
+        for &(img_idx, kp_idx) in &p.track {
+            let Some(pose) = poses[img_idx] else { continue };
+            let cam = &cameras[&input.images[img_idx].camera_id];
+            let pc = pose.transform_point(&p.xyz);
+            if pc.z <= 1e-9 {
+                continue;
+            }
+            let (px, py) = cam.project(&pc);
+            let (ox, oy) = keypoint_px(&input.images[img_idx].features, kp_idx);
+            sum += ((px - ox).powi(2) + (py - oy).powi(2)).sqrt();
+            n += 1;
+        }
+    }
+    if n == 0 {
+        f64::MAX
+    } else {
+        sum / n as f64
+    }
+}
+
+/// Refine intrinsics, re-triangulate, repeat - then keep the result only if it
+/// beats leaving the intrinsics alone.
+///
+/// The single-pass version could not work, and it took a real dataset to see
+/// why. Moving a focal length invalidates every 3D point, because each was
+/// triangulated under the old one; measured against the *stale* structure the
+/// refined intrinsics always score worse, the fixed-vs-free comparison rejects
+/// them, and the model never gets the chance to follow. On a 193-camera rig
+/// that left 190 focal lengths sitting exactly on their initial guess with
+/// every distortion coefficient at zero - not a calibration that was attempted
+/// and declined, but one that could not have succeeded.
+///
+/// COLMAP's incremental mapper does not have this problem because it does not
+/// judge a single pass: `ba_global_max_refinements` iterates bundle adjustment
+/// against re-triangulated structure until the model stops changing, bounding
+/// the result by plausibility (`min/max_focal_length_ratio`,
+/// `max_extra_param`) rather than by comparison. This does the same, and then
+/// keeps the safety net COLMAP lacks: the whole iterated result is compared
+/// against the untouched baseline once at the end, and discarded if it is
+/// worse.
+fn refine_intrinsics_iteratively(
+    input: &ReconstructionInput,
+    params: &IncrementalParams,
+    seed_i: usize,
+    registered: &[bool],
+    cameras: &mut HashMap<u32, CameraModel>,
+    poses: &mut [Option<Pose>],
+    points: &mut [PointWork],
+) {
+    /// COLMAP's `ba_global_max_refinements` default.
+    const MAX_REFINEMENTS: usize = 5;
+    /// Relative change in mean reprojection error below which iterating again
+    /// is not worth a full global bundle.
+    const CONVERGED: f64 = 5e-4;
+
+    let baseline_cameras = cameras.clone();
+    let baseline_poses = poses.to_vec();
+    let baseline_points = points.to_vec();
+    let baseline_error = mean_reprojection(input, cameras, poses, points);
+
+    let mut previous = baseline_error;
+    for _ in 0..MAX_REFINEMENTS {
+        run_bundle_adjustment(
+            input,
+            cameras,
+            params.ba_robust_loss,
+            params.max_reprojection_error_px,
+            seed_i,
+            registered,
+            poses,
+            points,
+            IntrinsicsMode::FreeBounded,
+            BaScope::Global,
+        );
+        // The step the single-pass version was missing: let the structure
+        // follow the intrinsics before judging either.
+        for idx in 0..points.len() {
+            retriangulate_point(input, cameras, params, poses, points, idx);
+        }
+        let now = mean_reprojection(input, cameras, poses, points);
+        if !now.is_finite() {
+            break;
+        }
+        if previous.is_finite() && previous > 0.0 && (previous - now).abs() / previous < CONVERGED {
+            previous = now;
+            break;
+        }
+        previous = now;
+    }
+
+    // The net effect has to be an improvement on doing nothing. Refinement
+    // that diverges, or that trades a better focal for a worse model, is not
+    // an improvement however plausible its parameters look.
+    let refined_error = mean_reprojection(input, cameras, poses, points);
+    if !(refined_error < baseline_error) {
+        *cameras = baseline_cameras;
+        poses.copy_from_slice(&baseline_poses);
+        points.clone_from_slice(&baseline_points);
+    }
 }
 
 struct GrowthResult {
@@ -1414,6 +1527,17 @@ enum IntrinsicsMode {
     /// reprojection-error comparison that can reject the refined result
     /// outright. The final, authoritative calibration pass.
     FreeGuarded,
+    /// Intrinsics free with outlier filtering and the plausibility bounds, but
+    /// *without* the fixed-vs-free comparison.
+    ///
+    /// Exists so a caller can iterate refinement and re-triangulation and
+    /// judge the result once at the end, which is what COLMAP does
+    /// (`ba_global_max_refinements`). The comparison inside `FreeGuarded`
+    /// cannot be used that way: it re-judges after every pass, against
+    /// structure triangulated under the *old* intrinsics, so a focal that
+    /// moves always looks worse and is always rejected - the model never gets
+    /// the chance to follow it. See `refine_intrinsics_iteratively`.
+    FreeBounded,
 }
 
 /// How many co-visible neighbours join the just-registered image as free
@@ -1596,7 +1720,7 @@ fn run_bundle_adjustment(
         // The final authoritative calibration pass happens once per
         // reconstruction, so it can afford to fully reconverge poses/points
         // around the refined intrinsics.
-        IntrinsicsMode::FreeGuarded => 200,
+        IntrinsicsMode::FreeGuarded | IntrinsicsMode::FreeBounded => 200,
         // The growth-time passes only need to *track* the intrinsics as the
         // model grows, not converge them - the final pass above does that.
         // Letting these inherit the 200-iteration budget made them chase full
@@ -1685,7 +1809,10 @@ fn run_bundle_adjustment(
     // during growth favor speed over this extra refinement.
     let run_ba = |fixed_cameras: Vec<bool>| -> sfm_ba::BaOutput {
         let input = build_input(fixed_cameras, &observations);
-        if intrinsics == IntrinsicsMode::FreeGuarded {
+        if matches!(
+            intrinsics,
+            IntrinsicsMode::FreeGuarded | IntrinsicsMode::FreeBounded
+        ) {
             filter_and_reoptimize(input, &ba_params, max_reprojection_error_px)
         } else {
             sfm_ba::bundle_adjust(input, &ba_params)
@@ -1791,7 +1918,33 @@ fn run_bundle_adjustment(
         // alone. This is exactly the failure mode the comparison below exists
         // to catch; falling back to `fixed_output` here is the correct,
         // working behavior, not a bug to chase further.
-        if distortion_is_plausible && eval_error(&free_output) < eval_error(&fixed_output) {
+        // A focal that has run far from its starting guess is not a
+        // calibration, it is a diverged solve. COLMAP bounds the same thing
+        // with `min/max_focal_length_ratio` (0.1x to 10x); this is tighter
+        // because the initial guess here is a field-of-view heuristic rather
+        // than EXIF, and a real lens is not 10x off it.
+        let focal_is_plausible =
+            free_output
+                .cameras
+                .iter()
+                .zip(&camera_list)
+                .all(|(refined, initial)| {
+                    let (f_new, _) = refined.focal_lengths();
+                    let (f_old, _) = initial.focal_lengths();
+                    f_old > 0.0
+                        && f_new.is_finite()
+                        && (f_new / f_old) > MIN_FOCAL_RATIO
+                        && (f_new / f_old) < MAX_FOCAL_RATIO
+                });
+        let plausible = distortion_is_plausible && focal_is_plausible;
+        if intrinsics == IntrinsicsMode::FreeBounded {
+            // The caller judges; this pass only refuses the implausible.
+            if plausible {
+                free_output
+            } else {
+                fixed_output
+            }
+        } else if plausible && eval_error(&free_output) < eval_error(&fixed_output) {
             free_output
         } else {
             fixed_output
