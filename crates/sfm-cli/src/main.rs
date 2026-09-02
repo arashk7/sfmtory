@@ -842,6 +842,33 @@ fn cmd_select_model(args: SelectModelArgs) -> Result<()> {
         );
     }
 
+    // Independent of the model comparison below, and able to see something it
+    // structurally cannot - see `radial_residual_trend`.
+    let mut suspect = Vec::new();
+    for (idx, id) in problem.camera_ids.iter().enumerate() {
+        if let Some(t) = modelselect::radial_residual_trend(&problem, idx) {
+            if t > modelselect::RADIAL_TREND_SUSPECT {
+                suspect.push((*id, t));
+            }
+        }
+    }
+    if !suspect.is_empty() {
+        println!();
+        println!(
+            "{} camera(s) have residuals that grow toward the edge of the frame, which is what",
+            suspect.len()
+        );
+        println!(
+            "a too-narrow projection model looks like - a fisheye lens fitted as rectilinear,"
+        );
+        println!("say. Comparing models against fixed structure cannot see this, because the");
+        println!("points were triangulated by the model being judged. Try the model explicitly:");
+        for (id, t) in suspect.iter().take(8) {
+            println!("   camera {id}: residual/radius correlation {t:+.2}");
+        }
+        println!("   [[cameras]] model = \"OPENCV_FISHEYE\"   then re-run map and compare.");
+    }
+
     let choices = modelselect::select(&problem, &folds);
     let mut tally: std::collections::BTreeMap<&str, usize> = Default::default();
     for c in &choices {

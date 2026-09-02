@@ -282,6 +282,61 @@ pub fn reseed(cam: &CameraModel, name: &str) -> Option<CameraModel> {
     CameraModel::from_name_and_params(name, &params)
 }
 
+/// How strongly a camera's residuals grow toward the edge of its image.
+///
+/// This catches what held-out reprojection error cannot: a *wrong projection
+/// family*. Scoring models against fixed structure compares how well each fits
+/// points that were triangulated by the incumbent model, so the incumbent
+/// always looks adequate - on a rig with two fisheye lenses being modelled as
+/// narrow rectilinear cameras, the selector confidently recommended
+/// `SIMPLE_RADIAL` for all four.
+///
+/// The residual *pattern* gives it away regardless. A rectilinear model fitted
+/// to a fisheye lens cannot bend far enough at the periphery, so its errors are
+/// small near the principal point and grow with radius - a signature no amount
+/// of refitting the same family removes. Reported as the Pearson correlation
+/// between an observation's distance from the principal point and its
+/// reprojection error, which is scale-free and needs no second reconstruction.
+pub fn radial_residual_trend(problem: &Problem, camera_idx: usize) -> Option<f64> {
+    let cam = &problem.cameras[camera_idx];
+    let (cx, cy) = cam.principal_point();
+    let mut pairs: Vec<(f64, f64)> = Vec::new();
+    for o in &problem.observations {
+        if problem.camera_of_image[o.image_idx] != camera_idx {
+            continue;
+        }
+        let pc = problem.poses[o.image_idx].transform_point(&problem.points[o.point_idx]);
+        if pc.z <= 1e-9 {
+            continue;
+        }
+        let (px, py) = cam.project(&pc);
+        let radius = ((o.x - cx).powi(2) + (o.y - cy).powi(2)).sqrt();
+        let err = ((px - o.x).powi(2) + (py - o.y).powi(2)).sqrt();
+        pairs.push((radius, err));
+    }
+    if pairs.len() < 30 {
+        return None;
+    }
+    let n = pairs.len() as f64;
+    let (mr, me) = (
+        pairs.iter().map(|p| p.0).sum::<f64>() / n,
+        pairs.iter().map(|p| p.1).sum::<f64>() / n,
+    );
+    let mut num = 0.0;
+    let (mut dr, mut de) = (0.0, 0.0);
+    for (r, e) in &pairs {
+        num += (r - mr) * (e - me);
+        dr += (r - mr).powi(2);
+        de += (e - me).powi(2);
+    }
+    let den = (dr * de).sqrt();
+    (den > 1e-12).then(|| num / den)
+}
+
+/// Above this, the residuals are growing with radius strongly enough that the
+/// projection model itself is suspect rather than merely imprecise.
+pub const RADIAL_TREND_SUSPECT: f64 = 0.35;
+
 /// Scores every candidate model on every camera by held-out reprojection error.
 pub fn select(problem: &Problem, folds: &Folds) -> Vec<CameraChoice> {
     let num_cameras = problem.cameras.len();
