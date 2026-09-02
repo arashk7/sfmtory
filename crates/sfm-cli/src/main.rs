@@ -848,25 +848,53 @@ fn cmd_select_model(args: SelectModelArgs) -> Result<()> {
     for (idx, id) in problem.camera_ids.iter().enumerate() {
         if let Some(t) = modelselect::radial_residual_trend(&problem, idx) {
             if t > modelselect::RADIAL_TREND_SUSPECT {
-                suspect.push((*id, t));
+                suspect.push((*id, t, modelselect::trend_cause(&problem.cameras[idx])));
             }
         }
     }
     if !suspect.is_empty() {
+        use modelselect::TrendCause;
         println!();
         println!(
-            "{} camera(s) have residuals that grow toward the edge of the frame, which is what",
+            "{} camera(s) have residuals that grow toward the edge of the frame. Comparing",
             suspect.len()
         );
-        println!(
-            "a too-narrow projection model looks like - a fisheye lens fitted as rectilinear,"
-        );
-        println!("say. Comparing models against fixed structure cannot see this, because the");
-        println!("points were triangulated by the model being judged. Try the model explicitly:");
-        for (id, t) in suspect.iter().take(8) {
+        println!("models against fixed structure cannot see this, because the points were");
+        println!("triangulated by the model being judged.");
+        for (id, t, _) in suspect.iter().take(8) {
             println!("   camera {id}: residual/radius correlation {t:+.2}");
         }
-        println!("   [[cameras]] model = \"OPENCV_FISHEYE\"   then re-run map and compare.");
+        // The trend says the periphery is mismodelled; only the camera's own
+        // parameters say whether that is the wrong family or the right family
+        // left unfitted. Recommending a wider model for a camera whose
+        // coefficients are all still zero sends the user in a circle.
+        let unfitted = suspect
+            .iter()
+            .filter(|(_, _, c)| *c == TrendCause::Unfitted)
+            .count();
+        if unfitted > 0 {
+            println!();
+            println!("{unfitted} of them still have every distortion coefficient at zero, so the");
+            println!("model they have has never been fitted - a wider one would not help. See the");
+            println!(
+                "\"kept the focal length they started with\" warning from `map`: intrinsics are"
+            );
+            println!(
+                "refined only for cameras with at least {} images.",
+                sfm_reconstruction::MIN_IMAGES_PER_CAMERA_FOR_INTRINSICS
+            );
+        }
+        if suspect.iter().any(|(_, _, c)| {
+            matches!(
+                c,
+                TrendCause::NoDistortionTerms | TrendCause::FittedButStillCurved
+            )
+        }) {
+            println!();
+            println!("For the rest, the projection family itself is the suspect - a fisheye lens");
+            println!("fitted as rectilinear looks exactly like this. Try it explicitly:");
+            println!("   [[cameras]] model = \"OPENCV_FISHEYE\"   then re-run map and compare.");
+        }
     }
 
     let choices = modelselect::select(&problem, &folds);

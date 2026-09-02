@@ -335,6 +335,44 @@ pub fn radial_residual_trend(problem: &Problem, camera_idx: usize) -> Option<f64
 
 /// Above this, the residuals are growing with radius strongly enough that the
 /// projection model itself is suspect rather than merely imprecise.
+/// The camera's distortion coefficients - everything after focal and principal
+/// point. Two-focal models carry four leading terms, the rest three.
+pub fn distortion_params(cam: &CameraModel) -> Vec<f64> {
+    let leading = match cam {
+        CameraModel::Pinhole { .. }
+        | CameraModel::OpenCV { .. }
+        | CameraModel::OpenCVFisheye { .. } => 4,
+        _ => 3,
+    };
+    cam.params().into_iter().skip(leading).collect()
+}
+
+/// Why a camera's residuals grow toward the frame edge. The trend alone cannot
+/// say, and the two causes want opposite advice: a camera whose coefficients
+/// are all still zero does not need a *wider* model, it needs the one it has to
+/// actually be fitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrendCause {
+    /// The model has no distortion terms at all.
+    NoDistortionTerms,
+    /// It has them, but they are all still at their seeded zero.
+    Unfitted,
+    /// It has fitted coefficients and the trend survives them, so the
+    /// projection family itself is the suspect.
+    FittedButStillCurved,
+}
+
+pub fn trend_cause(cam: &CameraModel) -> TrendCause {
+    let d = distortion_params(cam);
+    if d.is_empty() {
+        TrendCause::NoDistortionTerms
+    } else if d.iter().all(|v| v.abs() < 1e-12) {
+        TrendCause::Unfitted
+    } else {
+        TrendCause::FittedButStillCurved
+    }
+}
+
 pub const RADIAL_TREND_SUSPECT: f64 = 0.35;
 
 /// Scores every candidate model on every camera by held-out reprojection error.
@@ -708,5 +746,68 @@ mod tests {
             assert!(s.held_out_px.is_finite());
             assert!(s.in_sample_px.is_finite());
         }
+    }
+    #[test]
+    fn distortion_params_skip_focal_and_principal_point() {
+        let sr = CameraModel::SimpleRadial {
+            f: 100.0,
+            cx: 1.0,
+            cy: 2.0,
+            k: 0.3,
+        };
+        assert_eq!(distortion_params(&sr), vec![0.3]);
+        let fish = CameraModel::OpenCVFisheye {
+            fx: 100.0,
+            fy: 100.0,
+            cx: 1.0,
+            cy: 2.0,
+            k1: 0.1,
+            k2: 0.0,
+            k3: 0.0,
+            k4: 0.0,
+        };
+        assert_eq!(distortion_params(&fish), vec![0.1, 0.0, 0.0, 0.0]);
+        let pin = CameraModel::Pinhole {
+            fx: 1.0,
+            fy: 1.0,
+            cx: 0.0,
+            cy: 0.0,
+        };
+        assert!(distortion_params(&pin).is_empty());
+    }
+
+    #[test]
+    fn trend_cause_separates_unfitted_from_wrong_family() {
+        // A fisheye seeded and never refined must not be told to try a wider
+        // model - it has not tried the one it has.
+        let seeded = CameraModel::OpenCVFisheye {
+            fx: 100.0,
+            fy: 100.0,
+            cx: 1.0,
+            cy: 2.0,
+            k1: 0.0,
+            k2: 0.0,
+            k3: 0.0,
+            k4: 0.0,
+        };
+        assert_eq!(trend_cause(&seeded), TrendCause::Unfitted);
+        let fitted = CameraModel::OpenCVFisheye {
+            fx: 100.0,
+            fy: 100.0,
+            cx: 1.0,
+            cy: 2.0,
+            k1: -0.02,
+            k2: 0.0,
+            k3: 0.0,
+            k4: 0.0,
+        };
+        assert_eq!(trend_cause(&fitted), TrendCause::FittedButStillCurved);
+        let pin = CameraModel::Pinhole {
+            fx: 1.0,
+            fy: 1.0,
+            cx: 0.0,
+            cy: 0.0,
+        };
+        assert_eq!(trend_cause(&pin), TrendCause::NoDistortionTerms);
     }
 }
