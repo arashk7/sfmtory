@@ -2069,7 +2069,77 @@ fn cmd_map(args: MapArgs) -> Result<()> {
         project.sparse_dir().display(),
         log_path.display()
     );
+
+    // Say when the calibration did not actually happen. A reconstruction that
+    // registers every image still reports a focal length for each camera, and
+    // nothing in that output distinguishes a refined one from the untouched
+    // field-of-view guess it started from - which is how a single-capture rig
+    // can look like a successful calibration and be nothing of the kind.
+    warn_about_unrefined_intrinsics(&project, &recon);
     Ok(())
+}
+
+/// Reports cameras whose intrinsics came out exactly as they went in.
+fn warn_about_unrefined_intrinsics(project: &Project, recon: &sfm_core::Reconstruction) {
+    let initial = match crate::db::Database::open(&project.database_path())
+        .and_then(|db| db.list_cameras())
+    {
+        Ok(cams) => cams
+            .into_iter()
+            .map(|c| (c.camera_id, c.model))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        Err(_) => return,
+    };
+    let pinned: std::collections::BTreeSet<u32> = project
+        .config
+        .cameras
+        .iter()
+        .filter(|c| c.refine == Some(false))
+        .flat_map(|cfg| {
+            recon
+                .images
+                .values()
+                .filter(|im| project::glob_match(&cfg.images, &im.name))
+                .map(|im| im.camera_id)
+        })
+        .collect();
+
+    let diag = diagnostics::Diagnostics::compute(recon, &initial, &pinned);
+    let stuck: Vec<&diagnostics::CameraDiag> = diag
+        .cameras
+        .iter()
+        .filter(|c| c.verdict.is_warning())
+        .collect();
+    if stuck.is_empty() {
+        return;
+    }
+
+    eprintln!();
+    eprintln!();
+    eprintln!(
+        "WARNING: {} of {} camera(s) kept the focal length they started with; not calibrated.",
+        stuck.len(),
+        diag.cameras.len()
+    );
+    for c in stuck.iter().take(4) {
+        eprintln!("  camera {}: {}", c.camera_id, c.verdict.headline());
+        if let Some(e) = c.evidence() {
+            eprintln!("      {e}");
+        }
+    }
+    if stuck.len() > 4 {
+        eprintln!("  ... and {} more", stuck.len() - 4);
+    }
+    let single_view = stuck.iter().any(|c| {
+        matches!(c.verdict, diagnostics::FocalVerdict::NotEligible { num_images } if num_images < 2)
+    });
+    if single_view {
+        eprintln!("  A camera with one image cannot have its focal recovered from that image:");
+        eprintln!("  moving the focal and moving the camera toward or away from the scene");
+        eprintln!("  produce almost the same picture, so nothing separates them. Either give");
+        eprintln!("  each camera several images of differently-placed targets, or supply known");
+        eprintln!("  intrinsics:  [[cameras]] params = [f, cx, cy, 0.0]  with  refine = false");
+    }
 }
 
 /// Standalone global bundle-adjustment pass on an existing `sparse/0` model:

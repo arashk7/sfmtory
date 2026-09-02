@@ -523,11 +523,12 @@ fn refine_intrinsics_iteratively(
         if !now.is_finite() {
             break;
         }
-        if previous.is_finite() && previous > 0.0 && (previous - now).abs() / previous < CONVERGED {
-            previous = now;
+        let converged =
+            previous.is_finite() && previous > 0.0 && (previous - now).abs() / previous < CONVERGED;
+        previous = now;
+        if converged {
             break;
         }
-        previous = now;
     }
 
     // The net effect has to be an improvement on doing nothing. Refinement
