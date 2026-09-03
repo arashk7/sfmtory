@@ -15,6 +15,7 @@ mod layout;
 mod modelselect;
 mod progress;
 mod project;
+mod rebuild;
 mod rig;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -198,6 +199,15 @@ struct SelectModelArgs {
     /// Score folds by image even when capture information is available.
     #[arg(long)]
     fold_by_image: bool,
+    /// Rebuild the reconstruction once per candidate model instead of scoring
+    /// candidates against the existing structure.
+    ///
+    /// Slower - minutes rather than seconds - and the only mode that can detect
+    /// a wrong *projection family*, such as a fisheye lens being modelled as a
+    /// rectilinear one. Scoring against existing structure cannot: those points
+    /// were triangulated by the model being judged, so it always fits them.
+    #[arg(long)]
+    rebuild: bool,
 }
 
 #[cfg(feature = "gui")]
@@ -206,16 +216,18 @@ struct GuiArgs {
     /// Project directory to open. Defaults to the current directory.
     #[arg(long, default_value = ".")]
     project: PathBuf,
-    /// Which view to open on. Handy for going straight to the diagnostic that
-    /// prompted opening the viewer at all - typically the match graph, after a
-    /// run left images unregistered.
-    #[arg(long, value_enum, default_value_t = GuiViewArg::Scene)]
+    /// Which view to open on. Defaults to the guided start screen; pass
+    /// `--view graph` or similar to go straight to the diagnostic that prompted
+    /// opening the viewer at all.
+    #[arg(long, value_enum, default_value_t = GuiViewArg::Start)]
     view: GuiViewArg,
 }
 
 #[cfg(feature = "gui")]
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum GuiViewArg {
+    /// What to do next, and whether the answer will mean anything.
+    Start,
     /// The 3D point cloud and camera frusta.
     Scene,
     /// The selected image with its features and residuals drawn on it.
@@ -783,7 +795,188 @@ fn cmd_rig(args: RigArgs) -> Result<()> {
     Ok(())
 }
 
+/// Model selection by rebuilding - see `crate::rebuild` for why this exists
+/// alongside the structure-scoring path.
+fn cmd_select_model_rebuild(args: &SelectModelArgs) -> Result<()> {
+    let started = Instant::now();
+    let project = Project::open(&args.project)?;
+    let MapInput { input, num_images } = load_map_input(&project)?;
+    let params = sfm_reconstruction::IncrementalParams::default();
+
+    let counts = {
+        let mut n: std::collections::BTreeMap<u32, usize> = Default::default();
+        for im in &input.images {
+            *n.entry(im.camera_id).or_insert(0) += 1;
+        }
+        n
+    };
+    println!(
+        "Rebuilding to compare camera models: {} image(s), {} camera(s).",
+        num_images,
+        input.cameras.len()
+    );
+    let few: Vec<u32> = counts
+        .iter()
+        .filter(|(_, n)| **n < sfm_reconstruction::MIN_IMAGES_PER_CAMERA_FOR_INTRINSICS)
+        .map(|(id, _)| *id)
+        .collect();
+    if !few.is_empty() {
+        println!(
+            "  {} camera(s) have fewer than {} images, so bundle adjustment cannot move",
+            few.len(),
+            sfm_reconstruction::MIN_IMAGES_PER_CAMERA_FOR_INTRINSICS
+        );
+        println!("  their focal; the search sweeps it instead. Each family needs its own focal -");
+        println!("  a fisheye's is roughly a third of a rectilinear lens's for the same view -");
+        println!("  so without this the comparison would be decided by the focal, not the model.");
+    }
+    println!();
+
+    // Batched rather than per-item progress: the trials inside a pass run in
+    // parallel, so there is no meaningful ordering to tick through - only the
+    // completion of each pass.
+    let outcome = rebuild::search(&input, &params, |done, total| {
+        println!(
+            "  rebuilt {done}/{total} candidates ({} elapsed)",
+            progress::human_secs(started.elapsed().as_secs_f64())
+        );
+    });
+
+    println!();
+    if !outcome.baseline.mean_error.is_finite() {
+        println!("The reconstruction as currently configured does not build, so there is no");
+        println!("baseline to compare against. Fix `map` first.");
+    } else {
+        println!(
+            "As configured now:  {} image(s), {} points, {:.3}px",
+            outcome.baseline.registered, outcome.baseline.points, outcome.baseline.mean_error
+        );
+    }
+    if !outcome.best.mean_error.is_finite() {
+        bail!("no candidate model produced a usable reconstruction");
+    }
+    println!(
+        "Best found:         {} image(s), {} points, {:.3}px",
+        outcome.best.registered, outcome.best.points, outcome.best.mean_error
+    );
+
+    // Show the per-camera sweep, since the whole point is that the user can see
+    // *why* a family was chosen rather than being handed a verdict.
+    println!();
+    println!("Per-camera search (each row rebuilt the whole reconstruction):");
+    let mut by_camera: std::collections::BTreeMap<u32, Vec<&rebuild::Tried>> = Default::default();
+    for t in outcome.tried.iter().filter(|t| t.camera_id.is_some()) {
+        by_camera.entry(t.camera_id.unwrap()).or_default().push(t);
+    }
+    for (id, rows) in &by_camera {
+        println!("  camera {id}:");
+        // Best focal per family, so the table stays readable when the focal was
+        // swept: the family is the question, the focal is a nuisance parameter.
+        let mut best_per_family: std::collections::BTreeMap<&str, &rebuild::Tried> =
+            Default::default();
+        for t in rows {
+            let e = best_per_family.entry(t.choice.model).or_insert(t);
+            if t.score.mean_error < e.score.mean_error {
+                *e = t;
+            }
+        }
+        for name in rebuild::FAMILIES {
+            let Some(t) = best_per_family.get(name) else {
+                continue;
+            };
+            let chosen = outcome
+                .assignment
+                .get(id)
+                .map(|c| c.model == t.choice.model)
+                .unwrap_or(false);
+            let mark = if chosen { "->" } else { "  " };
+            if t.score.mean_error.is_finite() {
+                println!(
+                    "   {mark} {:<16} f = {:>8.1}  {:>3} img  {:>5} pts  {:>7.3} px",
+                    name, t.choice.focal, t.score.registered, t.score.points, t.score.mean_error
+                );
+            } else {
+                println!("   {mark} {name:<16} did not reconstruct");
+            }
+        }
+    }
+
+    println!();
+    println!("Recommended:");
+    for (id, c) in &outcome.assignment {
+        println!(
+            "  camera {id}: {} (f = {:.1}{})",
+            c.model,
+            c.focal,
+            if c.focal_swept { ", swept" } else { "" }
+        );
+    }
+    println!();
+    println!(
+        "A more complex family had to beat a simpler one by {:.0}% to be preferred; \
+         reprojection",
+        rebuild::PARSIMONY_MARGIN * 100.0
+    );
+    println!("error always falls with parameter count, so lowest-error-wins would pick the most");
+    println!("complex model offered every time.");
+
+    let globs: std::collections::BTreeMap<u32, String> = project
+        .config
+        .cameras
+        .iter()
+        .filter_map(|c| {
+            let id = input
+                .images
+                .iter()
+                .find_map(|im| project::glob_match(&c.images, &im.name).then_some(im.camera_id))?;
+            Some((id, c.images.clone()))
+        })
+        .collect();
+    let toml = rebuild::as_camera_toml(&outcome.assignment, &globs, true);
+
+    if args.apply {
+        let cfg_path = Project::config_path(&project.root);
+        let existing = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+        if existing.contains("[[cameras]]") {
+            println!();
+            println!(
+                "{} already declares [[cameras]]; not overwriting. Replace those blocks with:",
+                cfg_path.display()
+            );
+            println!();
+            print!("{toml}");
+        } else {
+            std::fs::write(&cfg_path, format!("{existing}\n{toml}"))?;
+            println!();
+            println!("Applied to {}. Re-run `sfmtory map`.", cfg_path.display());
+        }
+    } else {
+        println!();
+        println!("Add to sfm.toml (or re-run with --apply):");
+        println!();
+        print!("{toml}");
+    }
+
+    let payload = serde_json::json!({
+        "stage": "select-model",
+        "status": "ok",
+        "mode": "rebuild",
+        "num_rebuilds": outcome.tried.len() + 1,
+        "baseline_error_px": outcome.baseline.mean_error,
+        "best_error_px": outcome.best.mean_error,
+        "recommended": outcome.assignment.iter()
+            .map(|(id, c)| (id.to_string(), c.model))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        "elapsed_ms": started.elapsed().as_millis(),
+    });
+    project.record_log("select-model", &payload)?;
+    Ok(())
+}
+
 fn cmd_select_model(args: SelectModelArgs) -> Result<()> {
+    if args.rebuild {
+        return cmd_select_model_rebuild(&args);
+    }
     let started = Instant::now();
     let project = Project::open(&args.project)?;
     let dir = project.sparse_dir();
@@ -1960,11 +2153,20 @@ fn cmd_match(args: MatchArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_map(args: MapArgs) -> Result<()> {
-    let started = Instant::now();
-    let project = Project::open(&args.project)?;
-    let stage_dir = project.prepare_stage("map")?;
+/// Everything `run_incremental`/`run_global` need, loaded from the project
+/// database and config.
+///
+/// Extracted from `cmd_map` because choosing a camera model honestly requires
+/// *rebuilding*: scoring candidate models against structure the incumbent model
+/// triangulated cannot see a wrong projection family at all (see
+/// `modelselect::radial_residual_trend`). Both callers have to load identically,
+/// or the comparison would be measuring the loader rather than the model.
+pub struct MapInput {
+    pub input: sfm_reconstruction::ReconstructionInput,
+    pub num_images: usize,
+}
 
+pub fn load_map_input(project: &Project) -> Result<MapInput> {
     let db = Database::open(&project.database_path())?;
     let images = db.list_images()?;
     if images.len() < 2 {
@@ -2073,12 +2275,87 @@ fn cmd_map(args: MapArgs) -> Result<()> {
         );
     }
 
+    // The config is authoritative over the database for camera *models*.
+    //
+    // `feature` writes each declared camera into the database when it runs, so
+    // normally the two already agree and this is a no-op. They disagree exactly
+    // when the user edits `[[cameras]]` afterwards - which is the whole workflow
+    // for fixing a wrong camera model. Without this, editing `sfm.toml` and
+    // re-running `map` changes nothing at all, silently: the reconstruction
+    // keeps using the model `feature` recorded, and the only way to apply an
+    // edit is to delete the database and redo feature extraction and matching.
+    // That cost a real debugging session here, twice.
+    let mut cameras = cameras;
+    let mut overridden: Vec<u32> = Vec::new();
+    for cfg in &project.config.cameras {
+        let Some(model_name) = cfg.model.as_deref() else {
+            continue;
+        };
+        let ids: std::collections::BTreeSet<u32> = images
+            .iter()
+            .filter(|(_, _, name, ..)| project::glob_match(&cfg.images, name))
+            .map(|(_, camera_id, ..)| *camera_id)
+            .collect();
+        for id in ids {
+            let Some(existing) = cameras.get(&id) else {
+                continue;
+            };
+            let model = match &cfg.params {
+                Some(params) => CameraModel::from_name_and_params(model_name, params)
+                    .with_context(|| {
+                        format!(
+                            "camera \"{}\": model {model_name} does not accept {} parameters",
+                            cfg.name,
+                            params.len()
+                        )
+                    })?,
+                None => default_camera_model(model_name, existing.width, existing.height)
+                    .with_context(|| {
+                        format!("camera \"{}\": unknown model {model_name}", cfg.name)
+                    })?,
+            };
+            if model != existing.model {
+                overridden.push(id);
+                cameras.insert(
+                    id,
+                    Camera {
+                        camera_id: id,
+                        model,
+                        width: existing.width,
+                        height: existing.height,
+                    },
+                );
+            }
+        }
+    }
+    if !overridden.is_empty() {
+        overridden.sort_unstable();
+        overridden.dedup();
+        eprintln!(
+            "using the camera model(s) declared in sfm.toml for camera(s) {overridden:?}, \
+             which differ from what `feature` recorded"
+        );
+    }
+
     let input = sfm_reconstruction::ReconstructionInput {
         images: image_inputs,
         cameras,
         pairs,
         fixed_cameras,
     };
+    Ok(MapInput {
+        input,
+        num_images: images.len(),
+    })
+}
+
+fn cmd_map(args: MapArgs) -> Result<()> {
+    let started = Instant::now();
+    let project = Project::open(&args.project)?;
+    let stage_dir = project.prepare_stage("map")?;
+
+    let MapInput { input, num_images } = load_map_input(&project)?;
+
     let pipeline_name = match args.pipeline {
         PipelineArg::Incremental => "incremental",
         PipelineArg::Global => "global",
@@ -2104,7 +2381,7 @@ fn cmd_map(args: MapArgs) -> Result<()> {
         "stage": "map",
         "status": "ok",
         "pipeline": pipeline_name,
-        "num_images_input": images.len(),
+        "num_images_input": num_images,
         "num_images_registered": recon.images.len(),
         "num_points3d": recon.points3d.len(),
         "mean_reprojection_error_px": recon.mean_reprojection_error(),
@@ -2118,7 +2395,7 @@ fn cmd_map(args: MapArgs) -> Result<()> {
     println!(
         "Registered {}/{} images, {} points3d, mean reprojection error {:.3}px. Wrote {}. Logged to {}.",
         recon.images.len(),
-        images.len(),
+        num_images,
         recon.points3d.len(),
         recon.mean_reprojection_error(),
         project.sparse_dir().display(),

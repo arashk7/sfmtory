@@ -29,6 +29,8 @@ use crate::diagnostics::{self, CoverageVerdict, Diagnostics, PlaneDiag, TILT_BAN
 use crate::project::Project;
 use graph::MatchGraph;
 use imageview::LoadedImage;
+mod start;
+
 use pipeline::RunState;
 use scene::{OrbitCamera, PlaneOverlay, RenderOptions, Scene};
 
@@ -49,6 +51,8 @@ pub fn launch(project_dir: PathBuf, view: View) -> Result<()> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum View {
+    /// What to do next, and whether the answer will mean anything.
+    Start,
     Scene3d,
     Image,
     Graph,
@@ -59,6 +63,7 @@ pub enum View {
 impl From<crate::GuiViewArg> for View {
     fn from(v: crate::GuiViewArg) -> Self {
         match v {
+            crate::GuiViewArg::Start => View::Start,
             crate::GuiViewArg::Scene => View::Scene3d,
             crate::GuiViewArg::Image => View::Image,
             crate::GuiViewArg::Graph => View::Graph,
@@ -1356,6 +1361,7 @@ impl App {
     fn central(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.view, View::Start, "Start here");
                 ui.selectable_value(&mut self.view, View::Scene3d, "3D");
                 ui.selectable_value(&mut self.view, View::Image, "Image");
                 ui.selectable_value(&mut self.view, View::Graph, "Match graph");
@@ -1374,6 +1380,7 @@ impl App {
             };
 
             match self.view {
+                View::Start => self.view_start(ui, h),
                 View::Scene3d => self.view_3d(ctx, ui, h),
                 View::Image => self.view_image(ctx, ui, h),
                 View::Graph => self.view_graph(ctx, ui, h),
@@ -1396,6 +1403,163 @@ impl App {
                     });
             }
         });
+    }
+
+    /// The first screen: the next command, then whether its output will be a
+    /// calibration or a picture of one. See `gui::start` for why this is the
+    /// default view rather than the 3D scene.
+    fn view_start(&mut self, ui: &mut egui::Ui, height: f32) {
+        let st = StageStatus::read(&self.project);
+        let readiness = start::Readiness::read(&self.project);
+        let busy = self.run.is_running();
+
+        egui::ScrollArea::vertical()
+            .id_salt("start")
+            .max_height(height)
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                ui.heading("Calibrate a camera rig");
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} image(s), {} capture(s), {} camera(s) in this project",
+                        readiness.num_images, readiness.num_captures, readiness.num_cameras
+                    ))
+                    .weak(),
+                );
+                ui.add_space(10.0);
+
+                // --- the four stages, in order, with the next one highlighted
+                ui.strong("Pipeline");
+                ui.add_space(4.0);
+                let steps: [(&str, bool, Vec<String>, &str); 4] = [
+                    (
+                        "① Feature - find markers or keypoints in every image",
+                        st.features > 0,
+                        vec!["feature".into(), "--detector".into(), "aruco".into()],
+                        "Writes one feature set per image into the project database.",
+                    ),
+                    (
+                        "② Match - find and verify which images share what",
+                        st.pairs > 0,
+                        vec!["match".into(), "--pairing".into(), "exhaustive".into()],
+                        "Keeps only pairs that survive a geometric consistency check.",
+                    ),
+                    (
+                        "③ Map - solve poses, points and intrinsics",
+                        st.registered > 0,
+                        vec!["map".into(), "--pipeline".into(), "incremental".into()],
+                        "This is the step that produces the calibration.",
+                    ),
+                    (
+                        "④ Export - write the model out",
+                        false,
+                        vec!["export".into()],
+                        "COLMAP text, PLY, or NeRF-style transforms.",
+                    ),
+                ];
+                let next = steps.iter().position(|(_, done, ..)| !*done);
+                for (i, (label, done, cmd, why)) in steps.iter().enumerate() {
+                    let is_next = next == Some(i);
+                    ui.horizontal(|ui| {
+                        let text = if *done {
+                            egui::RichText::new(format!("{label}  ✔")).color(ok_color())
+                        } else if is_next {
+                            egui::RichText::new(*label).strong()
+                        } else {
+                            egui::RichText::new(*label).weak()
+                        };
+                        ui.label(text);
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("Run"))
+                            .on_hover_text(cmd.join(" "))
+                            .clicked()
+                        {
+                            self.run.spawn(&self.project, cmd.clone());
+                        }
+                    });
+                    ui.label(egui::RichText::new(format!("      {why}")).weak().small());
+                }
+                ui.add_space(6.0);
+                if ui
+                    .add_enabled(!busy, egui::Button::new("▶ Run all"))
+                    .on_hover_text("feature -> match -> map -> export")
+                    .clicked()
+                {
+                    self.run.spawn(
+                        &self.project,
+                        vec![
+                            "run".into(),
+                            "--detector".into(),
+                            DETECTORS[self.detector].into(),
+                            "--pairing".into(),
+                            PAIRINGS[self.pairing].into(),
+                            "--pipeline".into(),
+                            PIPELINES[self.pipeline_kind].into(),
+                        ],
+                    );
+                }
+
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                // --- the part that decides whether the numbers mean anything
+                ui.strong("Will the result be a calibration?");
+                ui.label(
+                    egui::RichText::new(
+                        "A reconstruction that never refined its intrinsics still renders a tidy \
+                         point cloud and confident-looking cameras. These checks are the \
+                         difference.",
+                    )
+                    .weak()
+                    .small(),
+                );
+                ui.add_space(6.0);
+
+                if readiness.checks.is_empty() {
+                    ui.label(egui::RichText::new("Nothing to check yet - no images found.").weak());
+                }
+                for check in &readiness.checks {
+                    ui.horizontal(|ui| {
+                        if check.ok {
+                            ui.label(egui::RichText::new("✔").color(ok_color()));
+                        } else {
+                            ui.label(egui::RichText::new("!").color(warn_color()).strong());
+                        }
+                        ui.label(egui::RichText::new(check.what).strong());
+                        ui.label(egui::RichText::new(&check.state).weak());
+                    });
+                    if let Some(fix) = &check.fix {
+                        ui.label(egui::RichText::new(format!("      {fix}")).small());
+                    }
+                    if let Some(cmd) = &check.command {
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            if ui
+                                .add_enabled(
+                                    !busy,
+                                    egui::Button::new(format!("Run: {}", cmd.join(" "))),
+                                )
+                                .clicked()
+                            {
+                                self.run.spawn(&self.project, cmd.clone());
+                            }
+                        });
+                    }
+                    ui.add_space(4.0);
+                }
+
+                if readiness.all_ok() && st.registered > 0 {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "All checks pass. Inspect the result in the 3D, Image and Match \
+                             graph views.",
+                        )
+                        .color(ok_color()),
+                    );
+                }
+            });
     }
 
     fn view_3d(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, height: f32) {

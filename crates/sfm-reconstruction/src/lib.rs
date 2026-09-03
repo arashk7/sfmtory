@@ -67,6 +67,7 @@ const MIN_OBSERVATIONS_FOR_INTRINSICS: usize = 200;
 const MIN_FOCAL_RATIO: f64 = 0.25;
 const MAX_FOCAL_RATIO: f64 = 4.0;
 
+#[derive(Clone)]
 pub struct ImageInput {
     pub image_id: u32,
     pub camera_id: u32,
@@ -81,6 +82,7 @@ pub struct ImageInput {
     pub pose_fixed: bool,
 }
 
+#[derive(Clone)]
 pub struct PairInput {
     pub i: usize,
     pub j: usize,
