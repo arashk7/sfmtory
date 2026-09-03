@@ -1560,7 +1560,7 @@ enum BaScope {
 }
 
 /// How camera intrinsics are treated by a `run_bundle_adjustment` call.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum IntrinsicsMode {
     /// Intrinsics held at their current values.
     Fixed,
@@ -1820,15 +1820,18 @@ fn run_bundle_adjustment(
     // worse". `filter_and_reoptimize`'s residual-based filtering below is
     // the safer tool for this: it only ever drops an observation whose
     // *current* fit is actually bad, never blind-drops sound ones.
-    let build_input = |fixed_cameras: Vec<bool>, obs: &[sfm_ba::Observation]| sfm_ba::BaInput {
+    let build_input = |fixed_cameras: Vec<bool>,
+                       obs: &[sfm_ba::Observation],
+                       param_mask: &[Vec<bool>],
+                       cameras: &[CameraModel]| sfm_ba::BaInput {
         camera_of_image: camera_of_image.clone(),
-        cameras: camera_list.clone(),
+        cameras: cameras.to_vec(),
         poses: ba_poses.clone(),
         points: ba_points.clone(),
         observations: obs.to_vec(),
         fixed_poses: fixed_poses.clone(),
         fixed_cameras,
-        fixed_camera_params: fixed_camera_params.clone(),
+        fixed_camera_params: param_mask.to_vec(),
     };
 
     // Judge the two candidates by *plain* mean reprojection error, not the
@@ -1854,8 +1857,11 @@ fn run_bundle_adjustment(
     // parameter (focal length/distortion) rather than just their own
     // already-somewhat-independent pose/point, and periodic in-loop calls
     // during growth favor speed over this extra refinement.
-    let run_ba = |fixed_cameras: Vec<bool>| -> sfm_ba::BaOutput {
-        let input = build_input(fixed_cameras, &observations);
+    let run_ba_with = |fixed_cameras: Vec<bool>,
+                       param_mask: &[Vec<bool>],
+                       cameras: &[CameraModel]|
+     -> sfm_ba::BaOutput {
+        let input = build_input(fixed_cameras, &observations, param_mask, cameras);
         if matches!(
             intrinsics,
             IntrinsicsMode::FreeGuarded | IntrinsicsMode::FreeBounded
@@ -1864,6 +1870,15 @@ fn run_bundle_adjustment(
         } else {
             sfm_ba::bundle_adjust(input, &ba_params)
         }
+    };
+    // Staging this as COLMAP does - focal alone first (`ba_refine_focal_length`),
+    // then distortion (`ba_refine_extra_params`) - was tried and measured
+    // *worse* on the `scan` rig: 2.977px against 0.868px for the single
+    // combined solve, with the rig no flatter. `focal_only_params_mask` is kept
+    // because the reasoning behind it still holds and the mask is the awkward
+    // part to rebuild, but the staging is not wired in. See decisions.md.
+    let run_ba = |fixed_cameras: Vec<bool>| -> sfm_ba::BaOutput {
+        run_ba_with(fixed_cameras, &fixed_camera_params, &camera_list)
     };
 
     // `Free` is the lightweight growth-time path: let the intrinsics move
@@ -1987,6 +2002,31 @@ fn run_bundle_adjustment(
                         && (f_new / f_old) < MAX_FOCAL_RATIO
                 });
         let plausible = distortion_is_plausible && focal_is_plausible;
+        if std::env::var("SFMTORY_DEBUG_INTRINSICS").is_ok() {
+            eprintln!(
+                "[intrinsics] pass={:?} distortion_ok={distortion_is_plausible} focal_ok={focal_is_plausible}",
+                intrinsics
+            );
+            for (refined, initial) in free_output.cameras.iter().zip(&camera_list) {
+                eprintln!(
+                    "   {} f {:.1} -> {:.1}  (ratio {:.3})  distortion {:?}",
+                    refined.name(),
+                    initial.focal_lengths().0,
+                    refined.focal_lengths().0,
+                    refined.focal_lengths().0 / initial.focal_lengths().0,
+                    refined
+                        .opencv_distortion()
+                        .iter()
+                        .map(|d| (d * 1000.0).round() / 1000.0)
+                        .collect::<Vec<_>>()
+                );
+            }
+            eprintln!(
+                "   free_err {:.4} vs fixed_err {:.4}",
+                eval_error(&free_output),
+                eval_error(&fixed_output)
+            );
+        }
         if intrinsics == IntrinsicsMode::FreeBounded {
             // The caller judges; this pass only refuses the implausible.
             if plausible {

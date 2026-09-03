@@ -46,7 +46,9 @@
 //!    the thousands-of-images range.
 
 mod intrinsics;
-pub use intrinsics::{default_fixed_params_mask, refine_intrinsics, IntrinsicsRefineParams};
+pub use intrinsics::{
+    default_fixed_params_mask, focal_only_params_mask, refine_intrinsics, IntrinsicsRefineParams,
+};
 
 use nalgebra::{DMatrix, DVector, Matrix3, Matrix6, SMatrix, SVector, Vector3, Vector6};
 use rayon::prelude::*;
@@ -716,6 +718,40 @@ fn camera_jacobian(
     jac
 }
 
+/// Lower and upper bounds on the Levenberg-Marquardt damping diagonal.
+///
+/// Damping is Marquardt's `lambda * diag(J^T J)` rather than `lambda * I`, so
+/// that badly-scaled parameters - a focal length near 4608 sharing a block with
+/// distortion coefficients near 0 - are damped in proportion to their own
+/// curvature. That scaling breaks down exactly where it matters most: a
+/// parameter the data barely constrains has a near-zero diagonal entry, so it
+/// receives near-zero damping and its block becomes singular in that direction.
+/// The step in that direction is then bounded by nothing at all.
+///
+/// This is not hypothetical. Refining a fisheye's intrinsics from k1..k4 = 0,
+/// the derivative of the projection with respect to k4 goes as theta^9, which
+/// for a well-behaved lens is numerically zero across the whole image. The
+/// solver duly took enormous steps in k4 - measured coefficients of -59.0 and
+/// +21.3 against physical values under 1 - and because Huber-robust cost can
+/// fall while a minority of points fly apart, those steps were *accepted*. Mean
+/// reprojection error came out at 317px where holding the intrinsics fixed gave
+/// 0.98px.
+///
+/// Ceres clamps the same quantity for the same reason
+/// (`Solver::Options::min_lm_diagonal` / `max_lm_diagonal`), which is how
+/// COLMAP avoids this without ever having to think about it. These are Ceres's
+/// own defaults.
+const MIN_LM_DIAGONAL: f64 = 1e-6;
+const MAX_LM_DIAGONAL: f64 = 1e32;
+
+/// Marquardt damping for one diagonal block, with the entries clamped into
+/// `[MIN_LM_DIAGONAL, MAX_LM_DIAGONAL]` before scaling by `lambda`.
+fn lm_damping(diagonal: impl Iterator<Item = f64>, lambda: f64) -> Vec<f64> {
+    diagonal
+        .map(|d| d.clamp(MIN_LM_DIAGONAL, MAX_LM_DIAGONAL) * lambda)
+        .collect()
+}
+
 /// IRLS weight for a residual of the given norm: `1.0` for `RobustLoss::None`,
 /// else the derivative-based reweighting for Huber/Cauchy that lets a
 /// standard weighted-least-squares solve approximate the robust M-estimator.
@@ -970,8 +1006,11 @@ pub fn bundle_adjust(mut input: BaInput, params: &BaParams) -> BaOutput {
                 if off == FIXED {
                     continue;
                 }
-                let damped =
-                    b_pose_diag[i] + Matrix6::from_diagonal(&b_pose_diag[i].diagonal()) * lambda;
+                let damped = b_pose_diag[i]
+                    + Matrix6::from_diagonal(&SVector::<f64, 6>::from_vec(lm_damping(
+                        b_pose_diag[i].diagonal().iter().copied(),
+                        lambda,
+                    )));
                 s.view_mut((off, off), (6, 6)).copy_from(&damped);
                 rhs.rows_mut(off, 6).copy_from(&(-b_pose_rhs[i]));
             }
@@ -982,8 +1021,11 @@ pub fn bundle_adjust(mut input: BaInput, params: &BaParams) -> BaOutput {
                 if k == 0 || off == FIXED {
                     continue;
                 }
-                let diag = b_cam_diag[c].diagonal();
-                let damped = &b_cam_diag[c] + DMatrix::from_diagonal(&diag) * lambda;
+                let damped = &b_cam_diag[c]
+                    + DMatrix::from_diagonal(&DVector::from_vec(lm_damping(
+                        b_cam_diag[c].diagonal().iter().copied(),
+                        lambda,
+                    )));
                 s.view_mut((off, off), (k, k)).copy_from(&damped);
                 rhs.rows_mut(off, k).copy_from(&(-b_cam_rhs[c].clone()));
             }
@@ -1005,7 +1047,11 @@ pub fn bundle_adjust(mut input: BaInput, params: &BaParams) -> BaOutput {
                 if points_to_obs[p].is_empty() {
                     continue;
                 }
-                let damped = c_diag[p] + Matrix3::from_diagonal(&c_diag[p].diagonal()) * lambda;
+                let damped = c_diag[p]
+                    + Matrix3::from_diagonal(&Vector3::from_vec(lm_damping(
+                        c_diag[p].diagonal().iter().copied(),
+                        lambda,
+                    )));
                 cp_inv[p] = damped.try_inverse();
             }
 

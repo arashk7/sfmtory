@@ -42,6 +42,51 @@ fn principal_point_indices(cam: &CameraModel) -> &'static [usize] {
     }
 }
 
+/// Fixed-parameter mask that frees the focal length alone, holding the
+/// principal point *and every distortion coefficient* at their current values.
+///
+/// The first half of a two-stage refinement, and the reason it exists is
+/// conditioning rather than taste. A distortion coefficient and a focal length
+/// both absorb radially-symmetric error, so with all of them free the solver
+/// can cancel a wrong focal against an unphysical coefficient and reach a low
+/// reprojection error without ever correcting the focal. Measured on a
+/// 20-image four-camera rig: with everything free the focals moved under 3%
+/// off a heuristic seed while `k2` ran to -20.8 and `k4` to -152.2, against
+/// physical values below 1. Pinning distortion leaves the focal as the only
+/// parameter that can explain radial error, which is exactly the constraint
+/// that makes it identifiable.
+///
+/// COLMAP exposes the same split as `ba_refine_focal_length` and
+/// `ba_refine_extra_params`.
+pub fn focal_only_params_mask(cameras: &[CameraModel]) -> Vec<Vec<bool>> {
+    cameras
+        .iter()
+        .map(|cam| {
+            let n = cam.params().len();
+            // Everything fixed, then free the focal indices back up: the focal
+            // is the short list, and listing it is less fragile than
+            // enumerating distortion layouts per model.
+            let mut mask = vec![true; n];
+            for idx in focal_indices(cam) {
+                mask[*idx] = false;
+            }
+            mask
+        })
+        .collect()
+}
+
+fn focal_indices(cam: &CameraModel) -> &'static [usize] {
+    match cam {
+        CameraModel::SimplePinhole { .. } => &[0],
+        CameraModel::Pinhole { .. } => &[0, 1],
+        CameraModel::SimpleRadial { .. } => &[0],
+        CameraModel::Radial { .. } => &[0],
+        CameraModel::Radial3 { .. } => &[0],
+        CameraModel::OpenCV { .. } => &[0, 1],
+        CameraModel::OpenCVFisheye { .. } => &[0, 1],
+    }
+}
+
 /// Fixed-parameter mask implementing the standard "refine focal length and
 /// distortion, hold the principal point fixed at its initial guess" policy -
 /// see `BaInput::fixed_camera_params`'s docs for why the principal point
@@ -380,6 +425,57 @@ mod tests {
         assert!(
             after_cost < before_cost * 0.01,
             "expected large cost reduction: before={before_cost} after={after_cost}"
+        );
+    }
+    #[test]
+    fn focal_only_mask_frees_exactly_the_focal() {
+        let cams = vec![
+            CameraModel::Radial3 {
+                f: 100.0,
+                cx: 1.0,
+                cy: 2.0,
+                k1: 0.0,
+                k2: 0.0,
+                k3: 0.0,
+            },
+            CameraModel::OpenCVFisheye {
+                fx: 100.0,
+                fy: 100.0,
+                cx: 1.0,
+                cy: 2.0,
+                k1: 0.0,
+                k2: 0.0,
+                k3: 0.0,
+                k4: 0.0,
+            },
+        ];
+        let m = focal_only_params_mask(&cams);
+        // Radial3: f free, cx/cy and k1..k3 held.
+        assert_eq!(m[0], vec![false, true, true, true, true, true]);
+        // Fisheye: fx and fy free, everything else held.
+        assert_eq!(m[1], vec![false, false, true, true, true, true, true, true]);
+    }
+
+    #[test]
+    fn focal_only_mask_is_stricter_than_the_default_mask() {
+        let cams = vec![CameraModel::OpenCV {
+            fx: 100.0,
+            fy: 100.0,
+            cx: 1.0,
+            cy: 2.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        }];
+        let default = default_fixed_params_mask(&cams);
+        let focal = focal_only_params_mask(&cams);
+        // Anything the default holds fixed, the focal-only mask also holds.
+        for (d, f) in default[0].iter().zip(&focal[0]) {
+            assert!(!d || *f, "focal-only mask must not free what default fixes");
+        }
+        assert!(
+            focal[0].iter().filter(|f| **f).count() > default[0].iter().filter(|d| **d).count()
         );
     }
 }
