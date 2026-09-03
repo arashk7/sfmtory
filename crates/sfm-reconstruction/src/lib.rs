@@ -45,22 +45,6 @@ use sfm_geometry::{
 /// - and drifting from - the pipeline's own threshold.
 pub const MIN_IMAGES_PER_CAMERA_FOR_INTRINSICS: usize = 5;
 
-/// Observations one camera needs before the *final* pass will refine its
-/// intrinsics, when it has too few image rows to pass the image-count gate.
-///
-/// The image count is the wrong measure for a merged fiducial capture. After
-/// `--merge-multicaps` a fixed camera has exactly one image row, and that row
-/// holds the target in as many poses as there were captures - which is
-/// precisely Zhang's configuration and precisely what self-calibration needs.
-/// Counting rows calls it ineligible; counting what the row actually contains
-/// does not.
-///
-/// This applies to the final guarded pass only. The growth-time pass keeps the
-/// image-count gate: it has no error comparison and no re-triangulation to
-/// recover from a bad step, and ungating it was measured at 5743px mean
-/// reprojection error against 0.83px.
-const MIN_OBSERVATIONS_FOR_INTRINSICS: usize = 200;
-
 /// How far a refined focal length may move from its starting guess before the
 /// solve is treated as diverged rather than calibrated. COLMAP's equivalent
 /// (`min/max_focal_length_ratio`) is 0.1x to 10x.
@@ -1938,106 +1922,122 @@ fn run_bundle_adjustment(
         obs_per_camera[camera_of_image[o.image_idx]] += 1;
     }
     let final_pass = intrinsics == IntrinsicsMode::FreeBounded;
+    // The final pass gates on nothing. COLMAP's `ParameterizeCameras` makes
+    // every camera's intrinsics variable in every global bundle adjustment and
+    // has no eligibility rule anywhere; what protects it is `HasBogusParams`
+    // *after* the solve. Copying that posture is not stylistic - the previous
+    // observation threshold was a cliff at an arbitrary number, and on this
+    // rig camera 4 landed at 187 observations against a threshold of 200 and
+    // was refused, while cameras 1-3 refined to within 2.5% of COLMAP's
+    // answer. One camera left at its heuristic focal while its neighbours moved
+    // is worse than either extreme: it made the whole reconstruction
+    // inconsistent, 4.308px against the 0.46px the solve itself reached.
+    //
+    // The growth-time passes keep the image-count gate. That one is earned:
+    // they have no error comparison and no re-triangulation to recover from a
+    // bad step, and ungating them was measured at 5743px against 0.83px.
     let eligible = |idx: usize| -> bool {
-        images_per_camera[idx] >= MIN_IMAGES_PER_CAMERA_FOR_INTRINSICS
-            || (final_pass && obs_per_camera[idx] >= MIN_OBSERVATIONS_FOR_INTRINSICS)
+        final_pass || images_per_camera[idx] >= MIN_IMAGES_PER_CAMERA_FOR_INTRINSICS
     };
     let any_camera_eligible = (0..camera_list.len()).any(eligible);
-
-    let output = if allow_intrinsics && any_camera_eligible {
-        let free_fixed_cameras: Vec<bool> = (0..camera_list.len())
-            .map(|idx| !eligible(idx) || input.fixed_cameras.contains(&camera_id_list[idx]))
-            .collect();
-        let free_output = run_ba(free_fixed_cameras);
-        // Belt-and-suspenders plausibility bound: a real photographic lens's
-        // radial/tangential distortion coefficients are essentially never
-        // this large, so an optimizer output that produces one is treated as
-        // a bad optimum outright, regardless of what its own reprojection
-        // error says.
-        //
-        // 0.5 is a real bound, not a formality: normal (non-fisheye) lenses
-        // sit well inside |k1| < 0.3, and wide-angle rarely passes -0.4. The
-        // bound was 2.0, which was loose enough that nothing ever tripped it
-        // - `temple_sparse_ring` was observed converging to k1 = -0.575 with
-        // a focal length 9.9% off the known truth, *winning* the reprojection
-        // comparison below because the two errors cancel in the reprojection
-        // but not in the calibration. That is exactly the "self-consistent
-        // but wrong" optimum this bound exists to catch, so it is set where
-        // it can actually catch one.
-        const MAX_PLAUSIBLE_DISTORTION: f64 = 0.5;
-        let distortion_is_plausible = free_output.cameras.iter().all(|cam| {
-            cam.opencv_distortion()
-                .iter()
-                .all(|&d| d.abs() < MAX_PLAUSIBLE_DISTORTION)
-        });
-        // On `temple_sparse_ring` specifically (16 images, ~2.1 observations
-        // per point on average) this comparison reliably rejects free_output:
-        // investigated directly (see decisions.md) by instrumenting this pass
-        // and confirming free_err *starts* above fixed_err and gets *worse*,
-        // not better, with a much larger iteration budget (200 -> 600 moved
-        // focal length further from the true value and raised free_err from
-        // 1.07px to 1.23px) - ruling out slow convergence and confirming a
-        // genuine local-optimum/identifiability problem: too few independent
-        // multi-view constraints on this dataset's short tracks for a shared
-        // focal length to be reliably recoverable from image observations
-        // alone. This is exactly the failure mode the comparison below exists
-        // to catch; falling back to `fixed_output` here is the correct,
-        // working behavior, not a bug to chase further.
-        // A focal that has run far from its starting guess is not a
-        // calibration, it is a diverged solve. COLMAP bounds the same thing
-        // with `min/max_focal_length_ratio` (0.1x to 10x); this is tighter
-        // because the initial guess here is a field-of-view heuristic rather
-        // than EXIF, and a real lens is not 10x off it.
-        let focal_is_plausible =
-            free_output
-                .cameras
-                .iter()
-                .zip(&camera_list)
-                .all(|(refined, initial)| {
-                    let (f_new, _) = refined.focal_lengths();
-                    let (f_old, _) = initial.focal_lengths();
-                    f_old > 0.0
-                        && f_new.is_finite()
-                        && (f_new / f_old) > MIN_FOCAL_RATIO
-                        && (f_new / f_old) < MAX_FOCAL_RATIO
-                });
-        let plausible = distortion_is_plausible && focal_is_plausible;
-        if std::env::var("SFMTORY_DEBUG_INTRINSICS").is_ok() {
+    if std::env::var("SFMTORY_DEBUG_INTRINSICS").is_ok() {
+        for idx in 0..camera_list.len() {
             eprintln!(
-                "[intrinsics] pass={:?} distortion_ok={distortion_is_plausible} focal_ok={focal_is_plausible}",
-                intrinsics
-            );
-            for (refined, initial) in free_output.cameras.iter().zip(&camera_list) {
-                eprintln!(
-                    "   {} f {:.1} -> {:.1}  (ratio {:.3})  distortion {:?}",
-                    refined.name(),
-                    initial.focal_lengths().0,
-                    refined.focal_lengths().0,
-                    refined.focal_lengths().0 / initial.focal_lengths().0,
-                    refined
-                        .opencv_distortion()
-                        .iter()
-                        .map(|d| (d * 1000.0).round() / 1000.0)
-                        .collect::<Vec<_>>()
-                );
-            }
-            eprintln!(
-                "   free_err {:.4} vs fixed_err {:.4}",
-                eval_error(&free_output),
-                eval_error(&fixed_output)
+                "[eligibility] camera {} images={} observations={} eligible={} pinned={}",
+                camera_id_list[idx],
+                images_per_camera[idx],
+                obs_per_camera[idx],
+                eligible(idx),
+                input.fixed_cameras.contains(&camera_id_list[idx])
             );
         }
-        if intrinsics == IntrinsicsMode::FreeBounded {
-            // The caller judges; this pass only refuses the implausible.
-            if plausible {
-                free_output
-            } else {
-                fixed_output
+    }
+
+    // A real photographic lens's distortion coefficients are essentially never
+    // this large, so an optimizer output producing one is a bad optimum
+    // regardless of what its reprojection error says. 0.5 is a real bound, not
+    // a formality: normal lenses sit well inside |k1| < 0.3 and wide-angle
+    // rarely passes -0.4. It was 2.0, loose enough that nothing ever tripped it
+    // - `temple_sparse_ring` was observed converging to k1 = -0.575 with a
+    // focal 9.9% off the known truth and *winning* the error comparison,
+    // because the two errors cancel in the reprojection but not in the
+    // calibration. That is exactly the self-consistent-but-wrong optimum this
+    // catches.
+    const MAX_PLAUSIBLE_DISTORTION: f64 = 0.5;
+    let camera_is_plausible = |refined: &CameraModel, initial: &CameraModel| -> bool {
+        let distortion_ok = refined
+            .opencv_distortion()
+            .iter()
+            .all(|&d| d.abs() < MAX_PLAUSIBLE_DISTORTION);
+        let (f_new, _) = refined.focal_lengths();
+        let (f_old, _) = initial.focal_lengths();
+        let focal_ok = f_old > 0.0
+            && f_new.is_finite()
+            && (f_new / f_old) > MIN_FOCAL_RATIO
+            && (f_new / f_old) < MAX_FOCAL_RATIO;
+        distortion_ok && focal_ok
+    };
+
+    let output = if allow_intrinsics && any_camera_eligible {
+        // Pin the cameras that come back implausible and solve again, rather
+        // than throwing away every camera's refinement because one diverged.
+        // COLMAP isolates the offender the same way, by filtering the bogus
+        // camera's images rather than reverting anyone's intrinsics. The
+        // all-or-nothing revert this replaces was measured discarding three
+        // good refinements - within 2.5% of COLMAP's own answer - because a
+        // fourth camera was out of bounds.
+        const MAX_PIN_ROUNDS: usize = 3;
+        let mut pinned: Vec<bool> = (0..camera_list.len())
+            .map(|idx| !eligible(idx) || input.fixed_cameras.contains(&camera_id_list[idx]))
+            .collect();
+        let mut settled: Option<sfm_ba::BaOutput> = None;
+        for _ in 0..MAX_PIN_ROUNDS {
+            let candidate = run_ba(pinned.clone());
+            let newly_bad: Vec<usize> = (0..camera_list.len())
+                .filter(|&i| !pinned[i])
+                .filter(|&i| !camera_is_plausible(&candidate.cameras[i], &camera_list[i]))
+                .collect();
+            if std::env::var("SFMTORY_DEBUG_INTRINSICS").is_ok() {
+                for i in 0..camera_list.len() {
+                    eprintln!(
+                        "[intrinsics] camera {} pinned={} f {:.1} -> {:.1} distortion {:?}",
+                        camera_id_list[i],
+                        pinned[i],
+                        camera_list[i].focal_lengths().0,
+                        candidate.cameras[i].focal_lengths().0,
+                        candidate.cameras[i]
+                            .opencv_distortion()
+                            .iter()
+                            .map(|d| (d * 1000.0).round() / 1000.0)
+                            .collect::<Vec<_>>()
+                    );
+                }
+                eprintln!(
+                    "   free_err {:.4} vs fixed_err {:.4}, newly implausible {:?}",
+                    eval_error(&candidate),
+                    eval_error(&fixed_output),
+                    newly_bad
+                );
             }
-        } else if plausible && eval_error(&free_output) < eval_error(&fixed_output) {
-            free_output
-        } else {
-            fixed_output
+            if newly_bad.is_empty() {
+                settled = Some(candidate);
+                break;
+            }
+            for i in newly_bad {
+                pinned[i] = true;
+            }
+            if pinned.iter().all(|p| *p) {
+                break;
+            }
+        }
+        match settled {
+            // The final pass is authoritative: the caller judges it against the
+            // previous iteration, so it does not second-guess itself here.
+            Some(free_output) if final_pass => free_output,
+            Some(free_output) if eval_error(&free_output) < eval_error(&fixed_output) => {
+                free_output
+            }
+            _ => fixed_output,
         }
     } else {
         fixed_output
