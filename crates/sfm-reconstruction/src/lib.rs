@@ -446,6 +446,160 @@ fn mean_reprojection(
     }
 }
 
+/// How many times one pair may be re-attempted across a whole refinement.
+/// COLMAP's `re_max_trials`.
+const RETRIANGULATE_MAX_TRIALS: usize = 1;
+
+/// Re-attempts every verified pair against the current intrinsics, extending
+/// and merging tracks. COLMAP's `Retriangulate` plus `CompleteAndMergeTracks`,
+/// which its refinement loop runs on either side of every bundle adjustment.
+///
+/// The pairing with `filter_points` is the point. Filtering alone converges to
+/// a smaller, cleaner model - measured at 480 points and 0.686px against
+/// COLMAP's 827 and 0.465px - because an observation dropped for not fitting
+/// the *old* focal is never reconsidered under the new one. A correspondence
+/// that the reconstruction rejected at f=4608 may be perfectly consistent at
+/// f=3500, and only re-attempting the pairs can find that out.
+fn complete_tracks_globally(
+    input: &ReconstructionInput,
+    cameras: &HashMap<u32, CameraModel>,
+    params: &IncrementalParams,
+    registered: &[bool],
+    poses: &[Option<Pose>],
+    points: &mut Vec<PointWork>,
+    trials: &mut HashMap<(usize, usize), usize>,
+) {
+    let mut obs_to_point: HashMap<(usize, u32), usize> = HashMap::new();
+    for (idx, p) in points.iter().enumerate() {
+        for &obs in &p.track {
+            obs_to_point.insert(obs, idx);
+        }
+    }
+    for pair in &input.pairs {
+        if !registered[pair.i] || !registered[pair.j] {
+            continue;
+        }
+        // Each pair is re-attempted at most once across the whole refinement -
+        // COLMAP's `re_max_trials`. Without a bound this is the dominant cost
+        // of the pipeline: on a 20-image SIFT capture, 143 pairs holding 118k
+        // matches re-attempted on all five refinement rounds took an 80s
+        // reconstruction past ten minutes.
+        //
+        // COLMAP also skips pairs already well triangulated (`re_min_ratio`,
+        // 0.2), but that guard belongs to its `Retriangulate` alone - its
+        // `CompleteAndMergeTracks` is ungated and runs after every bundle.
+        // Ours does both jobs in one function, so adopting the ratio guard
+        // silently disabled completion too: on the 6-pair merged-ArUco rig
+        // every pair is already above the ratio, completion never ran, and rig
+        // planarity went from 0.93% back to 3.67%. The trial bound alone gives
+        // the same protection without that cost.
+        if pair.geometry.inlier_matches.is_empty() {
+            continue;
+        }
+        let seen = trials.entry((pair.i, pair.j)).or_insert(0);
+        if *seen >= RETRIANGULATE_MAX_TRIALS {
+            continue;
+        }
+        *seen += 1;
+        triangulate_and_complete_tracks(
+            input,
+            cameras,
+            params,
+            pair.i,
+            pair.j,
+            &pair.geometry.inlier_matches,
+            poses,
+            points,
+            &mut obs_to_point,
+            registered,
+        );
+    }
+}
+
+/// Drops observations that do not fit the current model, and points left
+/// unsupported once they are gone. COLMAP's `FilterPoints`, which its
+/// `IterativeGlobalRefinement` runs after *every* bundle adjustment.
+///
+/// Without this step the refinement loop is bundle-adjust, re-triangulate,
+/// repeat - and a point whose observations genuinely disagree survives every
+/// round, because re-triangulation moves it to the least-bad compromise
+/// position rather than removing it. Measured on the merged-ArUco rig, the
+/// model came out with a median reprojection error of 0.523px (healthy, and
+/// comparable to COLMAP's 0.468px) beside a p99 of 15.9px and a worst point at
+/// 23.0px: 68 points above the pipeline's own 4px threshold, in the final
+/// output, after that threshold had been applied during growth. COLMAP's worst
+/// point on the same correspondences is 1.294px and it has none above 2px.
+///
+/// The reason the earlier filtering does not cover this is that intrinsics
+/// refinement invalidates it. Every point was accepted against the focal the
+/// reconstruction had at the time; moving the focal moves every reprojection,
+/// so the set of points that fit has to be recomputed afterwards. Returns the
+/// number of observations dropped, so the caller can tell a converged
+/// refinement from a still-moving one.
+fn filter_points(
+    input: &ReconstructionInput,
+    cameras: &HashMap<u32, CameraModel>,
+    params: &IncrementalParams,
+    poses: &[Option<Pose>],
+    points: &mut [PointWork],
+) -> usize {
+    let min_angle = params.min_triangulation_angle_deg.to_radians();
+    let mut dropped = 0usize;
+    for p in points.iter_mut() {
+        let before = p.track.len();
+        p.track.retain(|&(img_idx, kp_idx)| {
+            let Some(pose) = poses[img_idx] else {
+                return false;
+            };
+            let cam = &cameras[&input.images[img_idx].camera_id];
+            let pc = pose.transform_point(&p.xyz);
+            // Behind the camera is not a large error, it is a wrong point.
+            if pc.z <= 1e-9 {
+                return false;
+            }
+            let (px, py) = cam.project(&pc);
+            let (ox, oy) = keypoint_px(&input.images[img_idx].features, kp_idx);
+            ((px - ox).powi(2) + (py - oy).powi(2)).sqrt() <= params.max_reprojection_error_px
+        });
+        dropped += before - p.track.len();
+
+        // A point needs two views to exist at all, and those views need a real
+        // angle between them or its depth is arbitrary - COLMAP's
+        // `FilterPoints3DWithSmallTriangulationAngle`, on the widest pair in
+        // the track rather than an average, since one good pair is enough to
+        // fix the depth.
+        if p.track.len() < 2 {
+            dropped += p.track.len();
+            p.track.clear();
+            continue;
+        }
+        let centres: Vec<Vector3<f64>> = p
+            .track
+            .iter()
+            .filter_map(|&(img_idx, _)| poses[img_idx].map(|pose| pose.camera_center()))
+            .collect();
+        let widest = centres
+            .iter()
+            .enumerate()
+            .flat_map(|(a, ca)| centres[a + 1..].iter().map(move |cb| (ca, cb)))
+            .map(|(ca, cb)| {
+                let (u, v) = (p.xyz - ca, p.xyz - cb);
+                let (nu, nv) = (u.norm(), v.norm());
+                if nu <= 1e-12 || nv <= 1e-12 {
+                    0.0
+                } else {
+                    (u.dot(&v) / (nu * nv)).clamp(-1.0, 1.0).acos()
+                }
+            })
+            .fold(0.0f64, f64::max);
+        if widest < min_angle {
+            dropped += p.track.len();
+            p.track.clear();
+        }
+    }
+    dropped
+}
+
 /// Refine intrinsics, re-triangulate, repeat - then keep the result only if it
 /// beats leaving the intrinsics alone.
 ///
@@ -473,7 +627,7 @@ fn refine_intrinsics_iteratively(
     registered: &[bool],
     cameras: &mut HashMap<u32, CameraModel>,
     poses: &mut [Option<Pose>],
-    points: &mut [PointWork],
+    points: &mut Vec<PointWork>,
 ) {
     /// COLMAP's `ba_global_max_refinements` default.
     const MAX_REFINEMENTS: usize = 5;
@@ -486,6 +640,7 @@ fn refine_intrinsics_iteratively(
     let baseline_points = points.to_vec();
     let baseline_error = mean_reprojection(input, cameras, poses, points);
 
+    let mut retriangulation_trials: HashMap<(usize, usize), usize> = HashMap::new();
     let mut previous = baseline_error;
     for _ in 0..MAX_REFINEMENTS {
         run_bundle_adjustment(
@@ -505,6 +660,22 @@ fn refine_intrinsics_iteratively(
         for idx in 0..points.len() {
             retriangulate_point(input, cameras, params, poses, points, idx);
         }
+        // ... then re-attempt every pair under the new intrinsics, which is
+        // what recovers correspondences the old focal had rejected, and only
+        // then drop what still does not fit. COLMAP runs the same two steps
+        // around every bundle. Re-triangulation alone relocates a bad point to
+        // its least-bad position; it never removes one, and it never brings a
+        // discarded one back.
+        complete_tracks_globally(
+            input,
+            cameras,
+            params,
+            registered,
+            poses,
+            points,
+            &mut retriangulation_trials,
+        );
+        filter_points(input, cameras, params, poses, points);
         let now = mean_reprojection(input, cameras, poses, points);
         if !now.is_finite() {
             break;
@@ -524,7 +695,9 @@ fn refine_intrinsics_iteratively(
     if !(refined_error < baseline_error) {
         *cameras = baseline_cameras;
         poses.copy_from_slice(&baseline_poses);
-        points.clone_from_slice(&baseline_points);
+        // Completion can add points, so the baseline is not necessarily the
+        // same length any more - assign rather than copy into place.
+        *points = baseline_points;
     }
 }
 
