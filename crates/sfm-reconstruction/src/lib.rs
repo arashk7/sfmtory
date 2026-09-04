@@ -25,6 +25,7 @@ mod global;
 pub use global::{run_global, GlobalParams};
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use nalgebra::Vector3;
 use sfm_core::{
@@ -297,6 +298,7 @@ pub fn run_incremental(input: &ReconstructionInput, params: &IncrementalParams) 
     // searched for. Run exactly one growth, anchored on the first known-pose
     // image so bundle adjustment's gauge-fixing image is one whose pose is
     // meaningful in the caller's frame.
+    let progress = MapProgress::new(n);
     let known_pose_images: Vec<usize> = (0..n)
         .filter(|&i| input.images[i].initial_pose.is_some())
         .collect();
@@ -319,8 +321,9 @@ pub fn run_incremental(input: &ReconstructionInput, params: &IncrementalParams) 
             &seed.map(|p| p.geometry.pose).unwrap_or_else(Pose::identity),
             seed.map(|p| p.geometry.inlier_matches.as_slice())
                 .unwrap_or(&[]),
+            &progress,
         );
-        return finish_growth(input, params, result);
+        return finish_growth(input, params, result, &progress);
     }
 
     let target_registered = component_sizes[largest_component];
@@ -336,6 +339,7 @@ pub fn run_incremental(input: &ReconstructionInput, params: &IncrementalParams) 
             seed.j,
             &seed.geometry.pose,
             &seed.geometry.inlier_matches,
+            &progress,
         );
         let count = result.registered.iter().filter(|&&b| b).count();
         let better = best
@@ -351,7 +355,89 @@ pub fn run_incremental(input: &ReconstructionInput, params: &IncrementalParams) 
     }
 
     let result = best.unwrap();
-    finish_growth(input, params, result)
+    finish_growth(input, params, result, &progress)
+}
+
+/// Throttled progress for the mapping stage, on stderr.
+///
+/// `map` was the only long stage with no output at all. On a 193-image rig it
+/// ran for nineteen minutes writing nothing, and the only way to tell it apart
+/// from a hang was to read `/proc/<pid>/stat` for its CPU time - which is not
+/// something a user should have to do, and is exactly the visibility the other
+/// stages already provide.
+///
+/// Nothing is printed for the first second, so short reconstructions and the
+/// test suite stay silent; after that, at most one line per second.
+struct MapProgress {
+    started: Instant,
+    /// `Cell` because the reporter is shared, by reference, across several
+    /// seed-growth attempts and the post-growth passes. Throttling state is
+    /// the only thing that mutates, and it is not worth threading `&mut`
+    /// through the growth loop for.
+    last: std::cell::Cell<Instant>,
+    total: usize,
+}
+
+impl MapProgress {
+    fn new(total: usize) -> Self {
+        let now = Instant::now();
+        MapProgress {
+            started: now,
+            last: std::cell::Cell::new(now),
+            total,
+        }
+    }
+
+    fn report(&self, registered: usize, points: usize) {
+        let now = Instant::now();
+        if now.duration_since(self.started).as_secs_f64() < 1.0
+            || now.duration_since(self.last.get()).as_secs_f64() < 1.0
+        {
+            return;
+        }
+        self.last.set(now);
+        let elapsed = now.duration_since(self.started).as_secs_f64();
+        // Rate is measured over registrations, which is what actually paces
+        // the loop - bundle adjustment time is folded into it rather than
+        // pretended away.
+        let eta = if registered > 0 && registered < self.total {
+            let per = elapsed / registered as f64;
+            format!(
+                " eta {}",
+                human_secs(per * (self.total - registered) as f64)
+            )
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "map: {registered}/{} images  {points} points  elapsed {}{eta}",
+            self.total,
+            human_secs(elapsed)
+        );
+    }
+
+    fn note(&self, what: &str) {
+        if self.started.elapsed().as_secs_f64() >= 1.0 {
+            eprintln!(
+                "map: {what} (elapsed {})",
+                human_secs(self.started.elapsed().as_secs_f64())
+            );
+        }
+    }
+}
+
+fn human_secs(s: f64) -> String {
+    if s < 60.0 {
+        format!("{s:.0}s")
+    } else if s < 3600.0 {
+        format!("{}m{:02}s", (s / 60.0) as u64, (s % 60.0) as u64)
+    } else {
+        format!(
+            "{}h{:02}m",
+            (s / 3600.0) as u64,
+            ((s % 3600.0) / 60.0) as u64
+        )
+    }
 }
 
 /// The post-growth passes shared by every way of starting a reconstruction:
@@ -361,6 +447,7 @@ fn finish_growth(
     input: &ReconstructionInput,
     params: &IncrementalParams,
     result: GrowthResult,
+    progress: &MapProgress,
 ) -> Reconstruction {
     let GrowthResult {
         seed_i,
@@ -378,6 +465,7 @@ fn finish_growth(
     // gets a following correction pass before intrinsics refinement
     // otherwise, letting one bootstrap's residual pose error leak directly
     // into the focal length estimate.
+    progress.note("growth done, settling the model");
     run_bundle_adjustment(
         input,
         &mut cameras,
@@ -390,6 +478,7 @@ fn finish_growth(
         IntrinsicsMode::Fixed,
         BaScope::Global,
     );
+    progress.note("refining intrinsics");
 
     // Only this final bundle adjustment is allowed to touch intrinsics.
     // Refining them *during* the loop would mean every periodic call sees a
@@ -728,6 +817,7 @@ fn grow_from_seed(
     seed_j: usize,
     seed_pose: &Pose,
     seed_matches: &[(u32, u32)],
+    progress: &MapProgress,
 ) -> GrowthResult {
     let n = input.images.len();
     let mut registered = vec![false; n];
@@ -1040,6 +1130,7 @@ fn grow_from_seed(
         // schedule that made incremental SfM's cost scale acceptably.
         let num_reg = registered.iter().filter(|&&b| b).count();
         let num_pts = points.len();
+        progress.report(num_reg, num_pts);
         if num_reg as f64 >= images_at_last_global_ba as f64 * 1.1
             || num_pts as f64 >= points_at_last_global_ba as f64 * 1.1
         {
