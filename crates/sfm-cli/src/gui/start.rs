@@ -155,19 +155,20 @@ impl Readiness {
                 Check {
                     ok: false,
                     what: "captures",
-                    state: format!("{} captures, not merged", self.num_captures),
+                    state: format!(
+                        "{} captures, not merged - features were extracted with \
+                         --no-merge-captures",
+                        self.num_captures
+                    ),
                     fix: Some(
-                        "A fiducial that was moved between captures is a different 3D point in \
-                         each one, so captures do not match each other and each becomes its own \
-                         island - only one of them will reconstruct. Merge them per camera."
+                        "This layout says one physical camera took one image per capture, so a \
+                         camera's captures are one unmoved viewpoint and belong together. Kept \
+                         apart, a fiducial that moved between captures makes each capture its \
+                         own island in the match graph and only one of them reconstructs. \
+                         Re-running `feature` merges them, which is the default."
                             .into(),
                     ),
-                    command: Some(vec![
-                        "feature".into(),
-                        "--detector".into(),
-                        "aruco".into(),
-                        "--merge-multicaps".into(),
-                    ]),
+                    command: Some(vec!["feature".into(), "--detector".into(), "aruco".into()]),
                 }
             });
         }
@@ -266,11 +267,11 @@ mod tests {
         let checks = r.build_checks();
         let c = checks.iter().find(|c| c.what == "captures").unwrap();
         assert!(!c.ok);
-        assert!(c
-            .command
-            .as_ref()
-            .unwrap()
-            .contains(&"--merge-multicaps".to_string()));
+        // The fix is simply to re-run feature extraction: merging is the
+        // default now, so an unmerged project was extracted with the opt-out.
+        let cmd = c.command.as_ref().unwrap();
+        assert_eq!(cmd.first().map(String::as_str), Some("feature"));
+        assert!(!cmd.iter().any(|a| a.starts_with("--merge")));
     }
 
     #[test]

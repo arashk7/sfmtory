@@ -272,11 +272,18 @@ struct FeatureArgs {
     /// reuse them automatically.
     #[arg(long)]
     find_params: bool,
-    /// Merge each camera's features across captures into a single feature set
-    /// per (camera, image slot). For a rig of fixed cameras photographing a
-    /// target that moves between captures, this is what turns N captures into
-    /// N times the observations of one unmoved viewpoint.
+    /// Keep every capture as its own image instead of merging each camera's
+    /// captures together.
+    ///
+    /// Merging is the default whenever the layout identifies both captures and
+    /// cameras, because that layout says the same physical camera took one
+    /// image per capture. Pass this when the cameras *moved* between captures,
+    /// so each capture really is a separate viewpoint.
     #[arg(long)]
+    no_merge_captures: bool,
+    /// Accepted for compatibility: merging is now the default. See
+    /// `--no-merge-captures`.
+    #[arg(long, hide = true)]
     merge_multicaps: bool,
     /// Camera model for images not covered by a `[[cameras]]` entry.
     ///
@@ -571,7 +578,7 @@ fn cmd_rig(args: RigArgs) -> Result<()> {
         bail!(
             "this project was built with --merge-multicaps, which pools every capture into one \n\
              image per camera and leaves nothing to compare between captures.\n\n\
-             Re-run `sfmtory feature --detector aruco` without --merge-multicaps, then \n\
+             Re-run `sfmtory feature --detector aruco --no-merge-captures`, then \n\
              `sfmtory match`, then this command. Merging helps intrinsics and costs the rig \n\
              geometry: measured on a 4-camera wall rig, merged put the centres 16.2% of their \n\
              mean spacing off a common plane, against 1.1% per capture."
@@ -1669,7 +1676,23 @@ fn cmd_feature(args: FeatureArgs) -> Result<()> {
         records.push((d, w, h, f));
     }
 
-    if args.merge_multicaps {
+    // A `capture / camera` layout states that the same physical camera took one
+    // image per capture. That is exactly the case where the five images of
+    // camera 1 are five looks from one unmoved viewpoint at a target that
+    // moved, and pooling them is not an optimisation - it is what the layout
+    // already said. Leaving them separate is what produced five disconnected
+    // components in the match graph, one view per camera, and a focal that
+    // could not be recovered at all.
+    //
+    // So it is the default, and `--no-merge-captures` is for the case the
+    // layout cannot distinguish: cameras that genuinely moved between captures.
+    let merge = !args.no_merge_captures
+        && num_captures > 1
+        && layout == dataset::Layout::CapturesAndCameras;
+    if args.merge_multicaps && !merge {
+        eprintln!("note: --merge-multicaps is the default now; nothing to do");
+    }
+    if merge {
         records = merge_across_captures(records, num_captures)?;
     }
 
@@ -1790,11 +1813,7 @@ fn cmd_feature(args: FeatureArgs) -> Result<()> {
             }
         };
         // A merged row spans captures, so it has no single capture of origin.
-        let capture_col = if args.merge_multicaps && num_captures > 1 {
-            -1
-        } else {
-            d.capture_id as i64
-        };
+        let capture_col = if merge { -1 } else { d.capture_id as i64 };
         db.upsert_image(
             image_id,
             camera_id,
@@ -1862,7 +1881,7 @@ fn cmd_feature(args: FeatureArgs) -> Result<()> {
         "layout": format!("{layout:?}"),
         "num_captures": num_captures,
         "num_cameras": num_phys_cameras,
-        "merge_multicaps": args.merge_multicaps,
+        "merged_captures": merge,
         "num_images": per_image.len(),
         "total_features": total_features,
         "per_image": per_image,
@@ -1899,7 +1918,7 @@ fn merge_across_captures(
     num_captures: usize,
 ) -> Result<Vec<(dataset::DiscoveredImage, u32, u32, sfm_core::FeatureSet)>> {
     if num_captures < 2 {
-        println!("--merge-multicaps: only one capture present, nothing to merge");
+        println!("only one capture present, nothing to merge");
         return Ok(records);
     }
     // Grouped by (camera, slot) so a camera holding several shots per capture
@@ -1918,7 +1937,7 @@ fn merge_across_captures(
         for &m in &members {
             if (records[m].1, records[m].2) != (w, h) {
                 bail!(
-                    "--merge-multicaps: camera {camera_id} slot {image_index} mixes image sizes \
+                    "merging captures: camera {camera_id} slot {image_index} mixes image sizes \
                      ({}x{} vs {}x{}); merged images must come from the same unmoved camera",
                     w,
                     h,
@@ -1985,7 +2004,7 @@ fn merge_across_captures(
         ));
     }
     println!(
-        "--merge-multicaps: merged {num_captures} captures into {} per-camera feature set(s)",
+        "merged {num_captures} captures into {} per-camera feature set(s) (--no-merge-captures to keep them separate)",
         out.len()
     );
     Ok(out)
@@ -2046,7 +2065,8 @@ fn cmd_match(args: MatchArgs) -> Result<()> {
             if merged {
                 bail!(
                     "--pairing within-capture needs per-capture images, but this project was \
-                     built with --merge-multicaps, which pools them. Re-run `feature` without it."
+                     built with merged captures, which pools them. Re-run `feature` with \
+                     --no-merge-captures."
                 );
             }
             let pairs: Vec<(usize, usize)> = sfm_match::exhaustive_pairs(n)
@@ -2986,6 +3006,7 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         aruco_dict: None,
         max_features: None,
         find_params: false,
+        no_merge_captures: false,
         merge_multicaps: false,
         gpu: false,
         camera_model: args.camera_model.clone(),
